@@ -897,6 +897,13 @@ static void recShutdown(void)
 	memset(s_covered, 0, sizeof(s_covered));
 	if (s_code) { HostSys::Munmap(s_code, kCodeCacheSize); s_code = nullptr; }
 	s_code_pos = 0;
+	// The LUT goes with the cache it indexes. It used to outlive it: recReserve
+	// keeps an existing s_lut, so a second VM in the same process (a frontend
+	// that swaps content on a still-resident core -- macOS never unloads a
+	// dylib with TLVs or ObjC in it) dispatched through pointers into the
+	// munmap'd first cache and died on the instruction fetch. Mirrors
+	// eeJitShutdown_arm64.
+	if (s_lut) { munmap(s_lut, (size_t)kRamWords * sizeof(BlockFn)); s_lut = nullptr; }
 }
 
 R3000Acpu psxRec = {

@@ -4437,6 +4437,17 @@ void eeJitShutdown_arm64(void)
 	if (s_code) { HostSys::Munmap(s_code, kCodeCacheSize); s_code = nullptr; }
 	if (s_lut) { munmap(s_lut, (size_t)kRamWords * sizeof(BlockFn)); s_lut = nullptr; }
 	s_code_pos = 0;
+	// Every static the reserve fills, emptied with it -- the shutdown is the
+	// reserve's mirror, not a list of pointers that have crashed so far. The
+	// fastmem site tables point into the cache just unmapped (and the fault
+	// handler reads them), the faulting-pc blacklist is the previous game's, and
+	// the page counters are sized by the reserve. A second VM in this process
+	// (macOS never unloads a dylib with TLVs or ObjC in it, so a content swap
+	// re-inits the resident image) must start from nothing.
+	s_fm_sites.clear();
+	s_fm_pending.clear();
+	s_fm_faulting.clear();
+	s_page_clears.clear();
 }
 
 // C.50: a fastmem access touched a page the vtlb doesn't back with memory (a
