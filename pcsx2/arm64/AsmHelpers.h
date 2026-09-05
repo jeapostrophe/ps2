@@ -97,6 +97,35 @@ void armEmitCall(const void* ptr, bool force_inline = false);
 // `code_address` must already hold a single 4-byte instruction; target must be
 // within +/-128 MB (B imm26 range).
 void armEmitJmpPtr(void* code_address, const void* target, bool flush_icache = true);
+
+// Host code memory, the way this host allows it. On Apple silicon a code cache
+// must be a MAP_JIT mapping (a plain RWX mmap is refused with EACCES), and every
+// write into it must sit between pthread_jit_write_protect_np(0) and (1) on the
+// writing thread -- a MAP_JIT page is execute-only until the thread says
+// otherwise, and a write outside such a session is a SIGBUS. HostSys::Mmap adds
+// MAP_JIT there and HostSys::Begin/EndCodeWrite are the session; on every other
+// host the first is a plain mmap and the second is a no-op, so this is not an
+// Apple branch, it is the one spelling that is right everywhere. armStartBlock/
+// armEndBlock open and close the same session around the shared emitter; the
+// scope is for emitters that own their own cursor (the EE and IOP recs).
+u8* armJitMap(size_t size);
+struct ArmCodeWriteScope
+{
+	ArmCodeWriteScope();
+	~ArmCodeWriteScope();
+	ArmCodeWriteScope(const ArmCodeWriteScope&) = delete;
+	ArmCodeWriteScope& operator=(const ArmCodeWriteScope&) = delete;
+};
+
+// Can vixl-emitted code run on this host? A property of the host and the vixl
+// build, answered once per process: emits `add x0, x0, 1; ret` into an
+// armJitMap'd page under a write session and calls it. The stub must run from
+// host code memory, never from vixl's own staging buffer -- that buffer is
+// malloc'd on Darwin (VIXL_CODE_BUFFER_MALLOC) and SetExecutable() is
+// VIXL_UNIMPLEMENTED there, so executing it is an instruction-fetch SIGBUS,
+// which is how this test used to fail: by taking the process down instead of
+// returning false.
+bool armVixlSelfTest();
 void armEmitCbnz(const vixl::aarch64::Register& reg, const void* ptr);
 void armEmitCondBranch(vixl::aarch64::Condition cond, const void* ptr);
 void armMoveAddressToReg(const vixl::aarch64::Register& reg, const void* addr);

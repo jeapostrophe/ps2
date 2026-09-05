@@ -19,6 +19,7 @@
 
 #include "R3000A.h"
 #include "common/Console.h"
+#include "common/General.h"
 #include "IopMem.h"
 #include "IopHw.h"
 
@@ -30,6 +31,8 @@
 #include <sys/mman.h>
 
 #include "aarch64/macro-assembler-aarch64.h"
+#include "arm64/AsmHelpers.h"
+
 
 
 using namespace vixl::aarch64;
@@ -84,19 +87,6 @@ namespace
 			s_covered[w >> 3] |= 1u << (w & 7);
 	}
 
-	bool VixlEmitSelfTest()
-	{
-		MacroAssembler masm;
-		masm.Add(x0, x0, 1);
-		masm.Ret();
-		masm.FinalizeCode();
-		vixl::CodeBuffer* buf = masm.GetBuffer();
-		buf->SetExecutable();
-		auto fn = buf->GetStartAddress<int64_t (*)(int64_t)>();
-		const int64_t r = fn(41);
-		buf->SetWritable();
-		return r == 42;
-	}
 
 	// ---- C.32: block-local write-back GPR register cache (the C.27 pattern
 	// from the EE rec, sized for the IOP). Guest GPRs are 32-bit, mirrored in
@@ -691,6 +681,7 @@ namespace
 		}
 
 		u8* start = s_code + s_code_pos;
+		ArmCodeWriteScope cws; // every byte from here to the icache flush is a code write
 		MacroAssembler masm(start, kCodeCacheSize - s_code_pos, PositionDependentCode);
 		s_irc.Reset(); // fresh per-block register-cache state (C.32)
 
@@ -800,12 +791,10 @@ namespace
 
 static void recReserve(void)
 {
-	s_ok = VixlEmitSelfTest();
+	s_ok = armVixlSelfTest();
 	if (!s_code)
 	{
-		s_code = (u8*)mmap(nullptr, kCodeCacheSize, PROT_READ | PROT_WRITE | PROT_EXEC,
-		                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-		if (s_code == MAP_FAILED) s_code = nullptr;
+		s_code = armJitMap(kCodeCacheSize);
 	}
 	if (!s_lut)
 	{
@@ -906,7 +895,7 @@ static void recShutdown(void)
 	s_blocks.clear();
 	s_page.clear();
 	memset(s_covered, 0, sizeof(s_covered));
-	if (s_code) { munmap(s_code, kCodeCacheSize); s_code = nullptr; }
+	if (s_code) { HostSys::Munmap(s_code, kCodeCacheSize); s_code = nullptr; }
 	s_code_pos = 0;
 }
 

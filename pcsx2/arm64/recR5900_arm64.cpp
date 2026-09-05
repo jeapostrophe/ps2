@@ -22,6 +22,7 @@
 #include "Memory.h"
 #include "VU.h"
 #include "common/Console.h"
+#include "common/General.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -42,6 +43,7 @@
 // (aVU.cpp TU) + the AsmHelpers thread-locals its emitters write through, and
 // the analysis-flag plumbing they gate on.
 #include "arm64/AsmHelpers.h"
+
 #include "arm64/aR5900Analysis.h"
 #include "VUmicro.h" // _vu0FinishMicro
 // vu0Sync() lives in VU0.cpp with no header declaration (the interpreter ops call
@@ -204,19 +206,6 @@ namespace
 		return MemOperand(x19, static_cast<int64_t>(off));
 	}
 
-	bool VixlEmitSelfTest()
-	{
-		MacroAssembler masm;
-		masm.Add(x0, x0, 1);
-		masm.Ret();
-		masm.FinalizeCode();
-		vixl::CodeBuffer* buf = masm.GetBuffer();
-		buf->SetExecutable();
-		auto fn = buf->GetStartAddress<int64_t (*)(int64_t)>();
-		const int64_t r = fn(41);
-		buf->SetWritable();
-		return r == 42;
-	}
 
 	// Inline vtlb fast path (Phase C.12): with the guest address in w0 (upper
 	// half of x0 zero, as left by 32-bit address arithmetic), emit the vmap
@@ -4126,6 +4115,7 @@ namespace {
 		s_exit_labels.clear();
 		s_exit_labels.emplace_back();
 		s_blk_ret = &s_exit_labels.front(); // the block's one return tail
+		ArmCodeWriteScope cws; // every byte from here to the icache flush is a code write
 		MacroAssembler masm(start, kCodeCacheSize - s_code_pos, PositionDependentCode);
 		// The aVU macro emitters (C.30-2) hold RSCRATCHADDR (x17) and q31 across
 		// vixl macro expansions -- keep the assembler from synthesizing into them
@@ -4381,12 +4371,10 @@ namespace {
 
 void eeJitReserve_arm64(void)
 {
-	s_ok = VixlEmitSelfTest();
+	s_ok = armVixlSelfTest();
 	if (!s_code)
 	{
-		s_code = (u8*)mmap(nullptr, kCodeCacheSize, PROT_READ | PROT_WRITE | PROT_EXEC,
-		                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-		if (s_code == MAP_FAILED) s_code = nullptr;
+		s_code = armJitMap(kCodeCacheSize);
 	}
 	if (!s_lut)
 	{
@@ -4446,7 +4434,7 @@ void eeJitShutdown_arm64(void)
 {
 	s_blocks.clear();
 	s_page.clear();
-	if (s_code) { munmap(s_code, kCodeCacheSize); s_code = nullptr; }
+	if (s_code) { HostSys::Munmap(s_code, kCodeCacheSize); s_code = nullptr; }
 	if (s_lut) { munmap(s_lut, (size_t)kRamWords * sizeof(BlockFn)); s_lut = nullptr; }
 	s_code_pos = 0;
 }
@@ -4478,9 +4466,12 @@ extern "C" bool eeFastmemFault_arm64(uintptr_t code_address)
 	if (delta < -(1 << 25) || delta >= (1 << 25))
 		return false; // out of B range -- impossible within one block, but don't corrupt code
 
-	u32* const insn = reinterpret_cast<u32*>(site.code);
-	*insn = 0x14000000u | (static_cast<u32>(delta) & 0x03ffffffu); // B <stub>
-	__builtin___clear_cache(reinterpret_cast<char*>(insn), reinterpret_cast<char*>(insn + 1));
+	// A code write from the signal handler, on the faulting thread. armEmitJmpPtr
+	// is the tree's one B-patcher: it opens the write-protect session (per thread
+	// and async-signal-safe -- one system register), stores the branch, closes
+	// the session and flushes the icache. The range check above is what keeps
+	// this a `return false` rather than its assert.
+	armEmitJmpPtr(reinterpret_cast<void*>(site.code), reinterpret_cast<const void*>(site.stub), true);
 
 	const auto it = std::lower_bound(s_fm_faulting.begin(), s_fm_faulting.end(), site.pc);
 	if (it == s_fm_faulting.end() || *it != site.pc)

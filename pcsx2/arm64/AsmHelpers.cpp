@@ -208,6 +208,39 @@ void armEmitCall(const void* ptr, bool force_inline)
 	}
 }
 
+u8* armJitMap(size_t size)
+{
+	return static_cast<u8*>(HostSys::Mmap(nullptr, size, PageProtectionMode{true, true, true}));
+}
+
+ArmCodeWriteScope::ArmCodeWriteScope() { HostSys::BeginCodeWrite(); }
+ArmCodeWriteScope::~ArmCodeWriteScope() { HostSys::EndCodeWrite(); }
+
+static bool armVixlSelfTestOnce()
+{
+	constexpr size_t kScratch = 4096;
+	u8* scratch = armJitMap(kScratch);
+	if (!scratch)
+		return false;
+	{
+		ArmCodeWriteScope cws;
+		a64::MacroAssembler masm(static_cast<vixl::byte*>(scratch), kScratch, a64::PositionDependentCode);
+		masm.Add(a64::x0, a64::x0, 1);
+		masm.Ret();
+		masm.FinalizeCode();
+	}
+	HostSys::FlushInstructionCache(scratch, kScratch);
+	const int64_t r = reinterpret_cast<int64_t (*)(int64_t)>(scratch)(41);
+	HostSys::Munmap(scratch, kScratch);
+	return r == 42;
+}
+
+bool armVixlSelfTest()
+{
+	static const bool ok = armVixlSelfTestOnce();
+	return ok;
+}
+
 void armEmitJmpPtr(void* code_address, const void* target, bool flush_icache)
 {
 	const s64 displacement = GetPCDisplacement(code_address, target);

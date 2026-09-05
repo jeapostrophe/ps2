@@ -6,7 +6,7 @@
 // from isztldav/pcsx2 @ c89cb8a (pcsx2/arm64/Vif_Dynarec.cpp) into lrps2.
 // The block-cache logic (hash keys, dVifUnpack flow) is line-for-line the same
 // as lrps2's x86 newVif_Dynarec.cpp -- the two trees never diverged here --
-// only the emitter is NEON and the code cache is a plain RWX mmap per VIF
+// only the emitter is NEON and the code cache is a host code mapping per VIF
 // index (lrps2's RecompiledCodeReserve infra stays x86-only).
 
 #include "arm64/Vif_UnpackNEON.h"
@@ -15,6 +15,7 @@
 #include "MTVU.h"
 
 #include "common/Console.h"
+#include "common/General.h"
 
 #include <cstdlib>
 #include <sys/mman.h>
@@ -180,7 +181,7 @@ static void maskedVecWrite(const a64::VRegister& reg, const a64::MemOperand& add
 	}
 }
 
-// Plain RWX mmap per VIF index (8MB, same budget the x86 side gives
+// Host code mapping per VIF index (8MB, same budget the x86 side gives
 // RecompiledCodeReserve). Bases live here; nVifStruct keeps the write/end
 // cursors so dVifCompile's overflow check mirrors the ARMSX2 original.
 static u8* s_vifCode[2] = {nullptr, nullptr};
@@ -190,11 +191,9 @@ void dVifReserve(int idx)
 {
 	if (s_vifCode[idx])
 		return;
-	s_vifCode[idx] = (u8*)mmap(nullptr, kVifCodeSize, PROT_READ | PROT_WRITE | PROT_EXEC,
-		MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (s_vifCode[idx] == MAP_FAILED)
+	s_vifCode[idx] = armJitMap(kVifCodeSize); // host code memory; the writes are armStartBlock sessions
+	if (!s_vifCode[idx])
 	{
-		s_vifCode[idx] = nullptr;
 		Console.Error("arm64 VIF%d dynarec: mmap failed; unpacks fall back to the C reference path.", idx);
 		return;
 	}
@@ -217,7 +216,7 @@ void dVifRelease(int idx)
 	vif_hash_clear(&nVif[idx].vifBlocks);
 	if (s_vifCode[idx])
 	{
-		munmap(s_vifCode[idx], kVifCodeSize);
+		HostSys::Munmap(s_vifCode[idx], kVifCodeSize);
 		s_vifCode[idx] = nullptr;
 		nVif[idx].recWritePtr = nullptr;
 		nVif[idx].recEndPtr = nullptr;

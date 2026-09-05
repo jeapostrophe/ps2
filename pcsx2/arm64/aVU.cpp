@@ -28,6 +28,7 @@
 #include "Gif_Unit.h" // gifUnit + GIF_TRANS_XGKICK (XGKICK GIF transfer, aVU_Lower.inl)
 
 #include "common/AlignedMalloc.h"
+#include "common/General.h"
 #include "common/Perf.h"
 
 #include <algorithm>
@@ -536,12 +537,21 @@ void mVUinit(microVU& mVU, uint vuIndex)
 	mVU.mscalMemo    = (microMscalMemoA*)calloc(mVU.progSize / 2, sizeof(microMscalMemoA));
 	mVU.progMemMask  =  mVU.progSize-1;
 	// The libretro fork has no fixed HostMemoryMap code arena; give each VU a
-	// dedicated RWX mmap (same 64 MB budget as upstream's mVU0/1recSize).
+	// dedicated host code mapping (same 64 MB budget as upstream's mVU0/1recSize).
 	static u8* s_mvu_cache[2] = {nullptr, nullptr};
 	constexpr size_t kMvuRecSize = 0x4000000;
+	// Host code memory (armJitMap); the compile is already a session
+	// (armStartBlock/armEndBlock, see compareState in aVU.h). A failed mapping
+	// is fatal here as it is in upstream's x86 microVU: there is no VU program
+	// without a cache, and the MAP_FAILED this used to store unchecked became a
+	// -1 code pointer that crashed later and elsewhere.
 	if (!s_mvu_cache[vuIndex])
-		s_mvu_cache[vuIndex] = (u8*)mmap(nullptr, kMvuRecSize, PROT_READ | PROT_WRITE | PROT_EXEC,
-			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		s_mvu_cache[vuIndex] = armJitMap(kMvuRecSize);
+	if (!s_mvu_cache[vuIndex])
+	{
+		Console.Error("microVU: could not map the VU%d code cache (%zu bytes) -- cannot continue", vuIndex, kMvuRecSize);
+		std::abort();
+	}
 	mVU.cache        = s_mvu_cache[vuIndex];
 	mVU.prog.codeReserveEnd = s_mvu_cache[vuIndex] + kMvuRecSize;
 	mVU.prog.codeEnd = mVU.prog.codeReserveEnd - (mVUcacheSafeZone * _1mb);

@@ -2,13 +2,14 @@
 // SPDX-FileCopyrightText: 2026 isztld <https://isztld.com/>
 // SPDX-License-Identifier: GPL-3.0+
 // Transplanted into lrps2 from isztldav/pcsx2 @ c89cb8a (C.19); near-verbatim
-// except VifUnpackSSE_Init/Destroy, which use a local mmap'd code region
+// except VifUnpackSSE_Init/Destroy, which use a local host code mapping
 // instead of SysMemory.
 
 #include "Vif_UnpackNEON.h"
 #include <algorithm>
 
 #include "common/Console.h"
+#include "common/General.h"
 
 #include <cstdlib>
 #include <sys/mman.h>
@@ -422,11 +423,9 @@ void VifUnpackSSE_Init()
 {
 	if (!s_upkCode)
 	{
-		s_upkCode = (u8*)mmap(nullptr, kUpkCodeSize, PROT_READ | PROT_WRITE | PROT_EXEC,
-			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-		if (s_upkCode == MAP_FAILED)
+		s_upkCode = armJitMap(kUpkCodeSize); // host code memory; the writes are armStartBlock sessions
+		if (!s_upkCode)
 		{
-			s_upkCode = nullptr;
 			Console.Error("arm64 VIF unpack dynarec: mmap failed; using the C reference path.");
 			return;
 		}
@@ -446,7 +445,7 @@ void VifUnpackSSE_Destroy()
 {
 	if (s_upkCode)
 	{
-		munmap(s_upkCode, kUpkCodeSize);
+		HostSys::Munmap(s_upkCode, kUpkCodeSize);
 		s_upkCode = nullptr;
 	}
 	memset(nVifUpk, 0, sizeof(nVifUpk));
