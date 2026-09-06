@@ -244,6 +244,10 @@ class GSRenderer
 public:
 	explicit GSRenderer(PageTracker &tracker);
 	bool init(Vulkan::Device *device, const GSOptions &options);
+	// Cancels what is left of the pre-warm and joins its threads; after it the
+	// pipeline cache is quiescent, which is what a read of it needs. Not a
+	// wait: a caller mid-session would discard the rest of the pre-warm.
+	void drain_compilation_tasks();
 	~GSRenderer();
 
 	void reserve_primitive_buffers(uint32_t num_primitives);
@@ -541,7 +545,6 @@ private:
 	Vulkan::Program *sample_quad[2] = {};
 	Vulkan::Program *weave_quad = nullptr;
 
-	void drain_compilation_tasks();
 	void drain_compilation_tasks_nonblock();
 	void kick_compilation_tasks();
 	PGS::atomic_bool compilation_tasks_active;

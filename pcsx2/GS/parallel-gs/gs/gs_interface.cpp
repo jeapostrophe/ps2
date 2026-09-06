@@ -4338,6 +4338,11 @@ const void *GSInterface::map_vram_read(size_t offset, size_t size)
 	return static_cast<const uint8_t *>(renderer.begin_host_vram_access()) + offset;
 }
 
+void GSInterface::drain_compilation_tasks()
+{
+	renderer.drain_compilation_tasks();
+}
+
 void GSInterface::flush()
 {
 	flush_pending_transfer(true);

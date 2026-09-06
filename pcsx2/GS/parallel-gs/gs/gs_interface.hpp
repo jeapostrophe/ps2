@@ -261,6 +261,9 @@ public:
 	GSInterface();
 	bool init(Vulkan::Device *device, const GSOptions &options);
 	void reset_context_state();
+	// GSRenderer::drain_compilation_tasks: cancel and join the pre-warm compile
+	// threads (before the device's pipeline cache is read back).
+	void drain_compilation_tasks();
 
 	void set_super_sampling_rate(SuperSampling super_sampling, bool ordered_grid, bool super_sampled_textures);
 	void set_debug_mode(const DebugMode &mode);

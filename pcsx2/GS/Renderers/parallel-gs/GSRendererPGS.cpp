@@ -8,8 +8,13 @@
 #include "muglm/muglm_impl.hpp"
 #include "PerformanceMetrics.h"
 #include "common/Console.h"
+#include "common/Path.h"
 #include "logging.hpp"
+#include "timer.hpp"
+#include <streams/file_stream.h>
+#include <cstdlib>
 #include <stdarg.h>
+#include <vector>
 
 using namespace Vulkan;
 using namespace ParallelGS;
@@ -185,7 +190,120 @@ u8 *GSRendererPGS::GetRegsMem()
 
 GSRendererPGS::~GSRendererPGS()
 {
+	// Before `dev` destructs: reading the cache back needs the VkDevice, and
+	// libretro_context_destroy only resets the Vulkan context after CloseGS.
+	// What is left of the pre-warm is cancelled and joined first: `iface` is a
+	// member, so its own destructor (which does the same) runs after this
+	// body, and a teardown inside the pre-warm window would otherwise read a
+	// cache its threads are still filling — vkGetPipelineCacheData answers
+	// VK_INCOMPLETE when the cache grows between the size query and the read,
+	// and nothing would be written.
+	iface.drain_compilation_tasks();
+	SavePipelineCache();
 	last_vsync_image.reset();
+}
+
+/* The VkPipelineCache paraLLEl-GS compiles against, kept on disk.
+ *
+ * Granite has its own persistence (Device::init_pipeline_cache() /
+ * flush_pipeline_cache(), "cache://pipeline_cache.bin"), but every line of it
+ * is under GRANITE_VULKAN_SYSTEM_HANDLES, which this tree's
+ * GS/parallel-gs/CMakeLists.txt forces OFF. Device::set_context therefore
+ * never creates a VkPipelineCache at all: every pipeline is built against
+ * VK_NULL_HANDLE, so nothing is kept across launches: a pipeline the previous
+ * run compiled pays its full first-use compile again. Measured on MoltenVK
+ * (Apple M4 Max, css boot to intro, 2026-09-06): the same eight pipelines
+ * stall for 6-19 ms each on a fresh device in the SAME process, so not even
+ * the OS-level Metal cache covers it. That is the "Stalled compile (compute,
+ * ...): ... (mode: sync)" the log shows beside every frame-rate dip in the
+ * first minutes of a stage, on every launch (retro-trainer PLAN-ps2 PS2-01).
+ *
+ * Granite's public init_pipeline_cache(data, size) / get_pipeline_cache_data
+ * are compiled regardless, and they own the format (a pipelineCacheUUID and a
+ * payload hash ahead of the driver blob on the legacy path, a pipeline-binary
+ * archive on the other), checked on load: a cache from another GPU or driver,
+ * or a torn file, starts fresh. The renderer only has to move the bytes, the
+ * same way the Vulkan renderer's VKShaderCache moves its own cache, and under
+ * the same folder and knob (EmuFolders::Cache, GSConfig.DisableShaderCache). */
+static std::string pgs_pipeline_cache_path()
+{
+	return Path::Combine(EmuFolders::Cache, "pgs_pipeline_cache.bin");
+}
+
+static double ms_since(int64_t start_ns)
+{
+	return 1e-6 * double(Util::get_current_time_nsecs() - start_ns);
+}
+
+// `pipeline_cache_ready` means "there is a cache worth writing back": false
+// with the shader cache disabled (the device still gets a fresh, in-memory
+// VkPipelineCache) and false if vkCreatePipelineCache itself failed.
+void GSRendererPGS::LoadPipelineCache()
+{
+	pipeline_cache_ready = false;
+	if (GSConfig.DisableShaderCache)
+	{
+		Console.WriteLn("PGS: shader cache disabled, pipelines compile against a fresh cache.");
+		dev.init_pipeline_cache(nullptr, 0);
+		return;
+	}
+
+	const std::string path = pgs_pipeline_cache_path();
+	void *buf = nullptr;
+	int64_t len = 0;
+	const auto start = Util::get_current_time_nsecs();
+	// filestream_read_file hands back a malloc'd buffer on every success,
+	// including a zero-length file's, so it is freed on every success.
+	const bool read = filestream_read_file(path.c_str(), &buf, &len) != 0;
+	const bool have_file = read && len > 0;
+	if (have_file)
+	{
+		pipeline_cache_ready = dev.init_pipeline_cache(static_cast<const uint8_t *>(buf), static_cast<size_t>(len));
+		Console.WriteLn("PGS: pipeline cache '%s': %lld bytes read in %.1f ms (%s).", path.c_str(),
+			static_cast<long long>(len), ms_since(start), pipeline_cache_ready ? "ok" : "rejected");
+	}
+	if (read)
+		free(buf);
+	if (!pipeline_cache_ready)
+	{
+		// No file, an empty one, or one Granite refused outright (its own
+		// UUID / hash checks only ever *empty* a legacy cache; an outright
+		// refusal is the pipeline-binary path meeting a file of the other
+		// format). A refused file would be refused forever, so it goes.
+		if (have_file)
+			filestream_delete(path.c_str());
+		pipeline_cache_ready = dev.init_pipeline_cache(nullptr, 0);
+		Console.WriteLn("PGS: pipeline cache '%s': starting fresh (%s).", path.c_str(),
+			pipeline_cache_ready ? "ok" : "vkCreatePipelineCache failed");
+	}
+}
+
+void GSRendererPGS::SavePipelineCache()
+{
+	if (!pipeline_cache_ready)
+		return;
+
+	const auto start = Util::get_current_time_nsecs();
+	const size_t size = dev.get_pipeline_cache_size();
+	if (!size)
+	{
+		Console.Error("PGS: pipeline cache size query failed, nothing written.");
+		return;
+	}
+	std::vector<uint8_t> data(size);
+	if (!dev.get_pipeline_cache_data(data.data(), size))
+	{
+		Console.Error("PGS: pipeline cache data query failed, nothing written.");
+		return;
+	}
+
+	// Always written: half a megabyte, atomically, once per device lifetime.
+	const std::string path = pgs_pipeline_cache_path();
+	const bool ok = filestream_write_file_atomic(path.c_str(), data.data(), static_cast<int64_t>(size));
+	if (ok)
+		Console.WriteLn("PGS: pipeline cache '%s': %zu bytes written in %.1f ms.", path.c_str(), size, ms_since(start));
+	else
+		Console.Error("PGS: failed to write pipeline cache '%s'.", path.c_str());
 }
 
 struct ParsedSuperSampling
@@ -225,6 +343,7 @@ bool GSRendererPGS::Init()
 		return false;
 
 	dev.set_context(*vulkan_ctx);
+	LoadPipelineCache();
 	// We'll cycle through a lot of these.
 	dev.init_frame_contexts(12);
 	dev.set_queue_lock([]() {

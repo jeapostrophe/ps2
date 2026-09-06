@@ -38,6 +38,12 @@ public:
 	u8 *GetRegsMem();
 
 private:
+	// The on-disk VkPipelineCache (see the .cpp): seeded into `dev` by Init,
+	// written back by the destructor while the VkDevice is still alive.
+	void LoadPipelineCache();
+	void SavePipelineCache();
+	bool pipeline_cache_ready = false;
+
 	ParallelGS::PrivRegisterState *priv;
 	Vulkan::Device dev;
 	ParallelGS::GSInterface iface;
