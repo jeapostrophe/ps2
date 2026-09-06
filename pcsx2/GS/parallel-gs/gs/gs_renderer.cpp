@@ -20,6 +20,7 @@
 #include "bitops.hpp"
 #include "shaders/slangmosh.hpp"
 #include "shaders/swizzle_utils.h"
+#include <unordered_set>
 #include "thread_id.hpp"
 #include "gs_util.hpp"
 #include "thread_name.hpp"
@@ -463,144 +464,94 @@ bool GSRenderer::can_potentially_super_sample() const
 	return buffers.gpu->get_create_info().size > vram_size * 2;
 }
 
+uint32_t GSRenderer::shading_subgroup_minimum_log2(uint32_t minimum_subgroup_size_log2) const
+{
+	// A [k, 6] request Granite lowers to "any subgroup size" — every k the
+	// device's own minimum already satisfies — is the same pipeline for every
+	// such k, but each k is its own pipeline hash (the range is hashed as
+	// asked). Ask with one canonical range, so a fixed-size GPU (Apple: 32)
+	// gets one ubershader pipeline per variant instead of one per rate.
+	const auto &props = device->get_device_features().vk13_props;
+	if ((1u << minimum_subgroup_size_log2) <= props.minSubgroupSize && 64u >= props.maxSubgroupSize)
+		return 0;
+	return minimum_subgroup_size_log2;
+}
+
+void GSRenderer::set_shading_subgroup_size(Vulkan::CommandBuffer &cmd, uint32_t minimum_subgroup_size_log2) const
+{
+	// Prefer Wave64 if we can get away with it.
+	if (device->supports_subgroup_size_log2(true, 6, 6))
+	{
+		cmd.set_subgroup_size_log2(true, 6, 6);
+		return;
+	}
+	minimum_subgroup_size_log2 = shading_subgroup_minimum_log2(minimum_subgroup_size_log2);
+	if (device->supports_subgroup_size_log2(true, minimum_subgroup_size_log2, 6))
+		cmd.set_subgroup_size_log2(true, minimum_subgroup_size_log2, 6);
+}
+
+void GSRenderer::set_shading_variant(Vulkan::CommandBuffer &cmd, uint32_t color_psm, uint32_t depth_psm,
+                                     uint32_t variant_flags, uint32_t feedback_psm, uint32_t feedback_cpsm) const
+{
+	cmd.set_specialization_constant_mask(0xff);
+	cmd.set_specialization_constant(2, color_psm);
+	cmd.set_specialization_constant(3, depth_psm);
+	cmd.set_specialization_constant(4, vram_size - 1);
+	cmd.set_specialization_constant(5, variant_flags);
+	cmd.set_specialization_constant(6, feedback_psm);
+	cmd.set_specialization_constant(7, feedback_cpsm);
+}
+
+void GSRenderer::set_triangle_setup_variant(Vulkan::CommandBuffer &cmd, uint32_t rate_x_log2, uint32_t rate_y_log2,
+                                            bool has_array, bool field_render) const
+{
+	cmd.set_specialization_constant_mask(0xf);
+	cmd.set_specialization_constant(0, rate_x_log2);
+	cmd.set_specialization_constant(1, rate_y_log2);
+	cmd.set_specialization_constant(2, uint32_t(has_array));
+	cmd.set_specialization_constant(3, uint32_t(field_render));
+}
+
+void GSRenderer::set_copy_variant(Vulkan::CommandBuffer &cmd, uint32_t workgroup_size, uint32_t spsm, uint32_t dpsm,
+                                  uint32_t direction, bool prepare_only) const
+{
+	cmd.set_specialization_constant_mask(0x7f);
+	cmd.set_specialization_constant(0, workgroup_size);
+	cmd.set_specialization_constant(1, spsm);
+	cmd.set_specialization_constant(2, dpsm);
+	cmd.set_specialization_constant(3, vram_size - 1);
+	cmd.set_specialization_constant(4, direction);
+	cmd.set_specialization_constant(5, uint32_t(can_potentially_super_sample()));
+	cmd.set_specialization_constant(6, uint32_t(prepare_only));
+}
+
+void GSRenderer::set_upload_variant(Vulkan::CommandBuffer &cmd, uint32_t psm, uint32_t cpsm, uint32_t vram_mask,
+                                    bool indirection) const
+{
+	cmd.set_specialization_constant_mask(0xf);
+	cmd.set_specialization_constant(0, psm);
+	cmd.set_specialization_constant(1, vram_mask);
+	cmd.set_specialization_constant(2, cpsm);
+	cmd.set_specialization_constant(3, uint32_t(indirection));
+}
+
+// Every (rate_x, rate_y) log2 pair a render pass instance can run at.
+static const struct { uint32_t sample_x, sample_y; } shading_sampling_rates[] = {
+	{ 0, 0 },
+	{ 0, 1 },
+	{ 1, 1 },
+	{ 0, 2 },
+	{ 1, 2 },
+	{ 2, 2 },
+	{ 1, 3 },
+};
+
 void GSRenderer::kick_compilation_tasks()
 {
 	// Pre-prime all potential shader variants early.
 	std::vector<Vulkan::DeferredPipelineCompile> tasks;
 	compilation_tasks_active = true;
-
-	{
-		auto cmd = device->request_command_buffer();
-		cmd->set_program(shaders.ubershader[0][0]);
-		Vulkan::DeferredPipelineCompile deferred = {};
-
-		static const struct { uint32_t sample_x, sample_y; } sampling_rates[] = {
-			{ 0, 0 },
-			{ 0, 1 },
-			{ 1, 1 },
-			{ 0, 2 },
-			{ 1, 2 },
-			{ 2, 2 },
-			{ 1, 3 },
-		};
-
-		static const uint32_t variant_flags[] = {
-			0,
-			VARIANT_FLAG_HAS_AA1_BIT,
-			VARIANT_FLAG_HAS_SCANMSK_BIT,
-			VARIANT_FLAG_HAS_AA1_BIT | VARIANT_FLAG_HAS_SCANMSK_BIT,
-			VARIANT_FLAG_FEEDBACK_BIT,
-			VARIANT_FLAG_FEEDBACK_BIT | VARIANT_FLAG_HAS_AA1_BIT,
-			VARIANT_FLAG_FEEDBACK_BIT | VARIANT_FLAG_HAS_SCANMSK_BIT,
-			VARIANT_FLAG_FEEDBACK_BIT | VARIANT_FLAG_HAS_AA1_BIT | VARIANT_FLAG_HAS_SCANMSK_BIT,
-		};
-
-		// Prime all common combinations.
-		static const struct { uint32_t color_psm, depth_psm; } formats[] = {
-			{ PSMCT24, PSMZ24 },
-			{ PSMCT32, PSMZ24 },
-			{ PSMCT16S, PSMZ24 },
-			{ PSMCT24, PSMZ16S },
-			{ PSMCT32, PSMZ16S },
-			{ PSMCT16S, PSMZ16S },
-			{ PSMCT24, UINT32_MAX },
-			{ PSMCT32, UINT32_MAX },
-			{ PSMCT16S, UINT32_MAX },
-			{ PSMZ24, UINT32_MAX },
-			{ PSMZ32, UINT32_MAX },
-			{ PSMZ16S, UINT32_MAX },
-			{ PSMZ16, UINT32_MAX },
-		};
-
-		static const struct { uint32_t feedback_psm, feedback_cpsm; } feedbacks[] = {
-			{ PSMCT32, 0 },
-			{ PSMCT24, 0 },
-			{ PSMCT16S, 0 },
-			{ PSMT4HL, PSMCT32 },
-			{ PSMT4HL, PSMCT16 },
-			{ PSMT4HH, PSMCT32 },
-			{ PSMT4HH, PSMCT16 },
-			{ PSMT8H, PSMCT32 },
-			{ PSMT8H, PSMCT16 },
-		};
-
-		cmd->set_specialization_constant_mask(0xff);
-		cmd->enable_subgroup_size_control(true);
-
-		static const struct
-		{
-			uint32_t lo, hi;
-		} subgroup_configs[] = {
-			{ 6, 6 },
-			{ 4, 6 },
-			{ 3, 6 },
-			{ 2, 6 },
-		};
-
-		for (auto &subgroup_config : subgroup_configs)
-		{
-			if (device->supports_subgroup_size_log2(true, subgroup_config.lo, subgroup_config.hi))
-				cmd->set_subgroup_size_log2(true, subgroup_config.lo, subgroup_config.hi);
-			else
-				continue;
-
-			for (auto &format : formats)
-			{
-				for (auto &flags : variant_flags)
-				{
-					for (auto &rates : sampling_rates)
-					{
-						for (auto &feedback : feedbacks)
-						{
-							if ((flags & VARIANT_FLAG_FEEDBACK_BIT) != 0)
-							{
-								if (swizzle_compat_key(feedback.feedback_psm) != swizzle_compat_key(format.color_psm))
-									continue;
-							}
-							else if (feedback.feedback_psm != 0 || feedback.feedback_cpsm != 0)
-								continue;
-
-							cmd->set_specialization_constant(0, rates.sample_x);
-							cmd->set_specialization_constant(1, rates.sample_y);
-							cmd->set_specialization_constant(2, format.color_psm);
-							cmd->set_specialization_constant(3, format.depth_psm);
-							cmd->set_specialization_constant(4, vram_size - 1);
-							cmd->set_specialization_constant(6, feedback.feedback_psm);
-							cmd->set_specialization_constant(7, feedback.feedback_cpsm);
-
-							uint32_t active_flags =
-									flags | (rates.sample_y ? VARIANT_FLAG_HAS_SUPER_SAMPLE_REFERENCE_BIT : 0);
-							cmd->set_specialization_constant(5, active_flags);
-							cmd->extract_pipeline_state(deferred);
-							tasks.push_back(deferred);
-
-							if (rates.sample_y != 0)
-							{
-								active_flags |= VARIANT_FLAG_HAS_TEXTURE_ARRAY_BIT;
-								cmd->set_specialization_constant(5, active_flags);
-								cmd->extract_pipeline_state(deferred);
-								tasks.push_back(deferred);
-							}
-
-							if (rates.sample_x == 0 && rates.sample_y == 0 && can_potentially_super_sample())
-							{
-								cmd->set_specialization_constant(
-									5, flags | VARIANT_FLAG_HAS_SUPER_SAMPLE_REFERENCE_BIT);
-								cmd->extract_pipeline_state(deferred);
-								tasks.push_back(deferred);
-							}
-						}
-					}
-				}
-			}
-
-			// If device has wave64, we always use it.
-			if (device->supports_subgroup_size_log2(true, 6, 6))
-				break;
-		}
-
-		device->submit_discard(cmd);
-	}
+	tasks.reserve(8192);
 
 	{
 		Vulkan::DeferredPipelineCompile deferred = {};
@@ -624,23 +575,34 @@ void GSRenderer::kick_compilation_tasks()
 			{ 64, PSMT4 },
 		};
 
-		cmd->set_specialization_constant_mask(0x7f);
-		cmd->set_specialization_constant(3, vram_size - 1);
-		cmd->set_specialization_constant(4, HOST_TO_LOCAL);
-		cmd->set_specialization_constant(5, uint32_t(can_potentially_super_sample()));
-
+		// emit_copy_vram specializes on BITBLTBUF.SPSM, DPSM and TRXDIR.XDIR
+		// separately, and the workgroup size follows DPSM (copy_is_fused_nibble;
+		// the table has PSMT4 at both sizes). A host-to-local upload carries
+		// whatever SPSM the guest left in BITBLTBUF — PSMCT32 (0) is the common
+		// don't-care, and a PSMCT32 -> PSMCT16 upload is the one measured
+		// stalling — so every DPSM is paired with itself and with PSMCT32 in
+		// that direction. A local-to-local copy converts between color/depth
+		// formats; palette formats copy to themselves.
 		for (auto &format : formats)
 		{
-			cmd->set_specialization_constant(0, format.wg_size);
-			cmd->set_specialization_constant(1, format.psm);
-			cmd->set_specialization_constant(2, format.psm);
+			const auto push_copy = [&](uint32_t spsm, uint32_t direction) {
+				for (unsigned prepare_only = 0; prepare_only < 2; prepare_only++)
+				{
+					set_copy_variant(*cmd, format.wg_size, spsm, format.psm, direction, prepare_only != 0);
+					cmd->extract_pipeline_state(deferred);
+					tasks.push_back(deferred);
+				}
+			};
 
-			for (unsigned prepare_only = 0; prepare_only < 2; prepare_only++)
-			{
-				cmd->set_specialization_constant(6, prepare_only);
-				cmd->extract_pipeline_state(deferred);
-				tasks.push_back(deferred);
-			}
+			push_copy(format.psm, HOST_TO_LOCAL);
+			push_copy(format.psm, LOCAL_TO_LOCAL);
+			if (format.psm != PSMCT32)
+				push_copy(PSMCT32, HOST_TO_LOCAL);
+			if (is_palette_format(format.psm))
+				continue;
+			for (auto &src : formats)
+				if (src.psm != format.psm && !is_palette_format(src.psm))
+					push_copy(src.psm, LOCAL_TO_LOCAL);
 		}
 
 		device->submit_discard(cmd);
@@ -649,7 +611,6 @@ void GSRenderer::kick_compilation_tasks()
 	{
 		Vulkan::DeferredPipelineCompile deferred = {};
 		auto cmd = device->request_command_buffer();
-		cmd->set_specialization_constant_mask(0x7);
 
 		static const struct { uint32_t psm; uint32_t cpsm; } formats[] = {
 			{ PSMCT32, 0 },
@@ -672,19 +633,21 @@ void GSRenderer::kick_compilation_tasks()
 
 		const uint32_t vram_masks[] = { PageSize - 1, vram_size - 1 };
 
+		// upload_texture: (psm, cpsm, page or whole-VRAM mask, through an
+		// indirection buffer or not).
 		for (auto &format : formats)
 		{
-			cmd->set_specialization_constant(0, format.psm);
-			cmd->set_specialization_constant(2, format.cpsm);
-
 			for (auto mask : vram_masks)
 			{
-				cmd->set_specialization_constant(1, mask);
-				for (auto *prog : shaders.upload)
+				for (uint32_t indirection = 0; indirection < 2; indirection++)
 				{
-					cmd->set_program(prog);
-					cmd->extract_pipeline_state(deferred);
-					tasks.push_back(deferred);
+					set_upload_variant(*cmd, format.psm, format.cpsm, mask, indirection != 0);
+					for (auto *prog : shaders.upload)
+					{
+						cmd->set_program(prog);
+						cmd->extract_pipeline_state(deferred);
+						tasks.push_back(deferred);
+					}
 				}
 			}
 		}
@@ -726,16 +689,183 @@ void GSRenderer::kick_compilation_tasks()
 		device->submit_discard(cmd);
 	}
 
+	{
+		Vulkan::DeferredPipelineCompile deferred = {};
+		auto cmd = device->request_command_buffer();
+		cmd->set_program(shaders.triangle_setup);
+
+		// dispatch_triangle_setup: (rate_x, rate_y, bound texture has an array,
+		// array && field render). The first render pass of a game paid this one.
+		static const struct { uint32_t has_array, field; } texturing[] = {
+			{ 0, 0 },
+			{ 1, 0 },
+			{ 1, 1 },
+		};
+
+		for (auto &rates : shading_sampling_rates)
+		{
+			for (auto &tex : texturing)
+			{
+				set_triangle_setup_variant(*cmd, rates.sample_x, rates.sample_y, tex.has_array != 0, tex.field != 0);
+				cmd->extract_pipeline_state(deferred);
+				tasks.push_back(deferred);
+			}
+		}
+
+		device->submit_discard(cmd);
+	}
+
+	// The ubershader matrix last: it is the bulk of the list, and everything
+	// above it is what the first render pass needs besides its one variant.
+	{
+		auto cmd = device->request_command_buffer();
+		cmd->set_program(shaders.ubershader[0][0]);
+		Vulkan::DeferredPipelineCompile deferred = {};
+
+		// The common combinations. Two bits are left out on purpose:
+		// HAS_PRIMITIVE_RANGE needs a pass whose frame and Z buffers alias,
+		// FEEDBACK_DEPTH a depth-texture feedback pass; a stall line names
+		// either if a game asks (spec constant 5, bits 8 and 32).
+		static const uint32_t variant_flags[] = {
+			0,
+			VARIANT_FLAG_HAS_AA1_BIT,
+			VARIANT_FLAG_HAS_SCANMSK_BIT,
+			VARIANT_FLAG_HAS_AA1_BIT | VARIANT_FLAG_HAS_SCANMSK_BIT,
+			VARIANT_FLAG_FEEDBACK_BIT,
+			VARIANT_FLAG_FEEDBACK_BIT | VARIANT_FLAG_HAS_AA1_BIT,
+			VARIANT_FLAG_FEEDBACK_BIT | VARIANT_FLAG_HAS_SCANMSK_BIT,
+			VARIANT_FLAG_FEEDBACK_BIT | VARIANT_FLAG_HAS_AA1_BIT | VARIANT_FLAG_HAS_SCANMSK_BIT,
+		};
+
+		// Prime all common combinations.
+		static const struct { uint32_t color_psm, depth_psm; } formats[] = {
+			{ PSMCT24, PSMZ24 },
+			{ PSMCT32, PSMZ24 },
+			{ PSMCT16S, PSMZ24 },
+			{ PSMCT24, PSMZ16S },
+			{ PSMCT32, PSMZ16S },
+			{ PSMCT16S, PSMZ16S },
+			{ PSMCT24, UINT32_MAX },
+			{ PSMCT32, UINT32_MAX },
+			{ PSMCT16S, UINT32_MAX },
+			{ PSMZ24, UINT32_MAX },
+			{ PSMZ32, UINT32_MAX },
+			{ PSMZ16S, UINT32_MAX },
+			{ PSMZ16, UINT32_MAX },
+		};
+
+		static const struct { uint32_t feedback_psm, feedback_cpsm; } feedbacks[] = {
+			{ PSMCT32, 0 },
+			{ PSMCT24, 0 },
+			{ PSMCT16S, 0 },
+			{ PSMT4HL, PSMCT32 },
+			{ PSMT4HL, PSMCT16 },
+			{ PSMT4HH, PSMCT32 },
+			{ PSMT4HH, PSMCT16 },
+			{ PSMT8H, PSMCT32 },
+			{ PSMT8H, PSMCT16 },
+		};
+
+		cmd->enable_subgroup_size_control(true);
+
+		// The subgroup range is part of the pipeline hash, so a pre-warmed variant is
+		// only ever found if it was built with the range dispatch_shading asks for
+		// (set_shading_subgroup_size: wave64 where the device has it, otherwise
+		// [rate_x + rate_y, 6]). The old candidate list ({6,6}, {4,6}, {3,6}, {2,6})
+		// never contained [0,6] or [1,6], the ranges of every single-sampled and 2x
+		// draw on a GPU without wave64, so on such a GPU every one of those variants
+		// compiled synchronously at first use, while three copies of every other
+		// variant were built for nothing. Measured on Apple M4 Max / MoltenVK
+		// (retro-trainer PLAN-ps2 PS2-01).
+		const bool wave64 = device->supports_subgroup_size_log2(true, 6, 6);
+
+		// Rate outermost: the list is compiled front to back, and single-sampled
+		// draws are what a game asks for first (and, with super-sampling off,
+		// only).
+		for (auto &rates : shading_sampling_rates)
+		{
+			const uint32_t minimum_subgroup_size_log2 =
+					shading_subgroup_minimum_log2(rates.sample_x + rates.sample_y);
+			if (!wave64 && !device->supports_subgroup_size_log2(true, minimum_subgroup_size_log2, 6))
+				continue;
+			set_shading_subgroup_size(*cmd, minimum_subgroup_size_log2);
+			cmd->set_specialization_constant(0, rates.sample_x);
+			cmd->set_specialization_constant(1, rates.sample_y);
+
+			// dispatch_shading_commands also dispatches every super-sampled pass
+			// once at (0, 0) — the single-sample demotion — under the pass's own
+			// subgroup range, which is its own pipeline hash where that range
+			// is a real requirement (two rates with the same range make the
+			// same twin; the dedupe below keeps one).
+			const bool single_sample_twin = !wave64 && minimum_subgroup_size_log2 != 0;
+
+			for (auto &format : formats)
+			{
+				for (auto &flags : variant_flags)
+				{
+					for (auto &feedback : feedbacks)
+					{
+						if ((flags & VARIANT_FLAG_FEEDBACK_BIT) != 0)
+						{
+							if (swizzle_compat_key(feedback.feedback_psm) != swizzle_compat_key(format.color_psm))
+								continue;
+						}
+						else if (feedback.feedback_psm != 0 || feedback.feedback_cpsm != 0)
+							continue;
+
+						const auto push_variant = [&](uint32_t active_flags) {
+							set_shading_variant(*cmd, format.color_psm, format.depth_psm, active_flags,
+							                    feedback.feedback_psm, feedback.feedback_cpsm);
+							cmd->extract_pipeline_state(deferred);
+							tasks.push_back(deferred);
+							if (single_sample_twin)
+							{
+								cmd->set_specialization_constant(0, 0);
+								cmd->set_specialization_constant(1, 0);
+								cmd->extract_pipeline_state(deferred);
+								tasks.push_back(deferred);
+								cmd->set_specialization_constant(0, rates.sample_x);
+								cmd->set_specialization_constant(1, rates.sample_y);
+							}
+						};
+
+						uint32_t active_flags =
+								flags | (rates.sample_y ? VARIANT_FLAG_HAS_SUPER_SAMPLE_REFERENCE_BIT : 0);
+						push_variant(active_flags);
+
+						if (rates.sample_y != 0)
+							push_variant(active_flags | VARIANT_FLAG_HAS_TEXTURE_ARRAY_BIT);
+
+						if (rates.sample_x == 0 && rates.sample_y == 0 && can_potentially_super_sample())
+							push_variant(flags | VARIANT_FLAG_HAS_SUPER_SAMPLE_REFERENCE_BIT);
+					}
+				}
+			}
+		}
+
+		device->submit_discard(cmd);
+	}
+
+	// build_compute_pipeline compiles whatever it is handed and add_pipeline
+	// throws a second copy away, so a repeated hash is a whole compile wasted.
+	std::unordered_set<Util::Hash> seen;
+	tasks.erase(std::remove_if(tasks.begin(), tasks.end(),
+	                           [&](const Vulkan::DeferredPipelineCompile &t) { return !seen.insert(t.hash).second; }),
+	            tasks.end());
+
 	size_t num_tasks = tasks.size();
 	size_t target_threads = (cpu_features_get_core_amount() + 1) / 2;
-	size_t tasks_per_thread = num_tasks / target_threads;
 
 	for (size_t thread_index = 0; thread_index < target_threads; thread_index++)
 	{
-		std::vector<Vulkan::DeferredPipelineCompile> deferred(
-			tasks.data() + thread_index * tasks_per_thread,
-			tasks.data() + std::min<size_t>((thread_index + 1) * tasks_per_thread, tasks.size())
-		);
+		// Strided, not chunked: every thread starts at the front of the list,
+		// so the list's order is the order the pipelines become available in —
+		// and nothing is left over (a `num_tasks / target_threads` chunk stride
+		// left the last `num_tasks % target_threads` entries to nobody).
+		std::vector<Vulkan::DeferredPipelineCompile> deferred;
+		deferred.reserve(num_tasks / target_threads + 1);
+		for (size_t i = thread_index; i < num_tasks; i += target_threads)
+			deferred.push_back(tasks[i]);
 
 		auto async_task = std::unique_ptr<CompilationTask>(new CompilationTask);
 		auto *task_state = async_task.get();
@@ -1975,12 +2105,8 @@ void GSRenderer::dispatch_triangle_setup(Vulkan::CommandBuffer &cmd, const Rende
 	cmd.push_constants(&push, 0, sizeof(push));
 
 	cmd.set_program(shaders.triangle_setup);
-	cmd.set_specialization_constant_mask(0xf);
-	cmd.set_specialization_constant(0, sampling_rate_x_log2);
-	cmd.set_specialization_constant(1, sampling_rate_y_log2);
-	cmd.set_specialization_constant(2, bound_texture_has_array);
-
-	cmd.set_specialization_constant(3, bound_texture_has_array && allow_field_render);
+	set_triangle_setup_variant(cmd, sampling_rate_x_log2, sampling_rate_y_log2,
+	                           bound_texture_has_array, bound_texture_has_array && allow_field_render);
 
 	Vulkan::QueryPoolHandle start_ts, end_ts;
 	if (enable_timestamps)
@@ -2515,17 +2641,8 @@ void GSRenderer::dispatch_shading(Vulkan::CommandBuffer &cmd, const RenderPass &
 	// The shading itself runs at workgroup size == 64, we can handle multiple subgroups, but prefer large waves,
 	// since we're doing so much scalar work.
 
-	cmd.set_specialization_constant_mask(0xff);
-
 	cmd.enable_subgroup_size_control(true);
-
-	uint32_t minimum_subgroup_size_log2 = inst.sampling_rate_x_log2 + inst.sampling_rate_y_log2;
-
-	// Prefer Wave64 if we can get away with it.
-	if (device->supports_subgroup_size_log2(true, 6, 6))
-		cmd.set_subgroup_size_log2(true, 6, 6);
-	else if (device->supports_subgroup_size_log2(true, minimum_subgroup_size_log2, 6))
-		cmd.set_subgroup_size_log2(true, minimum_subgroup_size_log2, 6);
+	set_shading_subgroup_size(cmd, inst.sampling_rate_x_log2 + inst.sampling_rate_y_log2);
 
 	uint32_t color_psm = inst.fb.frame.desc.PSM;
 	uint32_t depth_psm = inst.fb.z.desc.PSM | ZBUFBits::PSM_MSB;
@@ -2542,10 +2659,6 @@ void GSRenderer::dispatch_shading(Vulkan::CommandBuffer &cmd, const RenderPass &
 		}
 #endif
 	}
-
-	cmd.set_specialization_constant(2, color_psm);
-	cmd.set_specialization_constant(3, inst.z_sensitive ? depth_psm : UINT32_MAX);
-	cmd.set_specialization_constant(4, vram_size - 1);
 
 	uint32_t variant_flags = 0;
 
@@ -2592,18 +2705,12 @@ void GSRenderer::dispatch_shading(Vulkan::CommandBuffer &cmd, const RenderPass &
 	if (first_primitive_index_z_sensitive != UINT32_MAX)
 		variant_flags |= VARIANT_FLAG_HAS_PRIMITIVE_RANGE_BIT;
 
-	if (rp.feedback_mode != RenderPass::Feedback::None)
+	const bool feedback = rp.feedback_mode != RenderPass::Feedback::None;
+	if (feedback)
 	{
-		cmd.set_specialization_constant(6, rp.feedback_texture_psm);
-		cmd.set_specialization_constant(7, rp.feedback_texture_cpsm);
 		variant_flags |= VARIANT_FLAG_FEEDBACK_BIT;
 		if (rp.feedback_mode == RenderPass::Feedback::Depth)
 			variant_flags |= VARIANT_FLAG_FEEDBACK_DEPTH_BIT;
-	}
-	else
-	{
-		cmd.set_specialization_constant(6, 0);
-		cmd.set_specialization_constant(7, 0);
 	}
 
 	if (can_potentially_super_sample())
@@ -2612,7 +2719,8 @@ void GSRenderer::dispatch_shading(Vulkan::CommandBuffer &cmd, const RenderPass &
 	if (bound_texture_has_array)
 		variant_flags |= VARIANT_FLAG_HAS_TEXTURE_ARRAY_BIT;
 
-	cmd.set_specialization_constant(5, variant_flags);
+	set_shading_variant(cmd, color_psm, inst.z_sensitive ? depth_psm : UINT32_MAX, variant_flags,
+	                    feedback ? rp.feedback_texture_psm : 0, feedback ? rp.feedback_texture_cpsm : 0);
 
 	assert(inst.sampling_rate_x_log2 <= 2);
 	assert(inst.sampling_rate_y_log2 <= 3);
@@ -2746,14 +2854,8 @@ void GSRenderer::emit_copy_vram(Vulkan::CommandBuffer &cmd,
 	bool is_fused_nibble = copy_is_fused_nibble(base_desc);
 	const uint32_t workgroup_size = is_fused_nibble ? 32 : 64;
 
-	cmd.set_specialization_constant_mask(0x7f);
-	cmd.set_specialization_constant(0, workgroup_size);
-	cmd.set_specialization_constant(1, base_desc.bitbltbuf.desc.SPSM);
-	cmd.set_specialization_constant(2, base_desc.bitbltbuf.desc.DPSM);
-	cmd.set_specialization_constant(3, vram_size - 1);
-	cmd.set_specialization_constant(4, base_desc.trxdir.desc.XDIR);
-	cmd.set_specialization_constant(5, uint32_t(can_potentially_super_sample()));
-	cmd.set_specialization_constant(6, uint32_t(prepare_only));
+	set_copy_variant(cmd, workgroup_size, base_desc.bitbltbuf.desc.SPSM, base_desc.bitbltbuf.desc.DPSM,
+	                 base_desc.trxdir.desc.XDIR, prepare_only);
 
 	cmd.set_storage_buffer(0, 0, *buffers.gpu);
 	cmd.set_storage_buffer(0, 1, *buffers.vram_copy_atomics);
@@ -3553,16 +3655,9 @@ void GSRenderer::upload_texture(const TextureUpload &upload)
 		{ uint32_t(desc.miptbp4_6.desc.TBP3), uint32_t(desc.miptbp4_6.desc.TBW3) },
 	};
 
-	cmd.set_specialization_constant_mask(0xf);
-	cmd.set_specialization_constant(0, uint32_t(desc.tex0.desc.PSM));
-	cmd.set_specialization_constant(2, uint32_t(desc.tex0.desc.CPSM));
-	cmd.set_specialization_constant(3, bool(upload.indirection.buffer));
-
 	// Makes it feasible to handle REGION_CLAMP where we only access one page, but at an offset.
-	if (scratch.buffer)
-		cmd.set_specialization_constant(1, PageSize - 1);
-	else
-		cmd.set_specialization_constant(1, vram_size - 1);
+	set_upload_variant(cmd, desc.tex0.desc.PSM, desc.tex0.desc.CPSM,
+	                   scratch.buffer ? PageSize - 1 : vram_size - 1, bool(upload.indirection.buffer));
 
 	for (uint32_t level = 0; level < levels; level++)
 	{

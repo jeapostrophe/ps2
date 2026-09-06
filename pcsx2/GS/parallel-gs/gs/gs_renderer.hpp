@@ -547,6 +547,21 @@ private:
 
 	void drain_compilation_tasks_nonblock();
 	void kick_compilation_tasks();
+	// Each compute draw site's specialization, set in one place, so the
+	// pre-warm asks through the same call and the pipeline hashes agree
+	// (the subgroup range, the constant mask and every constant are hashed).
+	// The shading rate (constants 0 and 1) is the dispatch's own, set beside
+	// the dispatch; everything else the ubershader is specialized on is here.
+	void set_shading_subgroup_size(Vulkan::CommandBuffer &cmd, uint32_t minimum_subgroup_size_log2) const;
+	uint32_t shading_subgroup_minimum_log2(uint32_t minimum_subgroup_size_log2) const;
+	void set_shading_variant(Vulkan::CommandBuffer &cmd, uint32_t color_psm, uint32_t depth_psm,
+	                         uint32_t variant_flags, uint32_t feedback_psm, uint32_t feedback_cpsm) const;
+	void set_triangle_setup_variant(Vulkan::CommandBuffer &cmd, uint32_t rate_x_log2, uint32_t rate_y_log2,
+	                                bool has_array, bool field_render) const;
+	void set_copy_variant(Vulkan::CommandBuffer &cmd, uint32_t workgroup_size, uint32_t spsm, uint32_t dpsm,
+	                      uint32_t direction, bool prepare_only) const;
+	void set_upload_variant(Vulkan::CommandBuffer &cmd, uint32_t psm, uint32_t cpsm, uint32_t vram_mask,
+	                        bool indirection) const;
 	PGS::atomic_bool compilation_tasks_active;
 
 	/* std::async's future was asked for three things here: run the batch
