@@ -29,6 +29,7 @@
 #include "timer.hpp"
 #include "breadcrumbs.hpp"
 #include <string.h>
+#include <string>
 
 using namespace Util;
 
@@ -1019,14 +1020,20 @@ void CommandBuffer::end_render_pass()
 	begin_compute();
 }
 
-static void log_compile_time(const char *tag, Hash hash,
+// If a compile takes more than 5 ms and it's not happening on an async thread,
+// we consider it a stall.
+static bool compile_stalled(int64_t time_ns, CommandBuffer::CompileMode mode)
+{
+	return time_ns >= 5 * 1000 * 1000 && mode != CommandBuffer::CompileMode::AsyncThread;
+}
+
+// Returns whether the compile was a stall.
+static bool log_compile_time(const char *tag, Hash hash,
                              int64_t time_ns, VkResult result,
                              CommandBuffer::CompileMode mode)
 {
-	bool stall = time_ns >= 5 * 1000 * 1000 && mode != CommandBuffer::CompileMode::AsyncThread;
+	bool stall = compile_stalled(time_ns, mode);
 #ifndef VULKAN_DEBUG
-	// If a compile takes more than 5 ms and it's not happening on an async thread,
-	// we consider it a stall.
 	if (stall)
 #endif
 	{
@@ -1065,6 +1072,7 @@ static void log_compile_time(const char *tag, Hash hash,
 			     time_us, mode_str, result == VK_SUCCESS ? "yes" : "no");
 		}
 	}
+	return stall;
 }
 
 Pipeline CommandBuffer::build_compute_pipeline(Device *device, const DeferredPipelineCompile &compile,
@@ -1186,7 +1194,25 @@ Pipeline CommandBuffer::build_compute_pipeline(Device *device, const DeferredPip
 	auto start_ts = Util::get_current_time_nsecs();
 	VkResult vr = device->pipeline_binary_cache.create_pipeline(&info, compile.cache, &compute_pipeline);
 	auto end_ts = Util::get_current_time_nsecs();
-	log_compile_time("compute", compile.hash, end_ts - start_ts, vr, mode);
+	// A sync stall names its specialization, so a log can be matched against the
+	// renderer's pre-warm lists (paraLLEl-GS kick_compilation_tasks) by hand:
+	// the pipeline hash alone cannot be.
+	if (log_compile_time("compute", compile.hash, end_ts - start_ts, vr, mode))
+	{
+		// Empty when the shader declares no specialization constants.
+		std::string spec;
+		for_each_bit(mask, [&](uint32_t bit) {
+			spec += (spec.empty() ? "" : " ") + std::to_string(bit) + "=" +
+			        std::to_string(compile.potential_static_state.spec_constants[bit]);
+		});
+		LOGW("  stalled compute pipeline %016llx: shader %016llx, subgroup log2 [%u, %u]%s, spec {%s}\n",
+		     static_cast<unsigned long long>(compile.hash),
+		     static_cast<unsigned long long>(shader.get_hash()),
+		     compile.static_state.state.subgroup_minimum_size_log2,
+		     compile.static_state.state.subgroup_maximum_size_log2,
+		     compile.static_state.state.subgroup_control_size ? "" : " (uncontrolled)",
+		     spec.c_str());
+	}
 
 	if (vr != VK_SUCCESS || compute_pipeline == VK_NULL_HANDLE)
 	{
