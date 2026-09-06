@@ -434,6 +434,28 @@ void HostSys::Munmap(void* base, size_t size)
 #endif
 }
 
+bool HostSys::ZeroPages(void* base, size_t size)
+{
+#ifdef _WIN32
+	/* Decommit then recommit: the recommitted pages are zero, and the
+	 * reservation underneath is untouched. MEM_RESET is not this -- it
+	 * does not promise zeros. */
+	if (!VirtualFree(base, size, MEM_DECOMMIT))
+		return false;
+	return VirtualAlloc(base, size, MEM_COMMIT, PAGE_READWRITE) == base;
+#else
+	/* The one MAP_FIXED in this file that is not an unmap, and the
+	 * carve-out from Mmap's refusal of it: MAP_FIXED is destructive over
+	 * a range that is not fully allocated (XNU raises EXC_GUARD), and
+	 * this range is, by contract, one mapping the caller owns end to end
+	 * -- so what the destruction replaces is exactly the pages being
+	 * zeroed. A fresh anonymous mapping is zero-filled on every host and
+	 * is not a hint, which is what madvise is on Darwin. */
+	void* res = mmap(base, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+	return res == base;
+#endif
+}
+
 void HostSys::MemProtect(void* baseaddr, size_t size, const PageProtectionMode mode)
 {
 #ifdef _WIN32

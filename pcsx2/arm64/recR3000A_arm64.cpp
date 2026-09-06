@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <unordered_map>
 #include <vector>
 #include <sys/mman.h>
@@ -74,7 +75,17 @@ namespace
 	constexpr u32 kRamWords = kRamBytes >> 2;
 	BlockFn*      s_lut      = nullptr;
 	inline bool InRam(u32 np) { return np < kRamBytes; }
-	inline void LutClearAll() { if (s_lut) armZeroMapping(s_lut, (size_t)kRamWords * sizeof(BlockFn)); }
+	// The LUT goes to zero with the cache it indexes, on reset and on a wrap. A
+	// clear that silently does nothing is a LUT of pointers into a rewound cache
+	// -- silent corruption, not a slow path -- so a refused clear stops here.
+	inline void LutClearAll()
+	{
+		if (s_lut && !HostSys::ZeroPages(s_lut, (size_t)kRamWords * sizeof(BlockFn)))
+		{
+			Console.Error("arm64 IOP rec: could not zero the block LUT (%zu bytes) -- cannot continue", (size_t)kRamWords * sizeof(BlockFn));
+			std::abort();
+		}
+	}
 
 	// Word-granular "native code covers this RAM word" bitmap (64KB). Every IOP
 	// RAM store lands in recClearIOP, so the common case (word with no compiled

@@ -4,8 +4,6 @@
 
 #include "../../common/Threading.h"
 #include <cstring>
-#include <cstdlib>
-#include <sys/mman.h>
 #include "arm64/AsmHelpers.h"
 
 #include "arm64/ArmCompat.h"
@@ -241,17 +239,6 @@ bool armVixlSelfTest()
 {
 	static const bool ok = armVixlSelfTestOnce();
 	return ok;
-}
-
-void armZeroMapping(void* base, size_t size)
-{
-	void* res = mmap(base, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-	if (res != base)
-	{
-		// A stale LUT is silent corruption, not a slow path; stop here.
-		Console.Error("armZeroMapping: MAP_FIXED remap of %p (%zu bytes) failed -- cannot continue", base, size);
-		std::abort();
-	}
 }
 
 void armEmitJmpPtr(void* code_address, const void* target, bool flush_icache)

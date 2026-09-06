@@ -190,7 +190,17 @@ namespace
 
 	inline u32  Norm(u32 a)  { return a & 0x1fffffff; }
 	inline bool InRam(u32 np) { return np < kRamBytes; }
-	inline void LutClearAll() { if (s_lut) armZeroMapping(s_lut, (size_t)kRamWords * sizeof(BlockFn)); }
+	// The LUT goes to zero with the cache it indexes, on reset and on a wrap. A
+	// clear that silently does nothing is a LUT of pointers into a rewound cache
+	// -- silent corruption, not a slow path -- so a refused clear stops here.
+	inline void LutClearAll()
+	{
+		if (s_lut && !HostSys::ZeroPages(s_lut, (size_t)kRamWords * sizeof(BlockFn)))
+		{
+			Console.Error("arm64 EE rec: could not zero the block LUT (%zu bytes) -- cannot continue", (size_t)kRamWords * sizeof(BlockFn));
+			std::abort();
+		}
+	}
 
 	// C.46: the whole cpuRegisters struct sits within the ldr/str immediate
 	// window of the guest-reg base already pinned in x19, so reach its fields

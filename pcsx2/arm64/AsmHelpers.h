@@ -126,17 +126,6 @@ struct ArmCodeWriteScope
 // which is how this test used to fail: by taking the process down instead of
 // returning false.
 bool armVixlSelfTest();
-
-// Zero a page-aligned anonymous mapping in place, the way the block LUTs are
-// cleared on every reset and cache wrap. It was madvise(MADV_DONTNEED), which
-// discards the pages on Linux so the next read is zero -- and which is only a
-// hint on Darwin: measured on macOS 15.3, the bytes are still there afterwards
-// (MADV_FREE too). Every reset then left the EE and IOP LUTs full of pointers
-// into a cache that had just been rewound, and the first frame after
-// retro_reset dispatched into whatever the new blocks had overwritten: no
-// crash, no ELF, a black screen for ever. A fresh anonymous MAP_FIXED mapping
-// over the same range is zero-filled on every host and is not a hint.
-void armZeroMapping(void* base, size_t size);
 void armEmitCbnz(const vixl::aarch64::Register& reg, const void* ptr);
 void armEmitCondBranch(vixl::aarch64::Condition cond, const void* ptr);
 void armMoveAddressToReg(const vixl::aarch64::Register& reg, const void* addr);

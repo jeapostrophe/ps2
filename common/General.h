@@ -65,6 +65,15 @@ namespace HostSys
 	// Unmaps a block allocated by SysMmap
 	extern void Munmap(void* base, size_t size);
 
+	// Zero a mapping in place, releasing its resident pages: a whole
+	// anonymous read/write mapping this process owns, [base, base+size).
+	// Returns false if the host refused. Not madvise(MADV_DONTNEED): that
+	// discards to zero on Linux and is only a hint on Darwin (measured,
+	// macOS 15.3 — the bytes are still there afterwards, MADV_FREE too),
+	// which left the arm64 recompilers' block LUTs full of stale pointers
+	// after every reset. See the definition for the MAP_FIXED carve-out.
+	extern bool ZeroPages(void* base, size_t size);
+
 	extern void MemProtect(void* baseaddr, size_t size, const PageProtectionMode mode);
 
 	extern std::string GetFileMappingName(const char* prefix);
