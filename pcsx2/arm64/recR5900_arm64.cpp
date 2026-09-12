@@ -3578,9 +3578,9 @@ namespace {
 		{
 			s_exit_labels.emplace_back();
 			Label* slow = &s_exit_labels.back();
-			m.Ldr(w0, RegsField(&cpuRegs.cycle));
-			m.Ldr(w1, RegsField(&cpuRegs.nextEventCycle));
-			m.Subs(w0, w0, w1);   // (s32)(cycle - nextEventCycle)
+			m.Ldr(x0, RegsField(&cpuRegs.cycle));
+			m.Ldr(x1, RegsField(&cpuRegs.nextEventCycle));
+			m.Subs(x0, x0, x1);   // (s64)(cycle - nextEventCycle): both are u64
 			m.B(slow, pl);        // event due -> out-of-line stub
 			s_exit_pending.push_back({slow, evt});
 		}
@@ -3730,9 +3730,14 @@ namespace {
 		m.Lsr(w2, w0, 3);
 		m.Cmp(w2, 0);
 		m.Csinc(w2, w2, wzr, ne); // max(1, bc >> 3)
-		m.Ldr(w3, RegsField(&cpuRegs.cycle));
-		m.Add(w3, w3, w2);
-		m.Str(w3, RegsField(&cpuRegs.cycle));
+		// cpuRegs.cycle is u64 (2675221d9, "EE: switch to 64-bit cycle
+		// counter"): the add is 64-bit, or whenever it crosses a 2^32 boundary
+		// (one every ~14.6 s of EE time) the carry out of the low word is lost
+		// and the counter falls back by 2^32.
+		// x2 is w2 zero-extended (a W write clears the upper half).
+		m.Ldr(x3, RegsField(&cpuRegs.cycle));
+		m.Add(x3, x3, x2);
+		m.Str(x3, RegsField(&cpuRegs.cycle));
 		m.And(w0, w0, 7);
 		m.Str(w0, MemOperand(x10));
 		m.B(&done);
@@ -3869,9 +3874,9 @@ namespace {
 		const auto EmitEventTest = [&m, evt]()
 		{
 			Label skip;
-			m.Ldr(w0, RegsField(&cpuRegs.cycle));
-			m.Ldr(w1, RegsField(&cpuRegs.nextEventCycle));
-			m.Subs(w0, w0, w1); // (s32)(cycle - nextEventCycle)
+			m.Ldr(x0, RegsField(&cpuRegs.cycle));
+			m.Ldr(x1, RegsField(&cpuRegs.nextEventCycle));
+			m.Subs(x0, x0, x1); // (s64)(cycle - nextEventCycle): both are u64
 			m.B(&skip, mi);     // not due yet
 			m.Mov(x16, evt);
 			m.Blr(x16);
@@ -3889,20 +3894,22 @@ namespace {
 		// nextEventCycle when spinning there (_doBranch_shared, gated on
 		// Cpu==&intCpu so the JIT never benefited). Mirror it on the taken
 		// path: after the cycle flush (upd), before the event test, do
-		// `if (nextEventCycle != cycle) cycle = nextEventCycle` -- the next
-		// event then fires immediately instead of burning host time emulating
-		// millions of idle iterations. Same effect as the interpreter's
-		// `(s64)(u32(nev-cyc)) > 0` condition (true iff the u32s differ).
+		// `if ((s64)(nextEventCycle - cycle) > 0) cycle = nextEventCycle` --
+		// the interpreter's own condition -- so the next event fires
+		// immediately instead of burning host time emulating millions of idle
+		// iterations. Both fields are u64 (2675221d9): the loads, compare and
+		// store are 64-bit, or a skip across a 2^32 boundary writes only the
+		// low word and cycle falls back by 2^32.
 		const bool idle_skip = EmuConfig.Speedhacks.WaitLoop && !is_jr
 			&& ((tconst & 0x1fffffff) == 0x00081fc0);
 		const auto EmitIdleSkip = [&m]()
 		{
 			Label skip;
-			m.Ldr(w0, RegsField(&cpuRegs.cycle));
-			m.Ldr(w1, RegsField(&cpuRegs.nextEventCycle));
-			m.Cmp(w1, w0);
-			m.B(&skip, eq);
-			m.Str(w1, RegsField(&cpuRegs.cycle)); // cycle = nextEventCycle
+			m.Ldr(x0, RegsField(&cpuRegs.cycle));
+			m.Ldr(x1, RegsField(&cpuRegs.nextEventCycle));
+			m.Cmp(x1, x0);
+			m.B(&skip, le); // nothing ahead to skip to
+			m.Str(x1, RegsField(&cpuRegs.cycle)); // cycle = nextEventCycle
 			m.Bind(&skip);
 		};
 
@@ -4042,15 +4049,18 @@ namespace {
 		m.Bic(w3, w0, 1u << 1); // Status & ~EXL
 		m.Csel(w0, w2, w3, ne);
 		m.Str(w0, RegsField(&cpuRegs.CP0.n.Status));
-		// if ((int)(nextEventCycle - cycle) > 4) nextEventCycle = cycle + 4
+		// if ((int)(nextEventCycle - cycle) > 4) nextEventCycle = cycle + 4 --
+		// COP0.cpp's ERET, whose (int) cast the 32-bit difference keeps. Both
+		// fields are u64 (2675221d9), so the pulled value is formed and stored
+		// in 64 bits: a 32-bit store would replace only the low word.
 		Label no_pull;
-		m.Ldr(w0, RegsField(&cpuRegs.cycle));
-		m.Ldr(w1, RegsField(&cpuRegs.nextEventCycle));
+		m.Ldr(x0, RegsField(&cpuRegs.cycle));
+		m.Ldr(x1, RegsField(&cpuRegs.nextEventCycle));
 		m.Sub(w2, w1, w0);
 		m.Cmp(w2, 4);
 		m.B(&no_pull, le);
-		m.Add(w0, w0, 4);
-		m.Str(w0, RegsField(&cpuRegs.nextEventCycle));
+		m.Add(x0, x0, 4);
+		m.Str(x0, RegsField(&cpuRegs.nextEventCycle));
 		m.Bind(&no_pull);
 		s_rc.FlushDirty(m, gpr); // block exit: the next block reads GPR memory
 		// NO cycle flush and NO event test here -- mirror the interpreter
