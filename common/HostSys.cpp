@@ -17,6 +17,7 @@
 #define _XOPEN_SOURCE
 #include <TargetConditionals.h>
 #include <libkern/OSCacheControl.h>
+#include <mach/mach.h>
 #endif
 
 #if !defined(_WIN32)
@@ -487,6 +488,42 @@ std::string HostSys::GetFileMappingName(const char* prefix)
 #endif
 }
 
+#if defined(__APPLE__)
+/* Shared memory on Apple is a Mach memory entry, not shm_open(): the iOS
+ * sandbox's shm_open is unverified, and SysMainMemory has no recovery from a
+ * failed one. The shape is Dolphin's MemArenaDarwin (what its core runs on
+ * the iPad station): a vm_allocate'd backing region and a memory entry naming
+ * it; every view is a vm_map of the entry, so every view is the same pages.
+ * Used on macOS as well, so the Mac runs the code the iPad does. Data only:
+ * a view that asks to be executable is refused. */
+namespace
+{
+	struct DarwinSharedMemory
+	{
+		vm_address_t backing;
+		vm_size_t size;
+		mach_port_t entry;
+	};
+
+	void* DarwinMapEntry(void* handle, size_t offset, void* base, size_t size, const PageProtectionMode mode, int flags)
+	{
+		if (mode.m_exec)
+			return nullptr;
+		const DarwinSharedMemory* shm = static_cast<const DarwinSharedMemory*>(handle);
+		vm_prot_t prot = VM_PROT_NONE;
+		if (mode.m_read)
+			prot |= VM_PROT_READ;
+		if (mode.m_write)
+			prot |= VM_PROT_WRITE;
+		vm_address_t addr = reinterpret_cast<vm_address_t>(base);
+		if (vm_map(mach_task_self(), &addr, size, 0, flags, shm->entry, offset, FALSE, prot,
+				VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE) != KERN_SUCCESS)
+			return nullptr;
+		return reinterpret_cast<void*>(addr);
+	}
+} // namespace
+#endif
+
 void* HostSys::CreateSharedMemory(const char* name, size_t size)
 {
 #ifdef _WIN32
@@ -512,6 +549,22 @@ void* HostSys::CreateSharedMemory(const char* name, size_t size)
 		return nullptr;
 	}
 	return reinterpret_cast<void*>(static_cast<intptr_t>(fd));
+#elif defined(__APPLE__)
+	(void)name; /* a memory entry is anonymous */
+	vm_address_t backing = 0;
+	if (vm_allocate(mach_task_self(), &backing, size, VM_FLAGS_ANYWHERE) != KERN_SUCCESS)
+		return nullptr;
+	memory_object_size_t entry_size = size;
+	mach_port_t entry = MACH_PORT_NULL;
+	if (mach_make_memory_entry_64(mach_task_self(), &entry_size, backing, VM_PROT_READ | VM_PROT_WRITE,
+			&entry, MACH_PORT_NULL) != KERN_SUCCESS || entry_size < size)
+	{
+		if (entry != MACH_PORT_NULL)
+			mach_port_deallocate(mach_task_self(), entry);
+		vm_deallocate(mach_task_self(), backing, size);
+		return nullptr;
+	}
+	return new DarwinSharedMemory{backing, size, entry};
 #else
 	const int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
 	if (fd < 0)
@@ -536,6 +589,11 @@ void HostSys::DestroySharedMemory(void* ptr)
 {
 #ifdef _WIN32
 	CloseHandle(static_cast<HANDLE>(ptr));
+#elif defined(__APPLE__)
+	DarwinSharedMemory* shm = static_cast<DarwinSharedMemory*>(ptr);
+	mach_port_deallocate(mach_task_self(), shm->entry);
+	vm_deallocate(mach_task_self(), shm->backing, shm->size);
+	delete shm;
 #else
 	close(static_cast<int>(reinterpret_cast<intptr_t>(ptr)));
 #endif
@@ -555,6 +613,13 @@ void* HostSys::MapSharedMemory(void* handle, size_t offset, void* baseaddr, size
 		DWORD old_prot;
 		VirtualProtect(ptr, size, prot, &old_prot);
 	}
+#elif defined(__APPLE__)
+	/* VM_FLAGS_FIXED without VM_FLAGS_OVERWRITE: a placement request that
+	 * fails, untouched, where anything is already mapped -- the contract
+	 * the hinted mmap below keeps. */
+	void* ptr = DarwinMapEntry(handle, offset, baseaddr, size, mode, baseaddr ? VM_FLAGS_FIXED : VM_FLAGS_ANYWHERE);
+	if (!ptr)
+		return nullptr;
 #else
 	const uint prot = unix_prot(mode);
 	/* Hint, never MAP_FIXED - see HostSys::Mmap for why fixed mapping
@@ -768,6 +833,14 @@ u8* SharedMemoryMappingArea::Map(void* file_handle, size_t file_offset, void* ma
 		DWORD old_prot;
 		VirtualProtect(map_base, map_size, prot, &old_prot);
 	}
+
+	m_num_mappings++;
+	return static_cast<u8*>(map_base);
+#elif defined(__APPLE__)
+	/* VM_FLAGS_OVERWRITE is the MAP_FIXED below: the page lies inside this
+	 * area's own PROT_NONE reservation, which is what it replaces. */
+	if (!DarwinMapEntry(file_handle, file_offset, map_base, map_size, mode, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE))
+		return nullptr;
 
 	m_num_mappings++;
 	return static_cast<u8*>(map_base);

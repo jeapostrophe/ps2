@@ -24,7 +24,7 @@
 set -u
 
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-SUITES="mmi vu fpu ee iop vif emitter faultstress fpaudit ipu spsc patch"
+SUITES="mmi vu fpu ee iop vif emitter faultstress fpaudit ipu spsc patch hostmem"
 
 failed=""
 skipped=""

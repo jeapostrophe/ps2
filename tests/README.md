@@ -23,6 +23,11 @@ not survive.
 Do a clean build between sanitizers with different define sets rather
 than reusing objects.
 
+`hostmem` links the real `common/HostSys.cpp` out of a cmake build of the
+core (`LRPS2_BUILD`, default `build/macos-arm64`) and fails without one: it
+holds that every view of `HostSys::CreateSharedMemory` -- the main mapping
+and each fastmem page -- is the same memory.
+
 ## The two kinds of harness
 
 Most ops are scored twice, and the pair is deliberate.
