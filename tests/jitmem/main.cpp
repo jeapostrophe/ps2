@@ -123,6 +123,9 @@ static void only_a_self_mapped_cache_is_written_in_place()
 	CHECK(armJitWriteAddress(r, ArmJitSource::None, stray) == 0, "a load with no code memory wrote code in place at %#lx",
 		(unsigned long)armJitWriteAddress(r, ArmJitSource::None, stray));
 	CHECK(armJitWriteAddress(r, ArmJitSource::Frontend, 0) == 0, "a null code pointer under Frontend was given a write address");
+	// Under Self a null pointer maps to itself -- 0, the miss answer -- so
+	// armJitRW stops on it under every source and names it as a null pointer.
+	CHECK(armJitWriteAddress(r, ArmJitSource::Self, 0) == 0, "a null code pointer under Self was given a write address");
 }
 
 static void a_cache_goes_back_the_way_it_came()

@@ -430,6 +430,11 @@ endif
 # ============================================================================
 # pcsx2/GS - common renderer code
 # ============================================================================
+# Apple: GSAllocateWrappedMemory lives in its own file (Mach memory entries;
+# GS.cpp's Apple branch is empty). Keep in step with pcsx2/CMakeLists.txt.
+ifneq (,$(filter osx ios% tvos%,$(platform)))
+	SOURCES_CXX += $(LRPS2_DIR)/GS/GSWrappedMemoryDarwin.cpp
+endif
 SOURCES_CXX += \
 	$(LRPS2_DIR)/GS/GS.cpp \
 	$(LRPS2_DIR)/GS/GSBlock.cpp \

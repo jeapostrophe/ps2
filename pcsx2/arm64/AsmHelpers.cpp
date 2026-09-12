@@ -233,9 +233,14 @@ u8* armJitRW(const void* exec)
 	if (!write)
 	{
 		// Also reached from the fastmem fault handler (armEmitJmpPtr): the
-		// process is going down either way, and this line says why.
-		Console.Error("arm64 JIT: a code write at %p, which no lease holds, while this load's code memory %s -- cannot continue.",
-			exec, s_jit_source == ArmJitSource::Frontend ? "is all leased from the frontend" : "is none");
+		// process is going down either way, and this line says why. A null
+		// exec lands here under every source (under Self it maps to itself,
+		// and 0 is the miss answer); any other miss is a non-Self source.
+		if (!exec)
+			Console.Error("arm64 JIT: a code write through a null pointer -- no code cache (null pointer); cannot continue.");
+		else
+			Console.Error("arm64 JIT: a code write at %p, which no lease holds, while this load's code memory %s -- cannot continue.",
+				exec, s_jit_source == ArmJitSource::Frontend ? "is all leased from the frontend" : "is none");
 		std::abort();
 	}
 	return reinterpret_cast<u8*>(write);
