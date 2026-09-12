@@ -498,7 +498,10 @@ static void eeExecuteLoop(void)
 	// and eeGameStarting never fired: g_GameStarted stayed false, which keeps
 	// every DMA on the BIOS's instant path (TESTINT, _cpuEventTest_Shared) and
 	// the game serial at the BIOS's. g_GameLoading marks that stage and is in the
-	// save state too, so a re-entry mid-load resumes in GAME_LOADING.
+	// save state too, so a re-entry mid-load resumes in GAME_LOADING. That stage
+	// waits for ElfEntry, which the save state does not carry: when a state is
+	// loaded into a core whose own boot never reached the ELF,
+	// VMManager::RefreshRunningGameAfterStateLoad re-derives it from the disc.
 	ExecuteState state = g_GameStarted ? GAME_RUNNING : (g_GameLoading ? GAME_LOADING : RESET);
 
 	// This will come back as zero the first time it runs, or on instruction cancel.
