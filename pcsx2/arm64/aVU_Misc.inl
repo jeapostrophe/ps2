@@ -53,6 +53,21 @@ static inline void mvuStrImm32(microVU& mVU, const void* addr, u32 imm, const a6
 	mvuStr32(mVU, addr, tmp);
 }
 
+// 64-bit siblings, for the u64/s64 VURegs fields (cycle, nextBlockCycles,
+// xgkicklastcycle since 2675221d9): a 32-bit store into one of them replaces
+// only the low word and leaves a stale high word.
+static inline void mvuStr64(microVU& mVU, const void* addr, const a64::Register& reg)
+{
+	armAsm->Str(reg.X(), mvuAbsMem(mVU, addr, 8));
+}
+
+// x86's xe_mov64_mi_s32: the immediate is sign-extended to 64 bits.
+static inline void mvuStrImm64(microVU& mVU, const void* addr, s32 imm, const a64::Register& tmp)
+{
+	armAsm->Mov(tmp.X(), static_cast<int64_t>(imm));
+	mvuStr64(mVU, addr, tmp);
+}
+
 static inline void mvuStrSS(microVU& mVU, const void* addr, const a64::VRegister& vreg)
 {
 	armAsm->Str(vreg.S(), mvuAbsMem(mVU, addr, 4));

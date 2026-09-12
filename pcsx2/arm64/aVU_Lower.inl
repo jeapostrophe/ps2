@@ -2134,7 +2134,7 @@ mVUop(mVU_XGKICK)
 			armMoveAddressToReg(RSCRATCHADDR, &VU1.cycle);
 			armAsm->Ldr(gprT1q, a64::MemOperand(RSCRATCHADDR));
 			armAsm->Add(gprT2q, gprT2q, gprT1q);
-			mvuStr32(mVU, &VU1.xgkicklastcycle, gprT2);
+			mvuStr64(mVU, &VU1.xgkicklastcycle, gprT2); // u64: x86's xe_mov64_mr
 			armAsm->Mov(gprT1.W(), regS.W());
 			armAsm->And(gprT1.W(), gprT1.W(), 0x3FF);
 			armAsm->Lsl(gprT1.W(), gprT1.W(), 4);

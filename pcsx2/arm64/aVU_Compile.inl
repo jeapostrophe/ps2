@@ -313,7 +313,7 @@ void mVUtestCycles(microVU& mVU, microFlagCycles& mFC)
 	armEmitCall(mVU.copyPLState);
 
 	if (EmuConfig.Gamefixes.VUSyncHack || EmuConfig.Gamefixes.FullVU0SyncHack)
-		mvuStrImm32(mVU, &mVU.regs().nextBlockCycles, mVUcycles, gprT1);
+		mvuStrImm64(mVU, &mVU.regs().nextBlockCycles, mVUcycles, gprT1);
 	mVUendProgram(mVU, &mFC, 0);
 
 	armAsm->Bind(&skip);
@@ -645,7 +645,7 @@ void* mVUcompile(microVU& mVU, u32 startPC, uptr pState)
 				incPC(2);
 				mVUsetupRange(mVU, xPC, false);
 				if (EmuConfig.Gamefixes.VUSyncHack || EmuConfig.Gamefixes.FullVU0SyncHack)
-					mvuStrImm32(mVU, &mVU.regs().nextBlockCycles, 0, gprT1);
+					mvuStrImm64(mVU, &mVU.regs().nextBlockCycles, 0, gprT1);
 				mVUendProgram(mVU, &mFC, 0);
 				normBranchCompile(mVU, xPC);
 				incPC(-2);
