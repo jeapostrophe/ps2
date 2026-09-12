@@ -2389,10 +2389,19 @@ static void configure_jit_memory(void)
 #else
 	const bool may_self_map = true;
 #endif
-	const ArmJitSource source = armJitChooseSource(answered, probe.mode, capable_answered, capable, may_self_map);
+	ArmJitSource source = armJitChooseSource(answered, probe.mode, capable_answered, capable, may_self_map);
+	/* LRPS2_EXEC_MEM=none: run this load as a frontend with no executable
+	 * memory would make it run (an iPad no debugger has attached to), on any
+	 * host -- the interpreter fallback, reachable without that frontend. */
+	const char* forced = getenv("LRPS2_EXEC_MEM");
+	const bool forced_none = forced && !strcmp(forced, "none");
+	if (forced_none)
+		source = ArmJitSource::None;
 	armJitSetSource(source, exec_mem_alloc, exec_mem_free);
 	if (!log_cb)
 		return;
+	if (forced_none)
+		log_cb(RETRO_LOG_WARN, "EXEC_MEM: LRPS2_EXEC_MEM=none in the environment -- taking no code memory, whatever the frontend offers.\n");
 	switch (source)
 	{
 		case ArmJitSource::Frontend:
