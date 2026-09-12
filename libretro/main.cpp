@@ -2384,12 +2384,7 @@ static void configure_jit_memory(void)
 	const bool answered = environ_cb(RETRO_ENVIRONMENT_EXEC_MEM_ALLOC, &probe);
 	bool capable = false;
 	const bool capable_answered = environ_cb(RETRO_ENVIRONMENT_GET_JIT_CAPABLE, &capable);
-#if defined(__APPLE__) && TARGET_OS_IPHONE
-	const bool may_self_map = false;
-#else
-	const bool may_self_map = true;
-#endif
-	ArmJitSource source = armJitChooseSource(answered, probe.mode, capable_answered, capable, may_self_map);
+	ArmJitSource source = armJitChooseSource(answered, probe.mode, capable_answered, capable, kArmJitHostMaySelfMap);
 	/* LRPS2_EXEC_MEM=none: run this load as a frontend with no executable
 	 * memory would make it run (an iPad no debugger has attached to), on any
 	 * host -- the interpreter fallback, reachable without that frontend. */

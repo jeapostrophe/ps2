@@ -110,7 +110,10 @@ void armEmitJmpPtr(void* code_address, const void* target, bool flush_icache = t
 // bytes are written at -- the write alias of a lease, or the same address for
 // a self-mapped cache -- and is async-signal-safe (the fastmem fault handler
 // patches through it). Flushes are by execute address. armJitUnmap hands a
-// cache back the way it came: to the frontend, or munmap.
+// cache back the way it came: to the frontend, or munmap. Both fail closed
+// when the load does not map its own caches: a code address no lease holds
+// stops the process with a message (ArmJitMemory.h: armJitWriteAddress,
+// armJitReleaseRule) rather than be written or unmapped in place.
 //
 // A self-mapped cache on Apple silicon is MAP_JIT (a plain RWX mmap is refused
 // with EACCES), and every write into it must sit between

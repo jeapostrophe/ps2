@@ -24,6 +24,10 @@
 
 #include "libretro.h"
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -44,7 +48,7 @@ enum class ArmJitSource
 //    process may not branch into).
 //  - anything else (UNAVAILABLE, or the RWX / WX_TOGGLE shapes this core
 //    does not implement): no code memory; the recompilers stand down.
-inline ArmJitSource armJitChooseSource(bool probe_answered, unsigned mode, bool capable_answered, bool capable,
+constexpr ArmJitSource armJitChooseSource(bool probe_answered, unsigned mode, bool capable_answered, bool capable,
 	bool host_may_self_map)
 {
 	if (probe_answered && mode == RETRO_EXEC_MEM_MODE_DUAL_MAP)
@@ -53,6 +57,23 @@ inline ArmJitSource armJitChooseSource(bool probe_answered, unsigned mode, bool 
 	if (unrestricted && host_may_self_map && (!capable_answered || capable))
 		return ArmJitSource::Self;
 	return ArmJitSource::None;
+}
+
+// Whether this host may map its own code pages. Not iOS: a self-mapped page
+// there is one this process may not branch into (on a TXM device, touching
+// it kills the process where nothing can catch it).
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+inline constexpr bool kArmJitHostMaySelfMap = false;
+#else
+inline constexpr bool kArmJitHostMaySelfMap = true;
+#endif
+
+// The source before any retro_init() has decided one: what a frontend that
+// answered neither call gets. Self on a desktop (the behaviour the core
+// always had), None on iOS -- never a self-mapped cache there.
+constexpr ArmJitSource armJitDefaultSource(bool host_may_self_map)
+{
+	return armJitChooseSource(false, 0, false, false, host_may_self_map);
 }
 
 // RETRO_ENVIRONMENT_EXEC_MEM_ALLOC / _FREE, as the libretro layer wraps them.
@@ -69,7 +90,7 @@ void armJitSetSource(ArmJitSource source, ArmJitHostAlloc alloc, ArmJitHostFree 
 // how two leases' aliases relate, so there is no single "rx - rw" to apply.
 //
 // Add/Remove run only where caches are reserved and released (a load and an
-// unload), never while a block is being compiled or run. WriteAddress runs
+// unload), never while a block is being compiled or run. Find runs
 // on every compile thread and inside the fastmem fault handler, so it is
 // async-signal-safe: a fixed table, loads only, no locks, no allocation. A
 // slot is published by storing its execute base last (release), and read by
@@ -141,10 +162,11 @@ public:
 		return false;
 	}
 
-	// The address the byte executed at `exec` is written at: the same offset
-	// in the write alias of the region holding it, or `exec` itself when no
-	// region does (a self-mapped cache, written in place).
-	uintptr_t WriteAddress(uintptr_t exec) const
+	// The address the byte executed at `exec` is written at -- the same
+	// offset in the write alias of the region holding it -- or 0 when no
+	// region does. What a miss means depends on the source:
+	// armJitWriteAddress.
+	uintptr_t Find(uintptr_t exec) const
 	{
 		for (const Slot& s : m_slots)
 		{
@@ -152,13 +174,7 @@ public:
 			if (base && exec - base < s.size)
 				return s.write + (exec - base);
 		}
-		return exec;
-	}
-
-	template <typename T>
-	T* Write(T* exec) const
-	{
-		return reinterpret_cast<T*>(WriteAddress(reinterpret_cast<uintptr_t>(exec)));
+		return 0;
 	}
 
 private:
@@ -170,3 +186,37 @@ private:
 	};
 	Slot m_slots[kMaxRegions];
 };
+
+// Where a write to the code byte executed at `exec` goes: through the write
+// alias of the lease holding it; in place only when this load maps its own
+// caches. Under any other source a code byte no lease holds is not code
+// memory this load has, and the answer is 0 -- the caller stops the process
+// with a message rather than write at an execute address (on the iPad a
+// read-execute page: a fault with no explanation, or, if the pointer is
+// stale, a write into whatever the frontend lent next).
+inline uintptr_t armJitWriteAddress(const ArmJitRegions& regions, ArmJitSource source, uintptr_t exec)
+{
+	if (const uintptr_t write = regions.Find(exec))
+		return write;
+	return source == ArmJitSource::Self ? exec : 0;
+}
+
+// How a cache goes back. A lease the table held returns to the frontend --
+// by what the table says, not by the source: a lease goes back to whoever
+// lent it. A cache no lease holds is munmapped only when this load maps its
+// own; under any other source it is pages this core does not own (under
+// Frontend, the frontend's pool, which a munmap would take from it for
+// good), so the caller refuses and stops the process with a message.
+enum class ArmJitRelease
+{
+	ToFrontend,
+	Munmap,
+	Refuse,
+};
+
+constexpr ArmJitRelease armJitReleaseRule(bool was_leased, ArmJitSource source)
+{
+	if (was_leased)
+		return ArmJitRelease::ToFrontend;
+	return source == ArmJitSource::Self ? ArmJitRelease::Munmap : ArmJitRelease::Refuse;
+}

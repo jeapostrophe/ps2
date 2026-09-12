@@ -3,19 +3,21 @@
  * WHAT THIS TESTS
  *
  * pcsx2/arm64/ArmJitMemory.h: which source the recompilers take their code
- * memory from after the env-83 probe (armJitChooseSource), and how an
- * execute address becomes the address its bytes are written at
- * (ArmJitRegions). On an iOS station every cache is a dual-mapped lease from
- * the frontend -- read-execute at `rx`, read-write at `rw` -- and the two
- * wrong answers are both fatal there and invisible on a desktop, where a
- * self-mapped cache is written where it runs: writing at the execute address
- * faults on the first byte of the first block, and publishing the write
- * address faults on the first fetch. So the translation is pure and held
- * here, with made-up addresses: this program maps nothing, writes no code
- * and executes nothing.
+ * memory from after the env-83 probe (armJitChooseSource) and before any
+ * probe (armJitDefaultSource), how an execute address becomes the address
+ * its bytes are written at (ArmJitRegions, armJitWriteAddress), and how a
+ * cache goes back (armJitReleaseRule). On an iOS station every cache is a
+ * dual-mapped lease from the frontend -- read-execute at `rx`, read-write at
+ * `rw` -- and the wrong answers are fatal there and invisible on a desktop,
+ * where a self-mapped cache is written where it runs: writing at the execute
+ * address faults on the first byte of the first block, publishing the write
+ * address faults on the first fetch, and munmapping a lease takes the
+ * frontend's pool pages for good. So the decisions are pure and held here,
+ * with made-up addresses: this program maps nothing, writes no code and
+ * executes nothing.
  *
  * It includes the real header (a real-code harness): the table and the
- * decision under test are the ones the recompilers use.
+ * decisions under test are the ones the recompilers use.
  *
  * USAGE (from repo root)
  *
@@ -48,15 +50,14 @@ static void a_lease_is_written_through_its_write_alias()
 	ArmJitRegions r;
 	const uintptr_t rx = 0x1'0000'0000, rw = 0x2'0000'4000; // same offset within a 4 KiB page
 	CHECK(r.Add(rx, rw, 32 * MB) == AddResult::Ok, "a well-formed 32 MB lease was refused");
-	CHECK(r.WriteAddress(rx) == rw,
+	CHECK(r.Find(rx) == rw,
 		"the first byte of a lease is written at %#lx, not its write alias %#lx -- on the iPad the execute "
 		"alias is read-execute only, so the first block's first byte would fault",
-		(unsigned long)r.WriteAddress(rx), (unsigned long)rw);
-	CHECK(r.WriteAddress(rx + 32 * MB - 4) == rw + 32 * MB - 4, "the last instruction of the lease does not translate by the lease's offset");
-	CHECK(r.WriteAddress(rx + 32 * MB) == rx + 32 * MB, "the byte past the lease was translated as if it were inside it");
-	CHECK(r.WriteAddress(rx - 4) == rx - 4, "the word before the lease was translated as if it were inside it");
-	int dummy = 0;
-	CHECK(r.Write(&dummy) == &dummy, "an address no lease holds (a self-mapped cache) must be written in place");
+		(unsigned long)r.Find(rx), (unsigned long)rw);
+	CHECK(r.Find(rx + 32 * MB - 4) == rw + 32 * MB - 4, "the last instruction of the lease does not translate by the lease's offset");
+	CHECK(r.Find(rx + 32 * MB) == 0, "the byte past the lease was translated as if it were inside it");
+	CHECK(r.Find(rx - 4) == 0, "the word before the lease was translated as if it were inside it");
+	CHECK(armJitWriteAddress(r, ArmJitSource::Frontend, rx + 0x40) == rw + 0x40, "a leased byte is not written through its lease");
 }
 
 static void every_lease_keeps_its_own_offset()
@@ -67,10 +68,10 @@ static void every_lease_keeps_its_own_offset()
 	const uintptr_t ee_rx = 0x1'0000'0000, ee_rw = 0x3'0000'0000;
 	const uintptr_t iop_rx = 0x1'4000'0000, iop_rw = 0x2'0000'0000;
 	CHECK(r.Add(ee_rx, ee_rw, 32 * MB) == AddResult::Ok && r.Add(iop_rx, iop_rw, 16 * MB) == AddResult::Ok, "two leases were refused");
-	CHECK(r.WriteAddress(ee_rx + 0x40) == ee_rw + 0x40, "the EE lease translates by another lease's offset");
-	CHECK(r.WriteAddress(iop_rx + 0x40) == iop_rw + 0x40,
+	CHECK(r.Find(ee_rx + 0x40) == ee_rw + 0x40, "the EE lease translates by another lease's offset");
+	CHECK(r.Find(iop_rx + 0x40) == iop_rw + 0x40,
 		"the IOP lease is written at %#lx, not %#lx -- the table applied one global rx-rw offset",
-		(unsigned long)r.WriteAddress(iop_rx + 0x40), (unsigned long)(iop_rw + 0x40));
+		(unsigned long)r.Find(iop_rx + 0x40), (unsigned long)(iop_rw + 0x40));
 }
 
 static void a_returned_lease_is_forgotten()
@@ -80,7 +81,7 @@ static void a_returned_lease_is_forgotten()
 	r.Add(rx, rw, MB);
 	CHECK(!r.Remove(rx + 4096), "an address inside a lease removed it");
 	CHECK(r.Remove(rx), "the lease's own execute base did not remove it");
-	CHECK(r.WriteAddress(rx) == rx, "a returned lease still translates -- the next core's pages would be written through it");
+	CHECK(r.Find(rx) == 0, "a returned lease still translates -- the next core's pages would be written through it");
 	CHECK(!r.Remove(rx), "a lease was removed twice");
 	CHECK(r.Add(rx, rw, MB) == AddResult::Ok, "the slot of a returned lease cannot be reused");
 }
@@ -104,7 +105,35 @@ static void the_table_holds_kMaxRegions_and_no_more()
 		CHECK(r.Add(0x1'0000'0000 + i * 64 * MB, 0x4'0000'0000 + i * 64 * MB, 64 * MB) == AddResult::Ok, "lease %zu of %zu was refused", i + 1, ArmJitRegions::kMaxRegions);
 	CHECK(r.Add(0x9'0000'0000, 0xA'0000'0000, MB) == AddResult::Full, "a lease past kMaxRegions was accepted");
 	const uintptr_t last = 0x1'0000'0000 + (ArmJitRegions::kMaxRegions - 1) * 64 * MB;
-	CHECK(r.WriteAddress(last + 8) == 0x4'0000'0000 + (ArmJitRegions::kMaxRegions - 1) * 64 * MB + 8, "a full table stopped translating its last lease");
+	CHECK(r.Find(last + 8) == 0x4'0000'0000 + (ArmJitRegions::kMaxRegions - 1) * 64 * MB + 8, "a full table stopped translating its last lease");
+}
+
+static void only_a_self_mapped_cache_is_written_in_place()
+{
+	ArmJitRegions r;
+	const uintptr_t rx = 0x1'0000'0000, rw = 0x2'0000'0000;
+	r.Add(rx, rw, MB);
+	const uintptr_t stray = 0x7'0000'0000; // no lease holds it
+	CHECK(armJitWriteAddress(r, ArmJitSource::Self, stray) == stray,
+		"a self-mapped cache (the Mac's MAP_JIT path) must be written in place");
+	CHECK(armJitWriteAddress(r, ArmJitSource::Frontend, stray) == 0,
+		"under Frontend a code address no lease holds was written at %#lx -- in place, at an execute address: "
+		"on the iPad a read-execute page, or, for a stale pointer, whatever the frontend lent next",
+		(unsigned long)armJitWriteAddress(r, ArmJitSource::Frontend, stray));
+	CHECK(armJitWriteAddress(r, ArmJitSource::None, stray) == 0, "a load with no code memory wrote code in place at %#lx",
+		(unsigned long)armJitWriteAddress(r, ArmJitSource::None, stray));
+	CHECK(armJitWriteAddress(r, ArmJitSource::Frontend, 0) == 0, "a null code pointer under Frontend was given a write address");
+}
+
+static void a_cache_goes_back_the_way_it_came()
+{
+	CHECK(armJitReleaseRule(true, ArmJitSource::Frontend) == ArmJitRelease::ToFrontend, "a lease was not handed back to the frontend");
+	CHECK(armJitReleaseRule(true, ArmJitSource::Self) == ArmJitRelease::ToFrontend,
+		"a lease was not handed back to the frontend because the source said Self -- the table decides, not the source");
+	CHECK(armJitReleaseRule(false, ArmJitSource::Self) == ArmJitRelease::Munmap, "a self-mapped cache (the Mac's) was not munmapped");
+	CHECK(armJitReleaseRule(false, ArmJitSource::Frontend) == ArmJitRelease::Refuse,
+		"under Frontend a cache no lease holds was released by munmap -- on a lease that takes the frontend's pool pages for good");
+	CHECK(armJitReleaseRule(false, ArmJitSource::None) == ArmJitRelease::Refuse, "a load with no code memory munmapped a code cache");
 }
 
 static void the_probe_decides_where_code_memory_comes_from()
@@ -130,6 +159,17 @@ static void the_probe_decides_where_code_memory_comes_from()
 		"on iOS a frontend without env 83 must never lead the core to map its own code pages");
 }
 
+static void before_any_probe_ios_maps_nothing()
+{
+	CHECK(armJitDefaultSource(false) == ArmJitSource::None,
+		"on iOS a load that never ran configure_jit_memory would map its own code pages -- on a TXM device that "
+		"kills the process where nothing can catch it");
+	CHECK(armJitDefaultSource(true) == ArmJitSource::Self, "the desktop default moved off the core's own caches");
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+	CHECK(!kArmJitHostMaySelfMap, "an iOS build believes it may map its own code pages");
+#endif
+}
+
 int main()
 {
 	a_lease_is_written_through_its_write_alias();
@@ -137,7 +177,10 @@ int main()
 	a_returned_lease_is_forgotten();
 	malformed_leases_are_refused();
 	the_table_holds_kMaxRegions_and_no_more();
+	only_a_self_mapped_cache_is_written_in_place();
+	a_cache_goes_back_the_way_it_came();
 	the_probe_decides_where_code_memory_comes_from();
+	before_any_probe_ios_maps_nothing();
 	if (s_failures)
 	{
 		std::fprintf(stderr, "jitmem: %d check(s) failed\n", s_failures);

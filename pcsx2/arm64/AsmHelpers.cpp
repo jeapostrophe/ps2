@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0
 
 #include "../../common/Threading.h"
+#include <cstdlib>
 #include <cstring>
 #include "arm64/AsmHelpers.h"
 
@@ -212,8 +213,9 @@ void armEmitCall(const void* ptr, bool force_inline)
 }
 
 // Where code memory comes from this load (armJitSetSource), the frontend's
-// lease calls, and the leases held as execute->write pairs.
-static ArmJitSource s_jit_source = ArmJitSource::Self;
+// lease calls, and the leases held as execute->write pairs. Until a
+// retro_init() decides, what a silent frontend would get: never Self on iOS.
+static ArmJitSource s_jit_source = armJitDefaultSource(kArmJitHostMaySelfMap);
 static ArmJitHostAlloc s_jit_host_alloc = nullptr;
 static ArmJitHostFree s_jit_host_free = nullptr;
 static ArmJitRegions s_jit_regions;
@@ -227,7 +229,16 @@ void armJitSetSource(ArmJitSource source, ArmJitHostAlloc alloc, ArmJitHostFree 
 
 u8* armJitRW(const void* exec)
 {
-	return reinterpret_cast<u8*>(s_jit_regions.WriteAddress(reinterpret_cast<uintptr_t>(exec)));
+	const uintptr_t write = armJitWriteAddress(s_jit_regions, s_jit_source, reinterpret_cast<uintptr_t>(exec));
+	if (!write)
+	{
+		// Also reached from the fastmem fault handler (armEmitJmpPtr): the
+		// process is going down either way, and this line says why.
+		Console.Error("arm64 JIT: a code write at %p, which no lease holds, while this load's code memory %s -- cannot continue.",
+			exec, s_jit_source == ArmJitSource::Frontend ? "is all leased from the frontend" : "is none");
+		std::abort();
+	}
+	return reinterpret_cast<u8*>(write);
 }
 
 static const char* armJitAddResultName(ArmJitRegions::AddResult r)
@@ -288,18 +299,23 @@ void armJitUnmap(u8* exec, size_t size, const char* what)
 {
 	if (!exec)
 		return;
-	// By what the table says, not by the current source: a lease is handed
-	// back to whoever lent it.
-	if (s_jit_regions.Remove(reinterpret_cast<uintptr_t>(exec)))
+	const bool leased = s_jit_regions.Remove(reinterpret_cast<uintptr_t>(exec));
+	switch (armJitReleaseRule(leased, s_jit_source))
 	{
-		s_jit_host_free(exec);
-		Console.WriteLn("arm64 JIT: %s code cache, %zu KiB, returned to the frontend (rx %p).", what, size >> 10, exec);
+		case ArmJitRelease::ToFrontend:
+			s_jit_host_free(exec);
+			Console.WriteLn("arm64 JIT: %s code cache, %zu KiB, returned to the frontend (rx %p).", what, size >> 10, exec);
+			return;
+		case ArmJitRelease::Munmap:
+			HostSys::Munmap(exec, size);
+			Console.WriteLn("arm64 JIT: %s code cache, %zu KiB, unmapped (%p).", what, size >> 10, exec);
+			return;
+		case ArmJitRelease::Refuse:
+			break;
 	}
-	else
-	{
-		HostSys::Munmap(exec, size);
-		Console.WriteLn("arm64 JIT: %s code cache, %zu KiB, unmapped (%p).", what, size >> 10, exec);
-	}
+	Console.Error("arm64 JIT: %s code cache at %p is no lease the frontend lent, and this load maps no code of its own -- "
+		"not unmapping pages the core does not own; cannot continue.", what, exec);
+	std::abort();
 }
 
 ArmCodeWriteScope::ArmCodeWriteScope() { HostSys::BeginCodeWrite(); }
