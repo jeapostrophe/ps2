@@ -4432,6 +4432,30 @@ void eeJitReset_arm64(void)
 	// them would mean re-taking every fault.
 	s_fm_sites.clear();
 	s_fm_pending.clear();
+	// Every block is gone, so no page of EE RAM has recompiled code behind it any
+	// more: take the SMC write protection back off, exactly as x86's recResetRaw
+	// does (vtlb's own comment on this function says it "is called by default from
+	// the eerecReset"). RegisterPages marks a page read-only through
+	// mmap_MarkCountedRamPage so a guest store into translated code faults into
+	// vtlb_PageFaultHandler; leaving those pages read-only across a reset is not
+	// merely stale bookkeeping -- the very next thing a reset's callers do is
+	// write EE RAM wholesale from a thread that is NOT registered with the fault
+	// filter (HostSys::RegisterFaultHandlerThread), so the fault chains to the
+	// default handler and kills the process instead of being fixed up:
+	//   - retro_unserialize: ClearCPUExecutionCaches() then
+	//     FreezeMem(eeMem->Main, Ps2MemSize::MainRam) -- a memmove on the
+	//     frontend's thread. Measured (SIGBUS, KERN_PROTECTION_FAILURE at
+	//     eeMem->Main + 0x4000, an r-- 16 KiB page; the cold load before it saw
+	//     the whole reservation rw-).
+	//   - VMManager::Reset -> cpuReset -> eeMemoryReserve::Reset -- the memset of
+	//     the same RAM, same thread.
+	// This also re-syncs the fastmem alias's protection and clears
+	// m_PageProtectInfo, which is a static that outlives a VM: without it a
+	// second VM in this process (macOS never unloads the dylib) would find pages
+	// already flagged ProtMode_Write, and mmap_MarkCountedRamPage's
+	// already-protected early-out would then never protect them -- SMC
+	// invalidation silently dead for the rest of that VM's life.
+	mmap_ResetBlockTracking();
 }
 
 void eeJitClear_arm64(u32 addr, u32 size)
