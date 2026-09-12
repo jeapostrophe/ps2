@@ -53,12 +53,15 @@ static inline void mvuStrImm32(microVU& mVU, const void* addr, u32 imm, const a6
 	mvuStr32(mVU, addr, tmp);
 }
 
-// 64-bit siblings, for the u64/s64 VURegs fields (cycle, nextBlockCycles,
-// xgkicklastcycle since 2675221d9): a 32-bit store into one of them replaces
-// only the low word and leaves a stale high word.
+// 64-bit forms, for the u64/s64 VURegs fields.
 static inline void mvuStr64(microVU& mVU, const void* addr, const a64::Register& reg)
 {
 	armAsm->Str(reg.X(), mvuAbsMem(mVU, addr, 8));
+}
+
+static inline void mvuLdr64(microVU& mVU, const a64::Register& reg, const void* addr)
+{
+	armAsm->Ldr(reg.X(), mvuAbsMem(mVU, addr, 8));
 }
 
 // x86's xe_mov64_mi_s32: the immediate is sign-extended to 64 bits.
@@ -66,6 +69,51 @@ static inline void mvuStrImm64(microVU& mVU, const void* addr, s32 imm, const a6
 {
 	armAsm->Mov(tmp.X(), static_cast<int64_t>(imm));
 	mvuStr64(mVU, addr, tmp);
+}
+
+// Typed front doors: a field passed by its own type must match the access
+// width, so a 32-bit access to a u64 field is a build error rather than a
+// stale high word. Raw addresses (const void*) take the untyped forms above.
+template <typename T>
+static inline void mvuStr32(microVU& mVU, const T* addr, const a64::Register& wreg)
+{
+	static_assert(sizeof(T) == 4, "mvuStr32 on a field that is not 32-bit");
+	mvuStr32(mVU, static_cast<const void*>(addr), wreg);
+}
+
+template <typename T>
+static inline void mvuLdr32(microVU& mVU, const a64::Register& wreg, const T* addr)
+{
+	static_assert(sizeof(T) == 4, "mvuLdr32 on a field that is not 32-bit");
+	mvuLdr32(mVU, wreg, static_cast<const void*>(addr));
+}
+
+template <typename T>
+static inline void mvuStrImm32(microVU& mVU, const T* addr, u32 imm, const a64::Register& tmp)
+{
+	static_assert(sizeof(T) == 4, "mvuStrImm32 on a field that is not 32-bit");
+	mvuStrImm32(mVU, static_cast<const void*>(addr), imm, tmp);
+}
+
+template <typename T>
+static inline void mvuStr64(microVU& mVU, const T* addr, const a64::Register& reg)
+{
+	static_assert(sizeof(T) == 8, "mvuStr64 on a field that is not 64-bit");
+	mvuStr64(mVU, static_cast<const void*>(addr), reg);
+}
+
+template <typename T>
+static inline void mvuLdr64(microVU& mVU, const a64::Register& reg, const T* addr)
+{
+	static_assert(sizeof(T) == 8, "mvuLdr64 on a field that is not 64-bit");
+	mvuLdr64(mVU, reg, static_cast<const void*>(addr));
+}
+
+template <typename T>
+static inline void mvuStrImm64(microVU& mVU, const T* addr, s32 imm, const a64::Register& tmp)
+{
+	static_assert(sizeof(T) == 8, "mvuStrImm64 on a field that is not 64-bit");
+	mvuStrImm64(mVU, static_cast<const void*>(addr), imm, tmp);
 }
 
 static inline void mvuStrSS(microVU& mVU, const void* addr, const a64::VRegister& vreg)

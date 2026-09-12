@@ -572,10 +572,7 @@ void eeloadHook(void)
 	std::string elfname;
 	const std::string& elf_override(VMManager::Internal::GetElfOverride());
 
-	if (!elf_override.empty())
-		cdvdReloadElfInfo(StringUtil::StdStringFromFormat("host:%s", elf_override.c_str()));
-	else
-		cdvdReloadElfInfo();
+	VMManager::Internal::ReloadBootElfInfo();
 
 	int disctype = GetPS2ElfName(discelf);
 	int argc     = cpuRegs.GPR.n.a0.SD[0];

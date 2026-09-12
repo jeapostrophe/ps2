@@ -102,7 +102,7 @@ void doIbit(mV)
 		if (EmuConfig.Gamefixes.IbitHack)
 		{
 			mvuLdr32(mVU, gprT1, &curI);
-			mvuStr32(mVU, &mVU.getVI(REG_I), gprT1);
+			mvuStr32(mVU, &mVU.getVI(REG_I).UL, gprT1);
 		}
 		else
 		{
@@ -115,7 +115,7 @@ void doIbit(mV)
 			else
 				tempI = curI;
 
-			mvuStrImm32(mVU, &mVU.getVI(REG_I), tempI, gprT1);
+			mvuStrImm32(mVU, &mVU.getVI(REG_I).UL, tempI, gprT1);
 		}
 		incPC(1);
 	}

@@ -318,22 +318,14 @@ void VMManager::ApplyGameFixes()
 
 void VMManager::RefreshRunningGameAfterStateLoad()
 {
-	// The savestate has restored ElfCRC, g_GameStarted and g_GameLoading, but
-	// not the ELF info the boot derives from the disc: ElfEntry, DiscSerial
-	// and LastELF. A core that loads a state before its own boot reached
-	// eeloadHook or cdvdReadKey still holds cpuReset's -- ElfEntry -1, no
-	// serial -- and eeExecuteLoop's GAME_LOADING stage waits for ElfEntry,
-	// while UpdateRunningGame takes the serial from DiscSerial. So while the
-	// flags say an ELF is loading or running and ElfEntry is unknown, read the
-	// ELF info from the disc the way eeloadHook does. UpdateRunningGame then
-	// early-returns when the identity is unchanged.
-	if ((g_GameLoading || g_GameStarted) && ElfEntry == 0xFFFFFFFF)
-	{
-		if (!s_elf_override.empty())
-			cdvdReloadElfInfo(StringUtil::StdStringFromFormat("host:%s", s_elf_override.c_str()));
-		else
-			cdvdReloadElfInfo();
-	}
+	// The state restores the game flags and ElfCRC, not the ELF info the boot
+	// reads from the disc (ElfEntry, DiscSerial, LastELF). A core whose own boot
+	// never reached the ELF still has cpuReset's -- ElfEntry -1, no serial --
+	// which GAME_LOADING waits on and UpdateRunningGame keys the GameDB by, so
+	// read it as the boot does. A disc that names a serial but yields no
+	// ElfEntry (PS1, an unloadable ELF) is read once, not on every load.
+	if ((g_GameLoading || g_GameStarted) && ElfEntry == 0xFFFFFFFF && !DiscSerial[0])
+		Internal::ReloadBootElfInfo();
 	UpdateRunningGame(false, false, false);
 }
 
@@ -1091,6 +1083,14 @@ void VMManager::Internal::EntryPointCompilingOnCPUThread()
 		if (_place == PPT_ONCE_ON_LOAD)
 			_ApplyPatch(&Patch[i]);
 	}
+}
+
+void VMManager::Internal::ReloadBootElfInfo()
+{
+	if (!s_elf_override.empty())
+		cdvdReloadElfInfo(StringUtil::StdStringFromFormat("host:%s", s_elf_override.c_str()));
+	else
+		cdvdReloadElfInfo();
 }
 
 void VMManager::Internal::GameStartingOnCPUThread()

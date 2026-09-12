@@ -490,18 +490,11 @@ static void eeExecuteLoop(void)
 	// g_GameStarted means exactly "we are past the game's entry point" and is part
 	// of the save state, so it is the right thing to resume on.
 	//
-	// The same trap opens one stage earlier. Execution also exits at any vsync
-	// the VM is paused on, and the libretro core pauses it for every
-	// retro_serialize -- so a re-entry anywhere between eeloadHook and the game's
-	// entry point (the whole of the ELF's load) waited in RESET for an EELOAD
-	// that had already run. The EE then interpreted for the rest of the session
-	// and eeGameStarting never fired: g_GameStarted stayed false, which keeps
-	// every DMA on the BIOS's instant path (TESTINT, _cpuEventTest_Shared) and
-	// the game serial at the BIOS's. g_GameLoading marks that stage and is in the
-	// save state too, so a re-entry mid-load resumes in GAME_LOADING. That stage
-	// waits for ElfEntry, which the save state does not carry: when a state is
-	// loaded into a core whose own boot never reached the ELF,
-	// VMManager::RefreshRunningGameAfterStateLoad re-derives it from the disc.
+	// Likewise g_GameLoading (also saved): a re-entry between eeloadHook and the
+	// entry point -- the libretro core pauses the VM for every retro_serialize --
+	// resumes in GAME_LOADING, where RESET would wait for an EELOAD that already
+	// ran and eeGameStarting would never fire. GAME_LOADING waits for ElfEntry,
+	// which the state does not carry; RefreshRunningGameAfterStateLoad restores it.
 	ExecuteState state = g_GameStarted ? GAME_RUNNING : (g_GameLoading ? GAME_LOADING : RESET);
 
 	// This will come back as zero the first time it runs, or on instruction cancel.

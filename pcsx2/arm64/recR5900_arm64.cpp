@@ -3552,6 +3552,15 @@ namespace {
 		m.Ret();
 	}
 
+	// Flags for (s64)(cpuRegs.cycle - nextEventCycle), both u64 (2675221d9):
+	// `pl` means an event is due, `mi` that it is not. Clobbers x0/x1.
+	inline void EmitCycleDueCompare(MacroAssembler& m)
+	{
+		m.Ldr(x0, RegsField(&cpuRegs.cycle));
+		m.Ldr(x1, RegsField(&cpuRegs.nextEventCycle));
+		m.Subs(x0, x0, x1);
+	}
+
 	// C.54: exit to a compile-time-known successor.
 	//
 	// cpuRegs.pc can only differ from that successor if the tail's event test
@@ -3578,9 +3587,7 @@ namespace {
 		{
 			s_exit_labels.emplace_back();
 			Label* slow = &s_exit_labels.back();
-			m.Ldr(x0, RegsField(&cpuRegs.cycle));
-			m.Ldr(x1, RegsField(&cpuRegs.nextEventCycle));
-			m.Subs(x0, x0, x1);   // (s64)(cycle - nextEventCycle): both are u64
+			EmitCycleDueCompare(m);
 			m.B(slow, pl);        // event due -> out-of-line stub
 			s_exit_pending.push_back({slow, evt});
 		}
@@ -3730,10 +3737,8 @@ namespace {
 		m.Lsr(w2, w0, 3);
 		m.Cmp(w2, 0);
 		m.Csinc(w2, w2, wzr, ne); // max(1, bc >> 3)
-		// cpuRegs.cycle is u64 (2675221d9, "EE: switch to 64-bit cycle
-		// counter"): the add is 64-bit, or whenever it crosses a 2^32 boundary
-		// (one every ~14.6 s of EE time) the carry out of the low word is lost
-		// and the counter falls back by 2^32.
+		// cpuRegs.cycle is u64 (2675221d9): a 32-bit add would lose the carry at
+		// each 2^32 (~14.6 s of EE time) and put the counter back by 2^32.
 		// x2 is w2 zero-extended (a W write clears the upper half).
 		m.Ldr(x3, RegsField(&cpuRegs.cycle));
 		m.Add(x3, x3, x2);
@@ -3874,9 +3879,7 @@ namespace {
 		const auto EmitEventTest = [&m, evt]()
 		{
 			Label skip;
-			m.Ldr(x0, RegsField(&cpuRegs.cycle));
-			m.Ldr(x1, RegsField(&cpuRegs.nextEventCycle));
-			m.Subs(x0, x0, x1); // (s64)(cycle - nextEventCycle): both are u64
+			EmitCycleDueCompare(m);
 			m.B(&skip, mi);     // not due yet
 			m.Mov(x16, evt);
 			m.Blr(x16);
@@ -3894,12 +3897,9 @@ namespace {
 		// nextEventCycle when spinning there (_doBranch_shared, gated on
 		// Cpu==&intCpu so the JIT never benefited). Mirror it on the taken
 		// path: after the cycle flush (upd), before the event test, do
-		// `if ((s64)(nextEventCycle - cycle) > 0) cycle = nextEventCycle` --
-		// the interpreter's own condition -- so the next event fires
-		// immediately instead of burning host time emulating millions of idle
-		// iterations. Both fields are u64 (2675221d9): the loads, compare and
-		// store are 64-bit, or a skip across a 2^32 boundary writes only the
-		// low word and cycle falls back by 2^32.
+		// `if ((s64)(nextEventCycle - cycle) > 0) cycle = nextEventCycle`, the
+		// interpreter's test, so the next event fires immediately instead of
+		// burning host time emulating millions of idle iterations.
 		const bool idle_skip = EmuConfig.Speedhacks.WaitLoop && !is_jr
 			&& ((tconst & 0x1fffffff) == 0x00081fc0);
 		const auto EmitIdleSkip = [&m]()
@@ -4049,10 +4049,9 @@ namespace {
 		m.Bic(w3, w0, 1u << 1); // Status & ~EXL
 		m.Csel(w0, w2, w3, ne);
 		m.Str(w0, RegsField(&cpuRegs.CP0.n.Status));
-		// if ((int)(nextEventCycle - cycle) > 4) nextEventCycle = cycle + 4 --
-		// COP0.cpp's ERET, whose (int) cast the 32-bit difference keeps. Both
-		// fields are u64 (2675221d9), so the pulled value is formed and stored
-		// in 64 bits: a 32-bit store would replace only the low word.
+		// if ((int)(nextEventCycle - cycle) > 4) nextEventCycle = cycle + 4, as
+		// COP0.cpp's ERET: the (int) makes the difference 32-bit; the stored value
+		// is u64.
 		Label no_pull;
 		m.Ldr(x0, RegsField(&cpuRegs.cycle));
 		m.Ldr(x1, RegsField(&cpuRegs.nextEventCycle));

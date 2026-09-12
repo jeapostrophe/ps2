@@ -130,6 +130,9 @@ namespace VMManager
 		void ClearCPUExecutionCaches();
 
 		const std::string& GetElfOverride();
+		/// Reads the boot ELF's info (ElfEntry, ElfCRC, DiscSerial, LastELF) from the
+		/// ELF override when one is set, else from the disc: the ELF this boot runs.
+		void ReloadBootElfInfo();
 		bool IsExecutionInterrupted();
 		void EntryPointCompilingOnCPUThread();
 		void GameStartingOnCPUThread();
