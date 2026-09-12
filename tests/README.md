@@ -23,10 +23,12 @@ not survive.
 Do a clean build between sanitizers with different define sets rather
 than reusing objects.
 
-`hostmem` links the real `common/HostSys.cpp` out of a cmake build of the
-core (`LRPS2_BUILD`, default `build/macos-arm64`) and fails without one: it
-holds that every view of `HostSys::CreateSharedMemory` -- the main mapping
-and each fastmem page -- is the same memory. `jitmem` holds the arm64 JIT's
+`hostmem` links the real `common/HostSys.cpp`, rebuilding `libcommon.a` from
+the working tree on every run (`LRPS2_BUILD`, default `build/tests-host`,
+configured on first use): it holds that every view of
+`HostSys::CreateSharedMemory` -- the main mapping and each fastmem page -- is
+the same memory, and on Apple that every slot of the GS's wrapped memory
+(`pcsx2/GS/GSWrappedMemoryDarwin.cpp`) is. `jitmem` holds the arm64 JIT's
 code-memory decisions (`pcsx2/arm64/ArmJitMemory.h`: which source a load
 takes its code caches from, and how an execute address becomes the address
 its bytes are written at) with made-up addresses; it maps, writes and runs

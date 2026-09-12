@@ -405,6 +405,10 @@ set(pcsx2GSHeaders
 	GS/Renderers/SW/GSVertexSW.h
 	)
 
+if(APPLE)
+	list(APPEND pcsx2GSSources GS/GSWrappedMemoryDarwin.cpp)
+endif()
+
 if(USE_OPENGL)
 	list(APPEND pcsx2GSSources
 		GS/Renderers/OpenGL/GLState.cpp

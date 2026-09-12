@@ -702,54 +702,7 @@ void GSFreeWrappedMemory(void* ptr, size_t size, size_t repeat)
 
 #elif defined(__APPLE__)
 
-#include <mach/mach.h>
-
-/* No shm_open on Apple -- the same Mach shape as HostSys::CreateSharedMemory
- * (see there for why): `repeat` consecutive views of one `size`-byte block.
- * Slot 0 is the vm_allocate'd block itself; every later slot is its memory
- * entry mapped over that part of the reservation. */
-static mach_port_t s_gs_entry = MACH_PORT_NULL;
-
-void GSFreeWrappedMemory(void* ptr, size_t size, size_t repeat)
-{
-	if (s_gs_entry == MACH_PORT_NULL)
-		return;
-
-	vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(ptr), size * repeat);
-	mach_port_deallocate(mach_task_self(), s_gs_entry);
-	s_gs_entry = MACH_PORT_NULL;
-}
-
-void* GSAllocateWrappedMemory(size_t size, size_t repeat)
-{
-	vm_address_t base = 0;
-	if (vm_allocate(mach_task_self(), &base, size * repeat, VM_FLAGS_ANYWHERE) != KERN_SUCCESS)
-		return nullptr;
-
-	memory_object_size_t entry_size = size;
-	if (mach_make_memory_entry_64(mach_task_self(), &entry_size, base, VM_PROT_READ | VM_PROT_WRITE,
-			&s_gs_entry, MACH_PORT_NULL) != KERN_SUCCESS || entry_size < size)
-	{
-		if (s_gs_entry != MACH_PORT_NULL)
-			mach_port_deallocate(mach_task_self(), s_gs_entry);
-		s_gs_entry = MACH_PORT_NULL;
-		vm_deallocate(mach_task_self(), base, size * repeat);
-		return nullptr;
-	}
-
-	for (size_t i = 1; i < repeat; i++)
-	{
-		vm_address_t slot = base + size * i;
-		if (vm_map(mach_task_self(), &slot, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, s_gs_entry, 0, FALSE,
-				VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE) != KERN_SUCCESS)
-		{
-			GSFreeWrappedMemory(reinterpret_cast<void*>(base), size, repeat);
-			return nullptr;
-		}
-	}
-
-	return reinterpret_cast<void*>(base);
-}
+/* GS/GSWrappedMemoryDarwin.cpp -- its own file so tests/hostmem can run it. */
 
 #else
 

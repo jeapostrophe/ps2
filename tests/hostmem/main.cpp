@@ -67,6 +67,59 @@ static u32 stamp(size_t page_index)
 	return static_cast<u32>(page_index * 2654435761u) ^ 0x5A5A0001u;
 }
 
+#if defined(__APPLE__)
+/* The GS's local memory (GSLocalMemory::m_vm8) is GSAllocateWrappedMemory:
+ * `repeat` consecutive views of one block, so an address that runs past the
+ * end of GS memory wraps back to its start. Every slot must be the same
+ * memory -- slot 0 included, which a first cut left as the region the memory
+ * entry was made from and never checked. pcsx2/GS/GSWrappedMemoryDarwin.cpp,
+ * compiled in by build.sh with GSLocalMemory's own size and repeat. */
+void* GSAllocateWrappedMemory(size_t size, size_t repeat);
+void GSFreeWrappedMemory(void* ptr, size_t size, size_t repeat);
+
+static void gs_wrapped_memory_is_one_block_repeated(size_t page)
+{
+	const size_t size = static_cast<size_t>(HOSTMEM_GS_VMSIZE);
+	const size_t repeat = HOSTMEM_GS_REPEAT;
+	const size_t pages = size / page;
+	// Twice: freed and allocated again, as a game swap does.
+	for (int round = 1; round <= 2; round++)
+	{
+		u8* base = static_cast<u8*>(GSAllocateWrappedMemory(size, repeat));
+		CHECK(base, "round %d: GSAllocateWrappedMemory(%#zx, %zu) failed", round, size, repeat);
+		if (!base)
+			return;
+		// Each slot in turn stamps every page; every other slot must read it.
+		for (size_t w = 0; w < repeat; w++)
+		{
+			for (size_t i = 0; i < pages; i++)
+			{
+				const u32 s = stamp(i) ^ static_cast<u32>(w << 28);
+				std::memcpy(base + w * size + i * page, &s, sizeof(s));
+			}
+			for (size_t r = 0; r < repeat; r++)
+			{
+				if (r == w)
+					continue;
+				size_t bad = pages;
+				u32 v = 0;
+				for (size_t i = 0; i < pages && bad == pages; i++)
+				{
+					std::memcpy(&v, base + r * size + i * page, sizeof(v));
+					if (v != (stamp(i) ^ static_cast<u32>(w << 28)))
+						bad = i;
+				}
+				CHECK(bad == pages,
+					"round %d: page %zu written through GS slot %zu reads %#x through slot %zu -- the wrapped memory "
+					"is not one block repeated, so a GS access that wraps sees different memory",
+					round, bad, w, v, r);
+			}
+		}
+		GSFreeWrappedMemory(base, size, repeat);
+	}
+}
+#endif
+
 int main()
 {
 	const size_t page = static_cast<size_t>(getpagesize());
@@ -150,6 +203,10 @@ int main()
 	HostSys::UnmapSharedMemory(a, size);
 	HostSys::Munmap(a, size);
 	HostSys::DestroySharedMemory(shm);
+
+#if defined(__APPLE__)
+	gs_wrapped_memory_is_one_block_repeated(page);
+#endif
 
 	if (s_failures)
 	{
