@@ -3553,7 +3553,8 @@ namespace {
 	}
 
 	// Flags for (s64)(cpuRegs.cycle - nextEventCycle), both u64 (2675221d9):
-	// `pl` means an event is due, `mi` that it is not. Clobbers x0/x1.
+	// `pl` means an event is due, `mi` that it is not. Clobbers x0 and leaves
+	// nextEventCycle in x1.
 	inline void EmitCycleDueCompare(MacroAssembler& m)
 	{
 		m.Ldr(x0, RegsField(&cpuRegs.cycle));
@@ -3905,10 +3906,8 @@ namespace {
 		const auto EmitIdleSkip = [&m]()
 		{
 			Label skip;
-			m.Ldr(x0, RegsField(&cpuRegs.cycle));
-			m.Ldr(x1, RegsField(&cpuRegs.nextEventCycle));
-			m.Cmp(x1, x0);
-			m.B(&skip, le); // nothing ahead to skip to
+			EmitCycleDueCompare(m);
+			m.B(&skip, pl); // nothing ahead to skip to
 			m.Str(x1, RegsField(&cpuRegs.cycle)); // cycle = nextEventCycle
 			m.Bind(&skip);
 		};

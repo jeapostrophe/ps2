@@ -479,28 +479,16 @@ static void eeExecuteLoop(void)
 		GAME_LOADING,
 		GAME_RUNNING
 	};
-	// The RESET stage interprets until the pc reaches the BIOS's EELOAD, which is
-	// how a cold boot walks itself to the game's entry point. Re-entering the loop
-	// with the game ALREADY running -- which is what loading a save state does,
-	// since it exits execution and comes back with the VM mid-game -- can never
-	// satisfy that condition: the pc is somewhere in the game, and it never
-	// returns to EELOAD. The loop then interprets forever and the recompiler is
-	// never reached (the JIT lives in the GAME_RUNNING stage), so a state load
-	// silently dropped the EE onto the interpreter for the rest of the session.
-	// g_GameStarted means exactly "we are past the game's entry point" and is part
-	// of the save state, so it is the right thing to resume on.
-	//
-	// Likewise g_GameLoading (also saved): a re-entry between eeloadHook and the
-	// entry point -- the libretro core pauses the VM for every retro_serialize --
-	// resumes in GAME_LOADING, where RESET would wait for an EELOAD that already
-	// ran and eeGameStarting would never fire. GAME_LOADING waits for ElfEntry,
-	// which the state does not carry; RefreshRunningGameAfterStateLoad restores it.
-	ExecuteState state = g_GameStarted ? GAME_RUNNING : (g_GameLoading ? GAME_LOADING : RESET);
-	// RESET steps before it tests, so that after a hook the pc moves off the
-	// hook address. But a re-entry can already sit on one (a pause exits from
-	// the event test of the branch that got there): on the first pass after an
-	// entry, test first. volatile: an instruction-cancel longjmp must not restore it.
-	volatile bool first_pass = true;
+	// The stage comes from the game-start flags on every pass, never from a local.
+	// The loop is re-entered on every exit -- a state load, and the pause the
+	// libretro core takes for each retro_serialize -- and on every instruction
+	// cancel, whose longjmp restores callee-saved registers, so a local set after
+	// fastjmp_set can snap back to its entry value. The flags are what the VM is
+	// actually past, and both are in the save state: g_GameStarted (eeGameStarting)
+	// means past the game's entry point, g_GameLoading (eeloadHook) means the ELF
+	// is loading. RESET waits for EELOAD, which a game that is loading or running
+	// never reaches again; GAME_LOADING waits for ElfEntry, which the state does
+	// not carry (RefreshRunningGameAfterStateLoad restores it).
 
 	// This will come back as zero the first time it runs, or on instruction cancel.
 	// It will come back as nonzero when we exit execution.
@@ -512,17 +500,13 @@ static void eeExecuteLoop(void)
 	{
 		// The execution was splited in three parts so it is easier to
 		// resume it after a cancelled instruction.
-		switch (state) {
+		switch (g_GameStarted ? GAME_RUNNING : (g_GameLoading ? GAME_LOADING : RESET)) {
 		case RESET:
 			{
-				if (!first_pass || cpuRegs.pc != (g_eeloadMain ? g_eeloadMain : EELOAD_START))
-				{
-					do
-					{
-						execI();
-					} while (cpuRegs.pc != (g_eeloadMain ? g_eeloadMain : EELOAD_START));
-				}
-				first_pass = false;
+				// Test before stepping: a re-entry may already sit on a hook address
+				// (a pause exits from the event test of the branch that got there).
+				while (cpuRegs.pc != (g_eeloadMain ? g_eeloadMain : EELOAD_START))
+					execI();
 
 				if (cpuRegs.pc == EELOAD_START)
 				{
@@ -551,9 +535,10 @@ static void eeExecuteLoop(void)
 					eeloadHook2();
 
 				if (!g_GameLoading)
+				{
+					execI(); // off the hook address, or the test above stops on it again
 					break;
-
-				state = GAME_LOADING;
+				}
 				PCSX2_FALLTHROUGH;
 			}
 
@@ -566,7 +551,6 @@ static void eeExecuteLoop(void)
 					execI();
 				eeGameStarting();
 			}
-			state = GAME_RUNNING;
 			// fallthrough
 
 		case GAME_RUNNING:

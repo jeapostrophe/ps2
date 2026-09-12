@@ -132,7 +132,8 @@ namespace VMManager
 		const std::string& GetElfOverride();
 		/// Re-reads the boot ELF's info, as eeloadHook does: DiscSerial always from
 		/// the disc; ElfEntry, ElfCRC and LastELF from the ELF override when one is
-		/// set, else from the disc's boot ELF.
+		/// set, else from the disc's boot ELF if it is a PS2 one (a PS1 or
+		/// unrecognized disc sets only DiscSerial).
 		void ReloadBootElfInfo();
 		bool IsExecutionInterrupted();
 		void EntryPointCompilingOnCPUThread();
