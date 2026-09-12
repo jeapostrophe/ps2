@@ -32,7 +32,13 @@
 #include <sys/ioctl.h>
 #endif
 
-#if defined(__FreeBSD__) || (__APPLE__)
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+/* The routing-table walk needs <net/route.h>, which the iOS SDK does not
+ * ship; on iOS GetGateways takes the "unsupported OS" arm below. */
+#if defined(__FreeBSD__) || (defined(__APPLE__) && !TARGET_OS_IPHONE)
+#define DEV9_ROUTE_SYSCTL
 #include <sys/param.h>
 #include <sys/sysctl.h>
 #include <net/route.h>
@@ -390,7 +396,7 @@ std::vector<IP_Address> AdapterUtils::GetGateways(Adapter* adapter)
 	}
 	return collection;
 }
-#elif defined(__FreeBSD__) || (__APPLE__)
+#elif defined(DEV9_ROUTE_SYSCTL)
 std::vector<IP_Address> AdapterUtils::GetGateways(Adapter* adapter)
 {
 	if (adapter == nullptr)

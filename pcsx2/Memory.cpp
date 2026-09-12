@@ -88,7 +88,16 @@ static VirtualMemoryManagerPtr AllocateVirtualMemory(const char* name, size_t si
 // --------------------------------------------------------------------------------------
 SysMainMemory::SysMainMemory()
 	: m_mainMemory(AllocateVirtualMemory("pcsx2", HostMemoryMap::MainSize, 0))
+#ifdef ARCH_ARM64
+	/* The x86 recompilers' 305 MB read-write-execute arena. Nothing on arm64
+	 * writes into it: the arm64 recompilers map their own caches
+	 * (armJitMap), and the software GS's JIT rasterizer is x86-only. It was a
+	 * MAP_JIT reservation on macOS for nothing, and on iOS no process may map
+	 * one at all. */
+	, m_codeMemory(nullptr)
+#else
 	, m_codeMemory(AllocateVirtualMemory(nullptr, HostMemoryMap::CodeSize, HostMemoryMap::MainSize))
+#endif
 	, m_bumpAllocator(m_mainMemory, HostMemoryMap::bumpAllocatorOffset, HostMemoryMap::MainSize - HostMemoryMap::bumpAllocatorOffset)
 {
 	uptr main_base = (uptr)MainMemory()->GetBase();

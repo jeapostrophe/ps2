@@ -4268,7 +4268,7 @@ namespace {
 		masm.FinalizeCode();
 
 		const size_t sz = masm.GetSizeOfCodeGenerated();
-		__builtin___clear_cache(reinterpret_cast<char*>(start), reinterpret_cast<char*>(start + sz));
+		HostSys::FlushInstructionCache(start, static_cast<u32>(sz));
 
 		// C.50: buffer offsets -> absolute addresses. Blocks are emitted at
 		// increasing s_code_pos and offsets grow within a block, so appending

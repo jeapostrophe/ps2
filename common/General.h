@@ -91,7 +91,13 @@ namespace HostSys
 	void RemovePageFaultHandler(PageFaultHandler handler);
 
 	/// JIT write protect for Apple Silicon. Needs to be called prior to writing to any RWX pages.
-#if !defined(__APPLE__) || !(defined(_M_ARM64) || defined(__aarch64__))
+	/// macOS only: MAP_JIT's per-thread W^X switch does not exist on iOS, where
+	/// the only code memory is the frontend's dual mapping (written through a
+	/// read-write alias that is never executable, so there is nothing to toggle).
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if !defined(__APPLE__) || !(defined(_M_ARM64) || defined(__aarch64__)) || !TARGET_OS_OSX
 	// clang-format -off
 	__fi static void BeginCodeWrite() {}
 	__fi static void EndCodeWrite() {}

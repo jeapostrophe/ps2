@@ -15,6 +15,8 @@
 
 #if defined(__APPLE__)
 #define _XOPEN_SOURCE
+#include <TargetConditionals.h>
+#include <libkern/OSCacheControl.h>
 #endif
 
 #if !defined(_WIN32)
@@ -316,9 +318,12 @@ bool HostSys::InstallPageFaultHandler(PageFaultHandler handler)
 		if (sigaction(SIGSEGV, &sa, &s_old_sigsegv_action) != 0)
 			return false;
 #endif
-#if defined(__APPLE__) && defined(__aarch64__)
-		/* Stops LLDB getting in a EXC_BAD_ACCESS loop 
-		 * when passing page faults to PCSX2. */
+#if defined(__APPLE__) && defined(__aarch64__) && TARGET_OS_OSX
+		/* Stops LLDB getting in a EXC_BAD_ACCESS loop
+		 * when passing page faults to PCSX2. macOS only: on iOS the
+		 * only debugger is the one that prepares the frontend's JIT
+		 * memory and detaches before any game loads, and clearing the
+		 * task's exception port there buys nothing. */
 		task_set_exception_ports(mach_task_self(), EXC_MASK_BAD_ACCESS, MACH_PORT_NULL, EXCEPTION_DEFAULT, 0);
 #endif
 	}
@@ -829,12 +834,18 @@ void HostSys::FlushInstructionCache(void* address, u32 size)
 {
 #ifdef _WIN32
 	::FlushInstructionCache(GetCurrentProcess(), address, size);
+#elif defined(__APPLE__)
+	/* libSystem's, on every Apple OS: the compiler-rt __clear_cache that
+	 * __builtin___clear_cache lowers to is not in the iOS link. Flushed by
+	 * the EXECUTE address -- the one the CPU fetches from -- which on a
+	 * dual-mapped code cache is not the address the bytes were written at. */
+	sys_icache_invalidate(address, size);
 #else
 	__builtin___clear_cache(reinterpret_cast<char*>(address), reinterpret_cast<char*>(address) + size);
 #endif
 }
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) && TARGET_OS_OSX
 static thread_local int s_code_write_depth = 0;
 
 void HostSys::BeginCodeWrite(void)

@@ -66,12 +66,16 @@ JITHASH_EXPORT void pcsx2_jithash_dump(void)
 	if (!env || env[0] == '0')
 		return;
 
-	const u8* base = GetVmMemory().CodeMemory()->GetBase();
-	if (!base)
-		return;
+	/* The regions are offsets into the x86 recompilers' code arena, which an
+	 * arm64 build does not map (SysMainMemory); the counters below are
+	 * printed either way. */
+	const VirtualMemoryManagerPtr& code = GetVmMemory().CodeMemory();
+	const u8* base = code ? code->GetBase() : nullptr;
 
 	for (const JitRegion& r : s_regions)
 	{
+		if (!base)
+			break;
 		// FNV-1a 64, plus a count of nonzero bytes as an independent
 		// sensitivity check (a hash collision and an equal nonzero count
 		// together are not a plausible accident).

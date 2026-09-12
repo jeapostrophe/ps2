@@ -20,7 +20,13 @@ option(LTO_PCSX2_CORE "Enable LTO/IPO/LTCG on the subset of pcsx2 that benefits 
 #-------------------------------------------------------------------------------
 # Graphical option
 #-------------------------------------------------------------------------------
-option(USE_OPENGL "Enable OpenGL GS renderer" ON)
+# iOS has no desktop OpenGL (find_package(OpenGL) fails there), and paraLLEl-GS
+# on Vulkan is the renderer a libretro frontend asks this core for anyway.
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+	option(USE_OPENGL "Enable OpenGL GS renderer" OFF)
+else()
+	option(USE_OPENGL "Enable OpenGL GS renderer" ON)
+endif()
 option(USE_VULKAN "Enable Vulkan GS renderer" ON)
 
 #-------------------------------------------------------------------------------
@@ -279,10 +285,11 @@ set(PCSX2_WARNINGS ${DEFAULT_WARNINGS})
 # MacOS-specific things
 #-------------------------------------------------------------------------------
 
-if(NOT CMAKE_GENERATOR MATCHES "Xcode")
+if(NOT CMAKE_GENERATOR MATCHES "Xcode" AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
 	# Assume Xcode builds aren't being used for distribution
 	# Helpful because Xcode builds don't build multiple metallibs for different macOS versions
 	# Also helpful because Xcode's interactive shader debugger requires apps be built for the latest macOS
+	# (A macOS version number; an iOS build keeps the one its toolchain was given.)
 	set(CMAKE_OSX_DEPLOYMENT_TARGET 10.13)
 endif()
 
@@ -311,6 +318,9 @@ if(CMAKE_SYSTEM_NAME MATCHES "Darwin")
 		# See http://www.cmake.org/cmake/help/v3.0/command/find_program.html
 		list(APPEND CMAKE_PREFIX_PATH "/usr")
 	endif()
+endif()
 
+if(APPLE)
+	# Every Apple linker, iOS's included.
 	add_link_options(-Wl,-dead_strip,-dead_strip_dylibs)
 endif()

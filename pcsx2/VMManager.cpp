@@ -889,14 +889,20 @@ void VMManager::InitializeCPUProviders()
 	dVifReserve(1);
 #endif
 
+#ifndef ARCH_ARM64
+	/* The software GS's JIT rasterizer (x86 only) lives in the code arena,
+	 * which arm64 does not map (SysMainMemory). */
 	GSCodeReserve::GetInstance().Assign(GetVmMemory().CodeMemory());
+#endif
 
 	VifUnpackSSE_Init(); // on arm64 this generates the NEON nVifUpk kernels (C.19)
 }
 
 void VMManager::ShutdownCPUProviders()
 {
+#ifndef ARCH_ARM64
 	GSCodeReserve::GetInstance().Release();
+#endif
 
 #ifndef ARCH_ARM64
 	dVifRelease(1);
