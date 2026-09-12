@@ -18,6 +18,8 @@
 #include <TargetConditionals.h>
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
+#include <algorithm>
+#include <vector>
 #endif
 
 #if !defined(_WIN32)
@@ -495,30 +497,77 @@ std::string HostSys::GetFileMappingName(const char* prefix)
  * the iPad station): a vm_allocate'd backing region and a memory entry naming
  * it; every view is a vm_map of the entry, so every view is the same pages.
  * Used on macOS as well, so the Mac runs the code the iPad does. Data only:
- * a view that asks to be executable is refused. */
+ * a view that asks to be executable is refused.
+ *
+ * One memory entry names one VM object, and XNU builds anonymous memory out of
+ * objects of at most 128 MB: over SysMainMemory's 320 MB the first entry
+ * covers only 128 MB (measured, macOS 15.3: mach_make_memory_entry_64 returns
+ * KERN_SUCCESS with the size cut to 0x8000000). So the backing is named by as
+ * many entries as the kernel hands out, each over the extent it reports, and a
+ * view maps each entry's piece of itself in turn. */
 namespace
 {
 	struct DarwinSharedMemory
 	{
+		struct Chunk
+		{
+			vm_size_t offset; // into the shared memory
+			vm_size_t size;
+			mach_port_t entry;
+		};
+
 		vm_address_t backing;
 		vm_size_t size;
-		mach_port_t entry;
+		std::vector<Chunk> chunks; // ascending, contiguous, covering [0, size)
 	};
 
+	void DarwinFreeSharedMemory(DarwinSharedMemory* shm)
+	{
+		for (const DarwinSharedMemory::Chunk& c : shm->chunks)
+			mach_port_deallocate(mach_task_self(), c.entry);
+		vm_deallocate(mach_task_self(), shm->backing, shm->size);
+		delete shm;
+	}
+
+	// Map [offset, offset + size) of the shared memory. VM_FLAGS_OVERWRITE
+	// means `base` is inside a reservation the caller owns and is replaced;
+	// otherwise the whole range is reserved first -- at `base` (VM_FLAGS_FIXED,
+	// which fails untouched where anything is mapped) or anywhere -- so the
+	// pieces land contiguously.
 	void* DarwinMapEntry(void* handle, size_t offset, void* base, size_t size, const PageProtectionMode mode, int flags)
 	{
 		if (mode.m_exec)
 			return nullptr;
 		const DarwinSharedMemory* shm = static_cast<const DarwinSharedMemory*>(handle);
+		if (offset > shm->size || size > shm->size - offset)
+			return nullptr;
 		vm_prot_t prot = VM_PROT_NONE;
 		if (mode.m_read)
 			prot |= VM_PROT_READ;
 		if (mode.m_write)
 			prot |= VM_PROT_WRITE;
+
+		const bool reserved_here = !(flags & VM_FLAGS_OVERWRITE);
 		vm_address_t addr = reinterpret_cast<vm_address_t>(base);
-		if (vm_map(mach_task_self(), &addr, size, 0, flags, shm->entry, offset, FALSE, prot,
-				VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE) != KERN_SUCCESS)
+		if (reserved_here && vm_allocate(mach_task_self(), &addr, size, flags) != KERN_SUCCESS)
 			return nullptr;
+
+		const vm_size_t end = offset + size;
+		for (const DarwinSharedMemory::Chunk& c : shm->chunks)
+		{
+			const vm_size_t lo = std::max<vm_size_t>(offset, c.offset);
+			const vm_size_t hi = std::min<vm_size_t>(end, c.offset + c.size);
+			if (lo >= hi)
+				continue;
+			vm_address_t at = addr + (lo - offset);
+			if (vm_map(mach_task_self(), &at, hi - lo, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, c.entry, lo - c.offset,
+					FALSE, prot, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE) != KERN_SUCCESS)
+			{
+				if (reserved_here)
+					vm_deallocate(mach_task_self(), addr, size);
+				return nullptr;
+			}
+		}
 		return reinterpret_cast<void*>(addr);
 	}
 } // namespace
@@ -551,20 +600,30 @@ void* HostSys::CreateSharedMemory(const char* name, size_t size)
 	return reinterpret_cast<void*>(static_cast<intptr_t>(fd));
 #elif defined(__APPLE__)
 	(void)name; /* a memory entry is anonymous */
-	vm_address_t backing = 0;
-	if (vm_allocate(mach_task_self(), &backing, size, VM_FLAGS_ANYWHERE) != KERN_SUCCESS)
-		return nullptr;
-	memory_object_size_t entry_size = size;
-	mach_port_t entry = MACH_PORT_NULL;
-	if (mach_make_memory_entry_64(mach_task_self(), &entry_size, backing, VM_PROT_READ | VM_PROT_WRITE,
-			&entry, MACH_PORT_NULL) != KERN_SUCCESS || entry_size < size)
+	DarwinSharedMemory* shm = new DarwinSharedMemory{0, size, {}};
+	if (vm_allocate(mach_task_self(), &shm->backing, size, VM_FLAGS_ANYWHERE) != KERN_SUCCESS)
 	{
-		if (entry != MACH_PORT_NULL)
-			mach_port_deallocate(mach_task_self(), entry);
-		vm_deallocate(mach_task_self(), backing, size);
+		delete shm;
 		return nullptr;
 	}
-	return new DarwinSharedMemory{backing, size, entry};
+	/* One entry per extent the kernel reports (see DarwinSharedMemory). */
+	for (vm_size_t off = 0; off < size;)
+	{
+		memory_object_size_t entry_size = size - off;
+		mach_port_t entry = MACH_PORT_NULL;
+		if (mach_make_memory_entry_64(mach_task_self(), &entry_size, shm->backing + off, VM_PROT_READ | VM_PROT_WRITE,
+				&entry, MACH_PORT_NULL) != KERN_SUCCESS || entry_size == 0)
+		{
+			if (entry != MACH_PORT_NULL)
+				mach_port_deallocate(mach_task_self(), entry);
+			DarwinFreeSharedMemory(shm);
+			return nullptr;
+		}
+		entry_size = std::min<memory_object_size_t>(entry_size, size - off);
+		shm->chunks.push_back({off, static_cast<vm_size_t>(entry_size), entry});
+		off += entry_size;
+	}
+	return shm;
 #else
 	const int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
 	if (fd < 0)
@@ -590,10 +649,7 @@ void HostSys::DestroySharedMemory(void* ptr)
 #ifdef _WIN32
 	CloseHandle(static_cast<HANDLE>(ptr));
 #elif defined(__APPLE__)
-	DarwinSharedMemory* shm = static_cast<DarwinSharedMemory*>(ptr);
-	mach_port_deallocate(mach_task_self(), shm->entry);
-	vm_deallocate(mach_task_self(), shm->backing, shm->size);
-	delete shm;
+	DarwinFreeSharedMemory(static_cast<DarwinSharedMemory*>(ptr));
 #else
 	close(static_cast<int>(reinterpret_cast<intptr_t>(ptr)));
 #endif

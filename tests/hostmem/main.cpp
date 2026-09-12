@@ -7,16 +7,20 @@
  * page, into the 4 GB fastmem area (SharedMemoryMappingArea::Map). The
  * recompilers read and write guest RAM through the fastmem pages while the
  * interpreters, DMA and the GS read it through the main mapping, so the one
- * property everything rests on is that the views are the same physical pages.
- * A view that is a private copy boots, runs for a while, and then diverges
- * wherever a write went through one view and a read through the other.
+ * property everything rests on is that the views are the same physical pages
+ * -- all of them, at the size SysMainMemory really asks for.
  *
- * On Apple the implementation is a Mach memory entry (vm_allocate +
- * mach_make_memory_entry_64, every view a vm_map of the entry) rather than
- * shm_open, so this is what holds that shape to the property. It links the
- * real common/HostSys.cpp out of a built libcommon.a -- a real-code harness,
- * not a transcription. Plain read-write data memory only: nothing here is
- * ever mapped executable.
+ * On Apple the implementation is Mach memory entries (vm_allocate +
+ * mach_make_memory_entry_64, every view a vm_map) rather than shm_open. One
+ * entry names at most one VM object, and XNU builds anonymous memory out of
+ * 128 MB objects, so at SysMainMemory's size the backing needs several
+ * entries -- which is why this runs at HostMemoryMap::MainSize and checks
+ * every page, rather than at a size where one entry would do: a first version
+ * of it ran at 64 KiB and passed over code that could not map guest RAM.
+ *
+ * It links the real common/HostSys.cpp out of a built libcommon.a -- a
+ * real-code harness, not a transcription. Plain read-write data memory only:
+ * nothing here is ever mapped executable.
  *
  * USAGE (from repo root, after a cmake build of the core)
  *
@@ -26,6 +30,7 @@
  * Exit 0 = every check held; otherwise each failure is named.
  */
 #include "common/General.h"
+#include "pcsx2/Memory.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -56,13 +61,20 @@ static PageProtectionMode rw()
 	return m;
 }
 
+// A value per page that no other page shares.
+static u32 stamp(size_t page_index)
+{
+	return static_cast<u32>(page_index * 2654435761u) ^ 0x5A5A0001u;
+}
+
 int main()
 {
 	const size_t page = static_cast<size_t>(getpagesize());
-	const size_t size = 4 * page;
+	const size_t size = HostMemoryMap::MainSize; // what SysMainMemory asks for
+	const size_t pages = size / page;
 
 	void* shm = HostSys::CreateSharedMemory(HostSys::GetFileMappingName("lrps2_hostmem").c_str(), size);
-	CHECK(shm, "CreateSharedMemory(%zu) returned no handle", size);
+	CHECK(shm, "CreateSharedMemory(%#zx) -- SysMainMemory's size -- returned no handle, so no guest RAM", size);
 	if (!shm)
 		return 1;
 
@@ -72,45 +84,67 @@ int main()
 	if (!a || !b)
 		return 1;
 
-	for (size_t i = 0; i < size; i++)
-		a[i] = static_cast<u8>(i * 7 + 3);
-	CHECK(std::memcmp(a, b, size) == 0,
-		"a write through one view is not visible through the other -- the views are copies, not "
-		"one memory, so fastmem and the interpreters would see different guest RAM");
-	b[page + 5] = 0xA5;
-	CHECK(a[page + 5] == 0xA5, "and not the other way round either (read %#x through the first view)", a[page + 5]);
+	// Every page, through one view, then back through the other.
+	size_t first_bad = pages;
+	for (size_t i = 0; i < pages; i++)
+	{
+		const u32 s = stamp(i);
+		std::memcpy(a + i * page, &s, sizeof(s));
+	}
+	for (size_t i = 0; i < pages && first_bad == pages; i++)
+	{
+		u32 v;
+		std::memcpy(&v, b + i * page, sizeof(v));
+		if (v != stamp(i))
+			first_bad = i;
+	}
+	CHECK(first_bad == pages,
+		"page %zu of %zu (offset %#zx) written through one view is not what the other view reads -- "
+		"the views are not one memory there, so fastmem and the interpreters would see different guest RAM",
+		first_bad, pages, first_bad * page);
+	b[size - 1] = 0xA5;
+	CHECK(a[size - 1] == 0xA5, "the last byte written through the second view is %#x through the first", a[size - 1]);
 
 	/* A placement request over something already mapped fails and leaves it
 	 * alone -- VirtualMemoryManager walks candidate bases relying on that. */
 	void* clash = HostSys::MapSharedMemory(shm, 0, a, size, rw());
 	CHECK(clash == nullptr, "a placement request over the first view succeeded (%p) instead of failing", clash);
-	CHECK(a[page + 5] == 0xA5 && a[0] == 3, "and the refused placement disturbed the view it was refused over");
+	u32 v0;
+	std::memcpy(&v0, a, sizeof(v0));
+	CHECK(v0 == stamp(0) && a[size - 1] == 0xA5, "and the refused placement disturbed the view it was refused over");
 
-	/* A view at an offset starts at that offset. */
-	u8* off = static_cast<u8*>(HostSys::MapSharedMemory(shm, 2 * page, nullptr, page, rw()));
-	CHECK(off && off[0] == a[2 * page] && off[page - 1] == a[3 * page - 1],
-		"a view at offset %zu does not show the memory at that offset", 2 * page);
+	/* A view at an offset starts at that offset -- here, the last two pages. */
+	u8* off = static_cast<u8*>(HostSys::MapSharedMemory(shm, size - 2 * page, nullptr, 2 * page, rw()));
+	CHECK(off && std::memcmp(off, a + size - 2 * page, 2 * page) == 0,
+		"a view at offset %#zx does not show the memory at that offset", size - 2 * page);
 
 	/* The fastmem area: a PROT_NONE reservation whose pages are replaced, one
-	 * at a time, by views of guest RAM. */
+	 * at a time, by views of guest RAM -- from anywhere in it. */
 	std::unique_ptr<SharedMemoryMappingArea> area = SharedMemoryMappingArea::Create(4 * page);
 	CHECK(area != nullptr, "SharedMemoryMappingArea::Create failed");
 	if (area)
 	{
-		u8* p = area->Map(shm, page, area->PagePointer(3), page, rw());
-		CHECK(p == area->PagePointer(3), "Map placed the page at %p, not at the area's page 3 (%p)",
-			static_cast<void*>(p), static_cast<void*>(area->PagePointer(3)));
-		if (p)
+		const size_t sources[] = {page, size / 2, size - page};
+		for (size_t k = 0; k < 3; k++)
 		{
-			CHECK(p[5] == 0xA5, "the area's page shows %#x where guest RAM holds 0xA5 -- not the same pages", p[5]);
-			p[6] = 0x5A;
-			CHECK(a[page + 6] == 0x5A, "a write through the fastmem page is not visible in guest RAM");
-			CHECK(area->Unmap(p, page), "Unmap of the area's page failed");
+			const size_t src = sources[k];
+			u8* p = area->Map(shm, src, area->PagePointer(k + 1), page, rw());
+			CHECK(p == area->PagePointer(k + 1), "Map of guest offset %#zx placed the page at %p, not at the area's page %zu (%p)",
+				src, static_cast<void*>(p), k + 1, static_cast<void*>(area->PagePointer(k + 1)));
+			if (!p)
+				continue;
+			CHECK(std::memcmp(p, a + src, page) == 0, "the area's page for guest offset %#zx is not guest RAM there", src);
+			p[8] = static_cast<u8>(0x40 + k);
+			CHECK(a[src + 8] == 0x40 + k, "a write through the fastmem page for guest offset %#zx is not visible in guest RAM", src);
+			CHECK(area->Unmap(p, page), "Unmap of the area's page %zu failed", k + 1);
 		}
 	}
 
-	HostSys::UnmapSharedMemory(off, page);
-	HostSys::Munmap(off, page);
+	if (off)
+	{
+		HostSys::UnmapSharedMemory(off, 2 * page);
+		HostSys::Munmap(off, 2 * page);
+	}
 	HostSys::UnmapSharedMemory(b, size);
 	HostSys::Munmap(b, size);
 	HostSys::UnmapSharedMemory(a, size);
@@ -122,6 +156,6 @@ int main()
 		std::fprintf(stderr, "hostmem: %d check(s) failed\n", s_failures);
 		return 1;
 	}
-	std::printf("hostmem: ok (shared memory views alias; placement requests refuse without side effects)\n");
+	std::printf("hostmem: ok (%zu MB of shared memory: every page aliases; placement requests refuse without side effects)\n", size >> 20);
 	return 0;
 }
