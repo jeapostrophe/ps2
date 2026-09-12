@@ -423,10 +423,10 @@ void VifUnpackSSE_Init()
 {
 	if (!s_upkCode)
 	{
-		s_upkCode = armJitMap(kUpkCodeSize); // host code memory; the writes are armStartBlock sessions
+		s_upkCode = armJitMap(kUpkCodeSize, "VIF unpack"); // the writes are armStartBlock sessions
 		if (!s_upkCode)
 		{
-			Console.Error("arm64 VIF unpack dynarec: mmap failed; using the C reference path.");
+			Console.Error("arm64 VIF unpack dynarec: no code memory; using the C reference path.");
 			return;
 		}
 	}
@@ -445,7 +445,7 @@ void VifUnpackSSE_Destroy()
 {
 	if (s_upkCode)
 	{
-		HostSys::Munmap(s_upkCode, kUpkCodeSize);
+		armJitUnmap(s_upkCode, kUpkCodeSize, "VIF unpack");
 		s_upkCode = nullptr;
 	}
 	memset(nVifUpk, 0, sizeof(nVifUpk));

@@ -927,6 +927,13 @@ void VMManager::ShutdownCPUProviders()
 #endif
 }
 
+#ifdef ARCH_ARM64
+// Whether a recompiler's reserve got its code memory (arm64/recR5900_arm64.cpp,
+// arm64/aVU.cpp).
+extern bool eeJitAvailable_arm64(void);
+extern bool mVUavailable(int vuIndex);
+#endif
+
 void VMManager::UpdateCPUImplementations()
 {
 #ifndef ARCH_ARM64
@@ -936,7 +943,15 @@ void VMManager::UpdateCPUImplementations()
 	// arm64: IOP uses the arm64 recompiler (Phase C.2b). EE uses the arm64 EE
 	// recompiler (Phase C.3) when CHECK_EEREC is set; C.3-1 blocks call the
 	// interpreter so behaviour is identical while the JIT plumbing runs.
-	Cpu    = CHECK_EEREC ? &recCpu : &intCpu;
+	// A recompiler whose reserve got no code memory (a frontend with none to
+	// lend) is not selectable; its interpreter runs instead. The EE's COP2
+	// macro emission calls into microVU0's cache (its exact-multiply stub),
+	// so the EE rec needs that cache too. The IOP rec falls back by itself
+	// (recExecuteBlock -> psxInt).
+	const bool ee_rec = CHECK_EEREC && eeJitAvailable_arm64() && mVUavailable(0);
+	if (CHECK_EEREC && !ee_rec)
+		Console.WriteLn("arm64 EE rec: no code memory this load -- the EE interpreter runs.");
+	Cpu    = ee_rec ? &recCpu : &intCpu;
 	psxCpu = &psxRec;
 #endif
 
@@ -955,8 +970,9 @@ void VMManager::UpdateCPUImplementations()
 
 #ifdef ARCH_ARM64
 	// C.30-1: microVU0 runs VU0 micro programs natively (macro-mode COP2
-	// stays on the C.29-1 inline interpreter calls until C.30-2).
-	if (EmuConfig.Cpu.Recompiler.EnableVU0 && !CHECK_VU_SOFT_REC(0))
+	// stays on the C.29-1 inline interpreter calls until C.30-2). Only with
+	// a code cache (mVUavailable).
+	if (EmuConfig.Cpu.Recompiler.EnableVU0 && !CHECK_VU_SOFT_REC(0) && mVUavailable(0))
 		CpuVU0 = &vucpu_rec_vu0;
 #endif
 
@@ -969,11 +985,13 @@ void VMManager::UpdateCPUImplementations()
 #else
 	// C.28-4: microVU1 (the armsx2 transplant, native VU codegen) is the VU1
 	// provider -- verified register-exact against the interpreter.
-	if (EmuConfig.Cpu.Recompiler.EnableVU1 && !CHECK_VU_SOFT_REC(1))
+	if (EmuConfig.Cpu.Recompiler.EnableVU1 && !CHECK_VU_SOFT_REC(1) && mVUavailable(1))
 	{
 		CpuVU1 = &vucpu_rec_vu1;
 		Console.WriteLn("arm64 VU1 rec: microVU1 (native codegen) is the default provider.");
 	}
+	else if (EmuConfig.Cpu.Recompiler.EnableVU1 && !CHECK_VU_SOFT_REC(1))
+		Console.WriteLn("arm64 VU1 rec: no code memory this load -- the VU1 interpreter runs.");
 #endif
 }
 

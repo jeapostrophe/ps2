@@ -191,10 +191,10 @@ void dVifReserve(int idx)
 {
 	if (s_vifCode[idx])
 		return;
-	s_vifCode[idx] = armJitMap(kVifCodeSize); // host code memory; the writes are armStartBlock sessions
+	s_vifCode[idx] = armJitMap(kVifCodeSize, idx ? "VIF1" : "VIF0"); // the writes are armStartBlock sessions
 	if (!s_vifCode[idx])
 	{
-		Console.Error("arm64 VIF%d dynarec: mmap failed; unpacks fall back to the C reference path.", idx);
+		Console.Error("arm64 VIF%d dynarec: no code memory; unpacks fall back to the C reference path.", idx);
 		return;
 	}
 	nVif[idx].recWritePtr = s_vifCode[idx];
@@ -216,7 +216,7 @@ void dVifRelease(int idx)
 	vif_hash_clear(&nVif[idx].vifBlocks);
 	if (s_vifCode[idx])
 	{
-		HostSys::Munmap(s_vifCode[idx], kVifCodeSize);
+		armJitUnmap(s_vifCode[idx], kVifCodeSize, idx ? "VIF1" : "VIF0");
 		s_vifCode[idx] = nullptr;
 		nVif[idx].recWritePtr = nullptr;
 		nVif[idx].recEndPtr = nullptr;

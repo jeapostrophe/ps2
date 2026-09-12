@@ -101,6 +101,11 @@ namespace
 	u8*    s_code     = nullptr;
 	size_t s_code_pos = 0;
 	bool   s_ok       = false;
+	// The execute address of the block CompileBlock is emitting. Its
+	// MacroAssembler writes through the cache's write alias (armJitRW), so
+	// the buffer's own start is not where the code runs: every adrp or
+	// displacement computed while emitting starts from here instead.
+	u8*    s_block_exec = nullptr;
 
 	// Block record with a snapshot of the NATIVE-range source words. The EE's
 	// fault-based SMC protection must drop every block on a written page (after
@@ -2296,15 +2301,14 @@ namespace
 
 	// C.78: adrp+pageoff fold for absolute data addresses -- the EE-rec twin of
 	// AsmHelpers' armAbsMemOperand, which reads the armAsm thread-locals and is
-	// only valid during the COP2-macro assembler handoff. Blocks are emitted in
-	// place (masm is constructed over s_code + s_code_pos), so the current host
-	// address is the buffer start plus the cursor. Falls back to the full
-	// materialization when the page displacement does not encode or the page
-	// offset is not size-aligned.
+	// only valid during the COP2-macro assembler handoff. The current host
+	// address is the block's EXECUTE start plus the cursor -- not the
+	// buffer's start, which is the write alias on a dual-mapped cache. Falls
+	// back to the full materialization when the page displacement does not
+	// encode or the page offset is not size-aligned.
 	MemOperand AbsMem(MacroAssembler& m, const Register& scratch, const void* addr, unsigned size)
 	{
-		const uintptr_t cur = reinterpret_cast<uintptr_t>(m.GetBuffer()->GetStartAddress<u8*>()) +
-		                      m.GetBuffer()->GetCursorOffset();
+		const uintptr_t cur = reinterpret_cast<uintptr_t>(s_block_exec) + m.GetBuffer()->GetCursorOffset();
 		const s64 page_disp = (static_cast<s64>(reinterpret_cast<uintptr_t>(addr) & ~uintptr_t(0xFFF)) -
 		                       static_cast<s64>(cur & ~uintptr_t(0xFFF))) >> 12;
 		const u32 page_off = static_cast<u32>(reinterpret_cast<uintptr_t>(addr) & 0xFFFu);
@@ -2326,8 +2330,9 @@ namespace
 	// (always denormalize/update/normalize the flags -- correct, just not
 	// minimal). The emitters write through the AsmHelpers thread-locals, so we
 	// hand them OUR in-flight assembler for the duration of the op: armAsmPtr
-	// must be the block buffer's start so armGetCurrentCodePointer() (used for
-	// ADRP/call displacement math) computes true host addresses.
+	// must be the block's execute start (s_block_exec) so
+	// armGetCurrentCodePointer() (used for ADRP/call displacement math)
+	// computes the addresses the code will run at.
 	EEINST s_cop2AllLive; // .info set on first use
 
 } // pause the anonymous namespace: cop2flags has a global declaration
@@ -2713,7 +2718,7 @@ namespace {
 		u8* saved_ptr = armAsmPtr;
 		size_t saved_cap = armAsmCapacity;
 		armAsm = &m;
-		armAsmPtr = m.GetBuffer()->GetStartAddress<u8*>();
+		armAsmPtr = s_block_exec; // the execute start: see s_block_exec
 		armAsmCapacity = m.GetBuffer()->GetCapacity();
 
 		const bool ok = recVUMacroEmitMode0(insn);
@@ -4126,7 +4131,10 @@ namespace {
 		s_exit_labels.emplace_back();
 		s_blk_ret = &s_exit_labels.front(); // the block's one return tail
 		ArmCodeWriteScope cws; // every byte from here to the icache flush is a code write
-		MacroAssembler masm(start, kCodeCacheSize - s_code_pos, PositionDependentCode);
+		// Written through the write alias, run at `start`: `start` is what is
+		// flushed, recorded in s_fm_sites and published as the BlockFn.
+		s_block_exec = start;
+		MacroAssembler masm(armJitRW(start), kCodeCacheSize - s_code_pos, PositionDependentCode);
 		// The aVU macro emitters (C.30-2) hold RSCRATCHADDR (x17) and q31 across
 		// vixl macro expansions -- keep the assembler from synthesizing into them
 		// (mirrors armStartBlock in AsmHelpers.cpp).
@@ -4382,9 +4390,9 @@ namespace {
 void eeJitReserve_arm64(void)
 {
 	s_ok = armVixlSelfTest();
-	if (!s_code)
+	if (s_ok && !s_code)
 	{
-		s_code = armJitMap(kCodeCacheSize);
+		s_code = armJitMap(kCodeCacheSize, "EE");
 	}
 	if (!s_lut)
 	{
@@ -4394,7 +4402,15 @@ void eeJitReserve_arm64(void)
 	}
 	s_page_clears.assign(kRamBytes >> kPageShift, 0); // C.60
 	s_ok = s_ok && s_code && s_lut;
-	Console.WriteLn("arm64 EE rec (C.7): %s.", s_ok ? "native ALU+mem+branch+FPU-mov+MMI+muldiv JIT (block-linking)" : "FAILED");
+	Console.WriteLn("arm64 EE rec (C.7): %s.", s_ok ? "native ALU+mem+branch+FPU-mov+MMI+muldiv JIT (block-linking)" : "FAILED -> interpreter fallback");
+}
+
+// Did the reserve get everything the recompiler needs? VMManager's provider
+// choice asks, so a load with no code memory runs the EE interpreter rather
+// than dispatching into a cache that does not exist.
+bool eeJitAvailable_arm64(void)
+{
+	return s_ok;
 }
 
 void eeJitReset_arm64(void)
@@ -4444,9 +4460,10 @@ void eeJitShutdown_arm64(void)
 {
 	s_blocks.clear();
 	s_page.clear();
-	if (s_code) { HostSys::Munmap(s_code, kCodeCacheSize); s_code = nullptr; }
+	if (s_code) { armJitUnmap(s_code, kCodeCacheSize, "EE"); s_code = nullptr; }
 	if (s_lut) { munmap(s_lut, (size_t)kRamWords * sizeof(BlockFn)); s_lut = nullptr; }
 	s_code_pos = 0;
+	s_ok = false;
 	// Every static the reserve fills, emptied with it -- the shutdown is the
 	// reserve's mirror, not a list of pointers that have crashed so far. The
 	// fastmem site tables point into the cache just unmapped (and the fault
@@ -4469,7 +4486,8 @@ void eeJitShutdown_arm64(void)
 // Runs on the faulting (EE) thread from the SIGSEGV handler. It only reads a
 // sorted vector that is mutated by the same thread while COMPILING -- never
 // while executing, which is the only time a fault can arrive -- and writes 4
-// bytes of RWX code cache. Returns false for any fault we don't own, which
+// bytes of code cache (through its write alias; the sites are execute
+// addresses, the faulting pc's). Returns false for any fault we don't own, which
 // lets the handler fall through to its default (abort) path.
 extern "C" bool eeFastmemFault_arm64(uintptr_t code_address)
 {

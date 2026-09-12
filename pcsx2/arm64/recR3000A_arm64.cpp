@@ -693,7 +693,10 @@ namespace
 
 		u8* start = s_code + s_code_pos;
 		ArmCodeWriteScope cws; // every byte from here to the icache flush is a code write
-		MacroAssembler masm(start, kCodeCacheSize - s_code_pos, PositionDependentCode);
+		// Written through the write alias, run at `start` (flushed and
+		// published as the BlockFn). Nothing emitted here computes an address
+		// from the buffer's own start.
+		MacroAssembler masm(armJitRW(start), kCodeCacheSize - s_code_pos, PositionDependentCode);
 		s_irc.Reset(); // fresh per-block register-cache state (C.32)
 
 		const Register gpr = x19;
@@ -803,9 +806,9 @@ namespace
 static void recReserve(void)
 {
 	s_ok = armVixlSelfTest();
-	if (!s_code)
+	if (s_ok && !s_code)
 	{
-		s_code = armJitMap(kCodeCacheSize);
+		s_code = armJitMap(kCodeCacheSize, "IOP");
 	}
 	if (!s_lut)
 	{
@@ -906,8 +909,9 @@ static void recShutdown(void)
 	s_blocks.clear();
 	s_page.clear();
 	memset(s_covered, 0, sizeof(s_covered));
-	if (s_code) { HostSys::Munmap(s_code, kCodeCacheSize); s_code = nullptr; }
+	if (s_code) { armJitUnmap(s_code, kCodeCacheSize, "IOP"); s_code = nullptr; }
 	s_code_pos = 0;
+	s_ok = false;
 	// The LUT goes with the cache it indexes. It used to outlive it: recReserve
 	// keeps an existing s_lut, so a second VM in the same process (a frontend
 	// that swaps content on a still-resident core -- macOS never unloads a

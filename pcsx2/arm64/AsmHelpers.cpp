@@ -114,7 +114,10 @@ u8* armStartBlock()
 	HostSys::BeginCodeWrite();
 
 	pxAssert(!armAsm);
-	armAsm = new (s_armAsmStorage) vixl::aarch64::MacroAssembler(static_cast<vixl::byte*>(armAsmPtr), armAsmCapacity);
+	// vixl writes the bytes through the write alias; armAsmPtr stays the
+	// execute address, so armGetCurrentCodePointer() -- every displacement,
+	// every published entry point -- is where the code runs.
+	armAsm = new (s_armAsmStorage) vixl::aarch64::MacroAssembler(static_cast<vixl::byte*>(armJitRW(armAsmPtr)), armAsmCapacity);
 	armAsm->GetScratchVRegisterList()->Remove(31);
 	armAsm->GetScratchRegisterList()->Remove(RSCRATCHADDR.GetCode());
 	return armAsmPtr;
@@ -208,37 +211,117 @@ void armEmitCall(const void* ptr, bool force_inline)
 	}
 }
 
-u8* armJitMap(size_t size)
+// Where code memory comes from this load (armJitSetSource), the frontend's
+// lease calls, and the leases held as execute->write pairs.
+static ArmJitSource s_jit_source = ArmJitSource::Self;
+static ArmJitHostAlloc s_jit_host_alloc = nullptr;
+static ArmJitHostFree s_jit_host_free = nullptr;
+static ArmJitRegions s_jit_regions;
+
+void armJitSetSource(ArmJitSource source, ArmJitHostAlloc alloc, ArmJitHostFree free)
 {
-	return static_cast<u8*>(HostSys::Mmap(nullptr, size, PageProtectionMode{true, true, true}));
+	s_jit_source = source;
+	s_jit_host_alloc = alloc;
+	s_jit_host_free = free;
+}
+
+u8* armJitRW(const void* exec)
+{
+	return reinterpret_cast<u8*>(s_jit_regions.WriteAddress(reinterpret_cast<uintptr_t>(exec)));
+}
+
+static const char* armJitAddResultName(ArmJitRegions::AddResult r)
+{
+	switch (r)
+	{
+		case ArmJitRegions::AddResult::Ok: return "ok";
+		case ArmJitRegions::AddResult::Empty: return "a null alias or a zero size";
+		case ArmJitRegions::AddResult::SameAlias: return "both aliases are one address";
+		case ArmJitRegions::AddResult::PageOffset: return "the aliases disagree within a 4 KiB page";
+		case ArmJitRegions::AddResult::Overlap: return "it overlaps a lease already held";
+		case ArmJitRegions::AddResult::Full: return "every region slot is taken";
+	}
+	return "?";
+}
+
+u8* armJitMap(size_t size, const char* what)
+{
+	switch (s_jit_source)
+	{
+		case ArmJitSource::Self:
+		{
+			u8* p = static_cast<u8*>(HostSys::Mmap(nullptr, size, PageProtectionMode{true, true, true}));
+			if (p)
+				Console.WriteLn("arm64 JIT: %s code cache, %zu KiB, mapped by the core at %p.", what, size >> 10, p);
+			else
+				Console.Error("arm64 JIT: %s code cache: the host refused %zu KiB of code memory.", what, size >> 10);
+			return p;
+		}
+		case ArmJitSource::Frontend:
+		{
+			void* rx = nullptr;
+			void* rw = nullptr;
+			if (!s_jit_host_alloc || !s_jit_host_alloc(size, &rx, &rw))
+			{
+				Console.Error("arm64 JIT: %s code cache: the frontend lent no %zu KiB.", what, size >> 10);
+				return nullptr;
+			}
+			const ArmJitRegions::AddResult added = s_jit_regions.Add(reinterpret_cast<uintptr_t>(rx), reinterpret_cast<uintptr_t>(rw), size);
+			if (added != ArmJitRegions::AddResult::Ok)
+			{
+				Console.Error("arm64 JIT: %s code cache: the frontend's lease (rx %p, rw %p, %zu KiB) is unusable: %s.",
+					what, rx, rw, size >> 10, armJitAddResultName(added));
+				s_jit_host_free(rx);
+				return nullptr;
+			}
+			Console.WriteLn("arm64 JIT: %s code cache, %zu KiB, from the frontend (rx %p, rw %p).", what, size >> 10, rx, rw);
+			return static_cast<u8*>(rx);
+		}
+		case ArmJitSource::None:
+			break;
+	}
+	Console.WriteLn("arm64 JIT: %s code cache: the frontend has no code memory to lend.", what);
+	return nullptr;
+}
+
+void armJitUnmap(u8* exec, size_t size, const char* what)
+{
+	if (!exec)
+		return;
+	// By what the table says, not by the current source: a lease is handed
+	// back to whoever lent it.
+	if (s_jit_regions.Remove(reinterpret_cast<uintptr_t>(exec)))
+	{
+		s_jit_host_free(exec);
+		Console.WriteLn("arm64 JIT: %s code cache, %zu KiB, returned to the frontend (rx %p).", what, size >> 10, exec);
+	}
+	else
+	{
+		HostSys::Munmap(exec, size);
+		Console.WriteLn("arm64 JIT: %s code cache, %zu KiB, unmapped (%p).", what, size >> 10, exec);
+	}
 }
 
 ArmCodeWriteScope::ArmCodeWriteScope() { HostSys::BeginCodeWrite(); }
 ArmCodeWriteScope::~ArmCodeWriteScope() { HostSys::EndCodeWrite(); }
 
-static bool armVixlSelfTestOnce()
+bool armVixlSelfTest()
 {
 	constexpr size_t kScratch = 4096;
-	u8* scratch = armJitMap(kScratch);
+	u8* scratch = armJitMap(kScratch, "self-test");
 	if (!scratch)
 		return false;
 	{
 		ArmCodeWriteScope cws;
-		a64::MacroAssembler masm(static_cast<vixl::byte*>(scratch), kScratch, a64::PositionDependentCode);
+		a64::MacroAssembler masm(static_cast<vixl::byte*>(armJitRW(scratch)), kScratch, a64::PositionDependentCode);
 		masm.Add(a64::x0, a64::x0, 1);
 		masm.Ret();
 		masm.FinalizeCode();
 	}
 	HostSys::FlushInstructionCache(scratch, kScratch);
 	const int64_t r = reinterpret_cast<int64_t (*)(int64_t)>(scratch)(41);
-	HostSys::Munmap(scratch, kScratch);
+	armJitUnmap(scratch, kScratch, "self-test");
 	return r == 42;
-}
-
-bool armVixlSelfTest()
-{
-	static const bool ok = armVixlSelfTestOnce();
-	return ok;
 }
 
 void armEmitJmpPtr(void* code_address, const void* target, bool flush_icache)
@@ -249,8 +332,11 @@ void armEmitJmpPtr(void* code_address, const void* target, bool flush_icache)
 	// ARM64 B (unconditional branch): 0b000101 | imm26
 	u32 insn = 0x14000000u | (static_cast<u32>(displacement) & 0x03FFFFFFu);
 
+	// The displacement is from the execute address (where the branch will
+	// run); the store goes through the write alias. armJitRW is a table read,
+	// safe in the fault handler this is called from.
 	HostSys::BeginCodeWrite();
-	std::memcpy(code_address, &insn, sizeof(insn));
+	std::memcpy(armJitRW(code_address), &insn, sizeof(insn));
 	HostSys::EndCodeWrite();
 
 	if (flush_icache)
@@ -499,7 +585,7 @@ u8* ArmConstantPool::GetJumpTrampoline(const void* target)
 		return nullptr;
 	}
 
-	a64::MacroAssembler masm(static_cast<vixl::byte*>(m_base_ptr + offset), m_capacity - offset);
+	a64::MacroAssembler masm(static_cast<vixl::byte*>(armJitRW(m_base_ptr + offset)), m_capacity - offset);
 	masm.Mov(RXVIXLSCRATCH, reinterpret_cast<intptr_t>(target));
 	masm.Br(RXVIXLSCRATCH);
 	masm.FinalizeCode();
@@ -529,7 +615,7 @@ u8* ArmConstantPool::GetLiteral(const u128& value)
 		return nullptr;
 
 	const u32 offset = Common::AlignUpPow2(m_used, 16);
-	std::memcpy(&m_base_ptr[offset], &value, sizeof(value));
+	std::memcpy(armJitRW(&m_base_ptr[offset]), &value, sizeof(value));
 	m_used = offset + sizeof(value);
 	return m_base_ptr + offset;
 }

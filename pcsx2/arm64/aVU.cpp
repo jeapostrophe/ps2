@@ -521,6 +521,14 @@ __fi void mVUinitFirstPass(microVU& mVU, uptr pState, u8* thisPtr)
 // Micro VU - Main Functions
 //------------------------------------------------------------------
 
+// Each VU's code cache (mVUinit leases it, mVUclose hands it back).
+static constexpr size_t kMvuRecSize = 0x4000000;
+
+bool mVUavailable(int vuIndex)
+{
+	return (vuIndex ? microVU1 : microVU0).cache != nullptr;
+}
+
 // Only run this once per VU! ;)
 void mVUinit(microVU& mVU, uint vuIndex)
 {
@@ -537,24 +545,17 @@ void mVUinit(microVU& mVU, uint vuIndex)
 	mVU.mscalMemo    = (microMscalMemoA*)calloc(mVU.progSize / 2, sizeof(microMscalMemoA));
 	mVU.progMemMask  =  mVU.progSize-1;
 	// The libretro fork has no fixed HostMemoryMap code arena; give each VU a
-	// dedicated host code mapping (same 64 MB budget as upstream's mVU0/1recSize).
-	static u8* s_mvu_cache[2] = {nullptr, nullptr};
-	constexpr size_t kMvuRecSize = 0x4000000;
-	// Host code memory (armJitMap); the compile is already a session
-	// (armStartBlock/armEndBlock, see compareState in aVU.h). A failed mapping
-	// is fatal here as it is in upstream's x86 microVU: there is no VU program
-	// without a cache, and the MAP_FAILED this used to store unchecked became a
-	// -1 code pointer that crashed later and elsewhere.
-	if (!s_mvu_cache[vuIndex])
-		s_mvu_cache[vuIndex] = armJitMap(kMvuRecSize);
-	if (!s_mvu_cache[vuIndex])
-	{
-		Console.Error("microVU: could not map the VU%d code cache (%zu bytes) -- cannot continue", vuIndex, kMvuRecSize);
-		std::abort();
-	}
-	mVU.cache        = s_mvu_cache[vuIndex];
-	mVU.prog.codeReserveEnd = s_mvu_cache[vuIndex] + kMvuRecSize;
-	mVU.prog.codeEnd = mVU.prog.codeReserveEnd - (mVUcacheSafeZone * _1mb);
+	// dedicated host code cache (same 64 MB budget as upstream's
+	// mVU0/1recSize), leased per VM and handed back by mVUclose -- a cache
+	// kept for the process would hold 128 MB of a frontend's code memory
+	// that the next core may need. The compile is already a session
+	// (armStartBlock/armEndBlock, see compareState in aVU.h). With no code
+	// memory to be had the cache stays null and the VU runs on its
+	// interpreter (mVUavailable, VMManager::UpdateCPUImplementations).
+	if (!mVU.cache)
+		mVU.cache = armJitMap(kMvuRecSize, vuIndex ? "microVU1" : "microVU0");
+	mVU.prog.codeReserveEnd = mVU.cache ? mVU.cache + kMvuRecSize : nullptr;
+	mVU.prog.codeEnd = mVU.cache ? mVU.prog.codeReserveEnd - (mVUcacheSafeZone * _1mb) : nullptr;
 
 	mVU.regAlloc.reset(new microRegAlloc(mVU.index));
 }
@@ -625,6 +626,15 @@ void mVUclose(microVU& mVU)
 	}
 	free(mVU.mscalMemo);
 	mVU.mscalMemo = nullptr;
+
+	// The cache goes with the VM that leased it (mVUinit).
+	if (mVU.cache)
+	{
+		armJitUnmap(mVU.cache, kMvuRecSize, mVU.index ? "microVU1" : "microVU0");
+		mVU.cache = nullptr;
+		mVU.prog.codeStart = mVU.prog.codePtr = nullptr;
+		mVU.prog.codeReserveEnd = mVU.prog.codeEnd = nullptr;
+	}
 }
 
 // Clears Block Data in specified range

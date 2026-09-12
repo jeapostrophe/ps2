@@ -50,6 +50,12 @@
 
 #include "../pcsx2/SPU2/spu2.h"
 #include "../pcsx2/PAD/PAD.h"
+#ifdef ARCH_ARM64
+#include "../pcsx2/arm64/ArmJitMemory.h"
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+#endif
 
 #ifdef HAVE_PARALLEL_GS
 extern std::unique_ptr<GSRendererPGS> g_pgs_renderer;
@@ -2328,6 +2334,81 @@ bool create_device_vulkan(retro_vulkan_context *context, VkInstance instance, Vk
 const VkApplicationInfo *get_application_info_vulkan(void);
 #endif
 
+#ifdef ARCH_ARM64
+/* Where the arm64 recompilers get their code memory, asked again at every
+ * retro_init(): a frontend can have memory for this load that it had none of
+ * for the last (a debugger attached in between), and on macOS a game swap is
+ * retro_deinit -> retro_init on the same resident image, so nothing here may
+ * be settled once per process. On an iOS 26 SPTM/TXM device no page this
+ * process maps for itself will run; RETRO_ENVIRONMENT_EXEC_MEM_ALLOC is how
+ * a frontend lends memory a debugger prepared, as a read-execute and a
+ * read-write mapping of the same pages (arm64/ArmJitMemory.h). The decision
+ * is armJitChooseSource's -- flycast's, so both cores read one frontend the
+ * same way. */
+static void exec_mem_free(void* rx)
+{
+	retro_exec_mem_free req{};
+	req.rx = rx;
+	environ_cb(RETRO_ENVIRONMENT_EXEC_MEM_FREE, &req);
+}
+
+static bool exec_mem_alloc(size_t size, void** rx, void** rw)
+{
+	retro_exec_mem_alloc req{};
+	req.version = 1;
+	req.size    = size;
+	if (!environ_cb(RETRO_ENVIRONMENT_EXEC_MEM_ALLOC, &req))
+		return false;
+	if (req.mode != RETRO_EXEC_MEM_MODE_DUAL_MAP || !req.rx || !req.rw)
+	{
+		/* Only the dual mapping is implemented. The frontend allocated all
+		 * the same, so hand it back rather than leave it lent until unload. */
+		if (req.rx)
+			exec_mem_free(req.rx);
+		else if (req.rw)
+			exec_mem_free(req.rw);
+		return false;
+	}
+	*rx = req.rx;
+	*rw = req.rw;
+	return true;
+}
+
+static void configure_jit_memory(void)
+{
+	retro_exec_mem_alloc probe{};
+	probe.version = 1;
+	probe.size    = 0;
+	/* A frontend that does not know the call returns false and leaves the
+	 * struct alone: "do what you always did", not "I have none". */
+	const bool answered = environ_cb(RETRO_ENVIRONMENT_EXEC_MEM_ALLOC, &probe);
+	bool capable = false;
+	const bool capable_answered = environ_cb(RETRO_ENVIRONMENT_GET_JIT_CAPABLE, &capable);
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+	const bool may_self_map = false;
+#else
+	const bool may_self_map = true;
+#endif
+	const ArmJitSource source = armJitChooseSource(answered, probe.mode, capable_answered, capable, may_self_map);
+	armJitSetSource(source, exec_mem_alloc, exec_mem_free);
+	if (!log_cb)
+		return;
+	switch (source)
+	{
+		case ArmJitSource::Frontend:
+			log_cb(RETRO_LOG_INFO, "EXEC_MEM: the frontend lends dual-mapped JIT memory; the recompilers take their code caches from it.\n");
+			break;
+		case ArmJitSource::Self:
+			log_cb(RETRO_LOG_INFO, "EXEC_MEM: no restrictions on executable memory; the recompilers map their own code caches.\n");
+			break;
+		case ArmJitSource::None:
+			log_cb(RETRO_LOG_WARN, "EXEC_MEM: no executable memory on offer (probe %s, mode %u); every recompiler runs its interpreter this load.\n",
+				answered ? "answered" : "unanswered", answered ? probe.mode : 0u);
+			break;
+	}
+}
+#endif
+
 void retro_init(void)
 {
 	struct retro_log_callback log;
@@ -2337,6 +2418,11 @@ void retro_init(void)
 	environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &xrgb888);
 	if (environ_cb(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &log))
 		log_cb = log.log;
+
+#ifdef ARCH_ARM64
+	/* Before retro_load_game, whose CPUThreadInitialize maps the caches. */
+	configure_jit_memory();
+#endif
 
 	vu1Thread.Reset();
 

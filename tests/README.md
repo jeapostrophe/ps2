@@ -26,7 +26,11 @@ than reusing objects.
 `hostmem` links the real `common/HostSys.cpp` out of a cmake build of the
 core (`LRPS2_BUILD`, default `build/macos-arm64`) and fails without one: it
 holds that every view of `HostSys::CreateSharedMemory` -- the main mapping
-and each fastmem page -- is the same memory.
+and each fastmem page -- is the same memory. `jitmem` holds the arm64 JIT's
+code-memory decisions (`pcsx2/arm64/ArmJitMemory.h`: which source a load
+takes its code caches from, and how an execute address becomes the address
+its bytes are written at) with made-up addresses; it maps, writes and runs
+no code.
 
 ## The two kinds of harness
 

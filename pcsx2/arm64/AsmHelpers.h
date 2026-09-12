@@ -6,6 +6,7 @@
 
 #include "common/Pcsx2Defs.h"
 #include "arm64/ArmCompat.h"
+#include "arm64/ArmJitMemory.h"
 #include "common/HashCombine.h"
 
 #include "aarch64/constants-aarch64.h"
@@ -98,17 +99,30 @@ void armEmitCall(const void* ptr, bool force_inline = false);
 // within +/-128 MB (B imm26 range).
 void armEmitJmpPtr(void* code_address, const void* target, bool flush_icache = true);
 
-// Host code memory, the way this host allows it. On Apple silicon a code cache
-// must be a MAP_JIT mapping (a plain RWX mmap is refused with EACCES), and every
-// write into it must sit between pthread_jit_write_protect_np(0) and (1) on the
-// writing thread -- a MAP_JIT page is execute-only until the thread says
-// otherwise, and a write outside such a session is a SIGBUS. HostSys::Mmap adds
-// MAP_JIT there and HostSys::Begin/EndCodeWrite are the session; on every other
-// host the first is a plain mmap and the second is a no-op, so this is not an
-// Apple branch, it is the one spelling that is right everywhere. armStartBlock/
-// armEndBlock open and close the same session around the shared emitter; the
-// scope is for emitters that own their own cursor (the EE and IOP recs).
-u8* armJitMap(size_t size);
+// Host code memory, the way this host allows it (arm64/ArmJitMemory.h has the
+// two shapes). armJitMap returns a cache's EXECUTE address, from wherever
+// armJitSetSource said this load's code memory comes from: the core's own
+// mapping, a dual-mapped lease from the frontend, or nothing -- nullptr, and
+// the recompiler runs its interpreter. `what` names the cache in the log.
+//
+// Every code pointer a recompiler keeps, branches to, computes a displacement
+// from or publishes is that execute address. armJitRW gives the address its
+// bytes are written at -- the write alias of a lease, or the same address for
+// a self-mapped cache -- and is async-signal-safe (the fastmem fault handler
+// patches through it). Flushes are by execute address. armJitUnmap hands a
+// cache back the way it came: to the frontend, or munmap.
+//
+// A self-mapped cache on Apple silicon is MAP_JIT (a plain RWX mmap is refused
+// with EACCES), and every write into it must sit between
+// pthread_jit_write_protect_np(0) and (1) on the writing thread -- a write
+// outside such a session is a SIGBUS. HostSys::Mmap adds MAP_JIT and
+// HostSys::Begin/EndCodeWrite are the session (no-ops wherever there is no
+// MAP_JIT, iOS included). armStartBlock/armEndBlock open and close the session
+// around the shared emitter; the scope is for emitters that own their own
+// cursor (the EE and IOP recs).
+u8* armJitMap(size_t size, const char* what);
+void armJitUnmap(u8* exec, size_t size, const char* what);
+u8* armJitRW(const void* exec);
 struct ArmCodeWriteScope
 {
 	ArmCodeWriteScope();
@@ -117,9 +131,12 @@ struct ArmCodeWriteScope
 	ArmCodeWriteScope& operator=(const ArmCodeWriteScope&) = delete;
 };
 
-// Can vixl-emitted code run on this host? A property of the host and the vixl
-// build, answered once per process: emits `add x0, x0, 1; ret` into an
-// armJitMap'd page under a write session and calls it. The stub must run from
+// Can vixl-emitted code run from this load's code memory? Emits `add x0, x0,
+// 1; ret` into a fresh armJitMap'd page through its write address, under a
+// write session, calls it at its execute address, and hands the page back.
+// Asked again at every reserve: where code memory comes from is decided per
+// load (a frontend can lend memory now that it had none for the last game),
+// and so is whether it runs. The stub must run from
 // host code memory, never from vixl's own staging buffer -- that buffer is
 // malloc'd on Darwin (VIXL_CODE_BUFFER_MALLOC) and SetExecutable() is
 // VIXL_UNIMPLEMENTED there, so executing it is an instruction-fetch SIGBUS,
