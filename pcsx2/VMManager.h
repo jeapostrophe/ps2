@@ -130,8 +130,9 @@ namespace VMManager
 		void ClearCPUExecutionCaches();
 
 		const std::string& GetElfOverride();
-		/// Reads the boot ELF's info (ElfEntry, ElfCRC, DiscSerial, LastELF) from the
-		/// ELF override when one is set, else from the disc: the ELF this boot runs.
+		/// Re-reads the boot ELF's info, as eeloadHook does: DiscSerial always from
+		/// the disc; ElfEntry, ElfCRC and LastELF from the ELF override when one is
+		/// set, else from the disc's boot ELF.
 		void ReloadBootElfInfo();
 		bool IsExecutionInterrupted();
 		void EntryPointCompilingOnCPUThread();

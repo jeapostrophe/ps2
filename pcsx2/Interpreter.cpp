@@ -496,6 +496,11 @@ static void eeExecuteLoop(void)
 	// ran and eeGameStarting would never fire. GAME_LOADING waits for ElfEntry,
 	// which the state does not carry; RefreshRunningGameAfterStateLoad restores it.
 	ExecuteState state = g_GameStarted ? GAME_RUNNING : (g_GameLoading ? GAME_LOADING : RESET);
+	// RESET steps before it tests, so that after a hook the pc moves off the
+	// hook address. But a re-entry can already sit on one (a pause exits from
+	// the event test of the branch that got there): on the first pass after an
+	// entry, test first. volatile: an instruction-cancel longjmp must not restore it.
+	volatile bool first_pass = true;
 
 	// This will come back as zero the first time it runs, or on instruction cancel.
 	// It will come back as nonzero when we exit execution.
@@ -510,10 +515,14 @@ static void eeExecuteLoop(void)
 		switch (state) {
 		case RESET:
 			{
-				do
+				if (!first_pass || cpuRegs.pc != (g_eeloadMain ? g_eeloadMain : EELOAD_START))
 				{
-					execI();
-				} while (cpuRegs.pc != (g_eeloadMain ? g_eeloadMain : EELOAD_START));
+					do
+					{
+						execI();
+					} while (cpuRegs.pc != (g_eeloadMain ? g_eeloadMain : EELOAD_START));
+				}
+				first_pass = false;
 
 				if (cpuRegs.pc == EELOAD_START)
 				{
