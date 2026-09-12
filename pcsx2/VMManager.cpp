@@ -946,7 +946,8 @@ void VMManager::UpdateCPUImplementations()
 	// A recompiler whose reserve got no code memory (a frontend with none to
 	// lend) is not selectable; its interpreter runs instead. The EE's COP2
 	// macro emission calls into microVU0's cache (its exact-multiply stub),
-	// so the EE rec needs that cache too. The IOP rec falls back by itself
+	// so the EE rec needs that cache too -- and microVU0 reset, which
+	// ClearCPUExecutionCaches sees to. The IOP rec falls back by itself
 	// (recExecuteBlock -> psxInt).
 	const bool ee_rec = CHECK_EEREC && eeJitAvailable_arm64() && mVUavailable(0);
 	if (CHECK_EEREC && !ee_rec)
@@ -969,9 +970,9 @@ void VMManager::UpdateCPUImplementations()
 		Console.WriteLn("VU1 soft float: running on the exact interpreter.");
 
 #ifdef ARCH_ARM64
-	// C.30-1: microVU0 runs VU0 micro programs natively (macro-mode COP2
-	// stays on the C.29-1 inline interpreter calls until C.30-2). Only with
-	// a code cache (mVUavailable).
+	// C.30-1: microVU0 runs VU0 micro programs natively (macro-mode COP2 is
+	// the EE rec's, emitted through microVU0's emitters whatever runs VU0's
+	// micro programs). Only with a code cache (mVUavailable).
 	if (EmuConfig.Cpu.Recompiler.EnableVU0 && !CHECK_VU_SOFT_REC(0) && mVUavailable(0))
 		CpuVU0 = &vucpu_rec_vu0;
 #endif
@@ -1000,11 +1001,13 @@ void VMManager::Internal::ClearCPUExecutionCaches()
 	Cpu->Reset();
 	psxCpu->Reset();
 
-#ifndef ARCH_ARM64
 	// mVU's VU0 needs to be properly initialized for macro mode even if it's not used for micro mode!
-	if (CHECK_EEREC && !EmuConfig.Cpu.Recompiler.EnableVU0)
+	// The EE rec emits COP2 macro ops through microVU0, which calls code
+	// mVUreset emits (the exact-multiply stub), so microVU0 is reset whenever
+	// the EE rec runs and VU0's micro programs do not: VU0's recompiler
+	// disabled, or VU0 on soft float (upstream tested only the first).
+	if (Cpu == &recCpu && CpuVU0 != &vucpu_rec_vu0)
 		vucpu_rec_vu0.Reset();
-#endif
 
 	CpuVU0->Reset();
 	CpuVU1->Reset();

@@ -634,6 +634,13 @@ void mVUclose(microVU& mVU)
 		mVU.cache = nullptr;
 		mVU.prog.codeStart = mVU.prog.codePtr = nullptr;
 		mVU.prog.codeReserveEnd = mVU.prog.codeEnd = nullptr;
+		// And every pointer mVUreset emitted into it: kept, each would point
+		// into memory the frontend may already have lent to something else.
+		mVU.startFunct = mVU.exitFunct = nullptr;
+		mVU.startFunctXG = mVU.exitFunctXG = nullptr;
+		mVU.compareStateF = mVU.waitMTVU = mVU.copyPLState = nullptr;
+		mVU.resumePtrXG = nullptr;
+		mVU.exactMulStub = nullptr;
 	}
 }
 

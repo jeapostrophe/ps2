@@ -606,6 +606,17 @@ static void mVUexactMulPS(mV, const a64::VRegister& dst, const a64::VRegister& t
 	armAsm->Str(from, armAbsMemOperand(RSCRATCHADDR, &buf[4], 128));
 	armAsm->Str(vC, armAbsMemOperand(RSCRATCHADDR, &buf[8], 128));
 	armAsm->Str(vA, armAbsMemOperand(RSCRATCHADDR, &buf[12], 128));
+	// mVUreset emits the stub. The EE's COP2 hand-off gets here through
+	// microVU0 even when VU0's micro programs run on the interpreter
+	// (VMManager::Internal::ClearCPUExecutionCaches resets it for that), so a
+	// missing stub is a missing reset: stop and say so rather than emit a call
+	// to nowhere.
+	if (!mVU.exactMulStub)
+	{
+		Console.Error("microVU%u: exact multiply emitted with no stub -- microVU%u was not reset this load; cannot continue.",
+			mVU.index, mVU.index);
+		std::abort();
+	}
 	armEmitCall(reinterpret_cast<const void*>(mVU.exactMulStub));
 	armAsm->Ldr(vC, armAbsMemOperand(RSCRATCHADDR, &buf[8], 128));
 	armAsm->Ldr(vA, armAbsMemOperand(RSCRATCHADDR, &buf[12], 128));
