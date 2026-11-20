@@ -29,6 +29,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <unordered_map>
+#include <string>
 #include <deque>
 #include <vector>
 #include <algorithm>
@@ -4217,6 +4218,863 @@ namespace {
 	}
 
 
+	// ---- HH-37: the C twin of CompileBlock (Interp's miss path) ----
+	// A block the image lacks runs here instead of as code. TwinDecode reads live memory exactly
+	// as CompileBlock reads it and ends the block where CompileBlock would; TwinRun then does what
+	// the code CompileBlock would have emitted does: each op as its emitter computes it (the
+	// Twin* functions below are transcriptions of the Emit* ones, helper for helper), pc held at
+	// the block's start until the exit stores it, the op cycles summed once and accounted where
+	// the emitted tails account them, and the event tests where those emit them, gated as they
+	// are. TwinSelfTest (LRPS2_TWIN_SELFTEST) holds each to the JIT's code, block by block.
+	inline u64 TwR64(u32 i) { return i ? cpuRegs.GPR.r[i].UD[0] : 0; } // SrcGpr/LoadGpr: r0 is 0
+	inline u32 TwR32(u32 i) { return (u32)TwR64(i); }
+	inline GPR_reg& TwG(u32 i) { return cpuRegs.GPR.r[i]; }
+
+	// The host FP ops the emitters use, as those instructions (no compiler contraction or
+	// reassociation can reach them).
+	inline float TwF(u32 w) { float f; memcpy(&f, &w, 4); return f; }
+	inline u32 TwW(float f) { u32 w; memcpy(&w, &f, 4); return w; }
+	inline u32 TwFadd(u32 a, u32 b) { float r; const float x = TwF(a), y = TwF(b); __asm__ volatile("fadd %s0, %s1, %s2" : "=w"(r) : "w"(x), "w"(y)); return TwW(r); }
+	inline u32 TwFmul(u32 a, u32 b) { float r; const float x = TwF(a), y = TwF(b); __asm__ volatile("fmul %s0, %s1, %s2" : "=w"(r) : "w"(x), "w"(y)); return TwW(r); }
+	inline u32 TwFdiv(u32 a, u32 b) { float r; const float x = TwF(a), y = TwF(b); __asm__ volatile("fdiv %s0, %s1, %s2" : "=w"(r) : "w"(x), "w"(y)); return TwW(r); }
+	inline u32 TwFsqrt(u32 a) { float r; const float x = TwF(a); __asm__ volatile("fsqrt %s0, %s1" : "=w"(r) : "w"(x)); return TwW(r); }
+	inline u64 TwDaddsub(u64 a, u64 b, bool sub)
+	{
+		double r, x, y;
+		memcpy(&x, &a, 8); memcpy(&y, &b, 8);
+		if (sub) __asm__ volatile("fsub %d0, %d1, %d2" : "=w"(r) : "w"(x), "w"(y));
+		else     __asm__ volatile("fadd %d0, %d1, %d2" : "=w"(r) : "w"(x), "w"(y));
+		u64 w; memcpy(&w, &r, 8); return w;
+	}
+	inline u32 TwScvtf(u32 a) { float r; const s32 x = (s32)a; __asm__ volatile("scvtf %s0, %w1" : "=w"(r) : "r"(x)); return TwW(r); }
+	inline u32 TwFcvtzs(u32 a) { s32 r; const float x = TwF(a); __asm__ volatile("fcvtzs %w0, %s1" : "=r"(r) : "w"(x)); return (u32)r; }
+
+	inline u32& TwFcr31() { return fpuRegs.fprc[31]; }
+	inline u32& TwFpr(u32 i) { return fpuRegs.fpr[i].UL; }
+	// EmitFpuClampBits
+	inline u32 TwClamp(u32 w)
+	{
+		const u32 e = w & 0x7f800000;
+		if (!e) return w & 0x80000000;
+		if (e != 0x7f800000) return w;
+		return (w & 0x80000000) | 0x7f7fffff;
+	}
+	// EmitFpuOverflowUnderflow
+	inline u32 TwOvUn(u32 wd)
+	{
+		if ((wd & 0x7fffffff) == 0x7f800000)
+		{
+			TwFcr31() |= 0x8000 | 0x10;
+			return (wd & 0x80000000) | 0x7f7fffff;
+		}
+		TwFcr31() &= ~0x8000u;
+		if (!(wd & 0x7f800000) && (wd & 0x7fffff))
+		{
+			TwFcr31() |= 0x4000 | 0x8;
+			return wd & 0x80000000;
+		}
+		TwFcr31() &= ~0x4000u;
+		return wd;
+	}
+	// EmitFpuClampOutValueOnly
+	inline u32 TwClampOut(u32 wd)
+	{
+		if ((wd & 0x7fffffff) == 0x7f800000) return (wd & 0x80000000) | 0x7f7fffff;
+		if (!(wd & 0x7f800000) && (wd & 0x7fffff)) return wd & 0x80000000;
+		return wd;
+	}
+	// EmitFpuAddSubExactCore: a, b raw; returns what it stores
+	u32 TwAddSubExact(u32 a, u32 b, bool sub)
+	{
+		const s32 d = (s32)((a >> 23) & 0xff) - (s32)((b >> 23) & 0xff);
+		if (d >= 25) b &= 0x80000000;
+		else if (d >= 1) b &= 0xffffffffu << (d - 1);
+		else if (d == 0) {}
+		else if (d < -24) a &= 0x80000000;
+		else a &= 0xffffffffu << (-d - 1);
+		const auto toD = [](u32 v) -> u64 {
+			const u32 e = (v >> 23) & 0xff;
+			if (!e) return (u64)(v >> 31) << 63;
+			return ((u64)(e + 896) << 52) | ((u64)(v & 0x7fffff) << 29) | ((u64)(v >> 31) << 63);
+		};
+		const u64 r = TwDaddsub(toD(a), toD(b), sub);
+		const u32 sign = (u32)(r >> 63) << 31;
+		if (!(r & 0x7fffffffffffffffull))
+		{
+			TwFcr31() &= ~0xC000u;
+			return sign;
+		}
+		const s32 e = (s32)((u32)(r >> 52) & 0x7ff) - 896;
+		if (e > 255) { TwFcr31() |= 0x8000 | 0x10; return sign | 0x7fffffff; }
+		if (e < 1)   { TwFcr31() |= 0x4000 | 0x8; return sign; }
+		TwFcr31() &= ~0xC000u;
+		return sign | ((u32)(r >> 29) & 0x7fffff) | ((u32)e << 23);
+	}
+
+	// EmitCop1Reg
+	void TwinCop1(u32 insn)
+	{
+		const u32 rs = (insn >> 21) & 31, rt = (insn >> 16) & 31, fs = (insn >> 11) & 31, fd = (insn >> 6) & 31;
+		const u32 funct = insn & 0x3f;
+		if (rs == 0x00) { if (rt) TwG(rt).SD[0] = (s32)TwFpr(fs); return; }                  // MFC1
+		if (rs == 0x04) { TwFpr(fs) = TwR32(rt); return; }                                    // MTC1
+		if (rs == 0x02)                                                                       // CFC1
+		{
+			if (rt)
+				TwG(rt).SD[0] = (fs & 0x10) ? (s32)((TwFcr31() & 0x0083c078) | 0x01000001) : (s32)fpuRegs.fprc[0];
+			return;
+		}
+		if (rs == 0x06) { if (fs == 31) TwFcr31() = TwR32(rt); return; }                      // CTC1
+		if (rs == 0x14) { TwFpr(fd) = TwScvtf(TwFpr(fs)); return; }                           // CVT.S.W
+		const u32 ft = rt;
+		u32& acc = fpuRegs.ACC.UL;
+		switch (funct)
+		{
+			case 0x00: case 0x01: TwFpr(fd) = TwAddSubExact(TwFpr(fs), TwFpr(ft), funct == 1); return; // ADD.S/SUB.S
+			case 0x18: case 0x19: acc = TwAddSubExact(TwFpr(fs), TwFpr(ft), funct == 0x19); return;     // ADDA.S/SUBA.S
+			case 0x02: case 0x1a:                                                                        // MUL.S/MULA.S
+			{
+				const u32 r = TwOvUn(TwFmul(TwClamp(TwFpr(fs)), TwClamp(TwFpr(ft))));
+				if (funct == 0x02) TwFpr(fd) = r; else acc = r;
+				return;
+			}
+			case 0x03: // DIV.S
+			{
+				const u32 w5 = TwFpr(ft);
+				if (!(w5 & 0x7f800000))
+				{
+					const u32 w6 = TwFpr(fs);
+					TwFcr31() |= (w6 & 0x7f800000) ? (0x10000u | 0x20) : (0x20000u | 0x40);
+					TwFpr(fd) = ((w5 ^ w6) & 0x80000000) | 0x7f7fffff;
+					return;
+				}
+				TwFpr(fd) = TwClampOut(TwFdiv(TwClamp(TwFpr(fs)), TwClamp(w5)));
+				return;
+			}
+			case 0x04: // SQRT.S (source Ft)
+			{
+				TwFcr31() &= ~0x30000u;
+				const u32 w0 = TwFpr(ft);
+				if (!(w0 & 0x7f800000)) { TwFpr(fd) = w0 & 0x80000000; return; }
+				if (w0 & 0x80000000)
+				{
+					TwFcr31() |= 0x20000 | 0x40;
+					TwFpr(fd) = TwFsqrt(TwClamp(w0) & 0x7fffffff);
+					return;
+				}
+				TwFpr(fd) = TwFsqrt(TwClamp(w0));
+				return;
+			}
+			case 0x16: // RSQRT.S
+			{
+				TwFcr31() &= ~0x30000u;
+				const u32 w5 = TwFpr(ft);
+				if (!(w5 & 0x7f800000))
+				{
+					TwFcr31() |= 0x10000 | 0x20;
+					TwFpr(fd) = (w5 & 0x80000000) | 0x7f7fffff;
+					return;
+				}
+				u32 s1;
+				if (w5 & 0x80000000)
+				{
+					TwFcr31() |= 0x20000 | 0x40;
+					s1 = TwClamp(TwFsqrt(TwClamp(w5) & 0x7fffffff));
+				}
+				else
+					s1 = TwFsqrt(TwClamp(w5));
+				TwFpr(fd) = TwClampOut(TwFdiv(TwClamp(TwFpr(fs)), s1));
+				return;
+			}
+			case 0x1c: case 0x1d: case 0x1e: case 0x1f: // MADD.S/MSUB.S/MADDA.S/MSUBA.S
+			{
+				const u32 prod = TwClamp(TwFmul(TwClamp(TwFpr(fs)), TwClamp(TwFpr(ft))));
+				const u32 r = TwAddSubExact(acc, prod, funct == 0x1d || funct == 0x1f);
+				if (funct <= 0x1d) TwFpr(fd) = r; else acc = r;
+				return;
+			}
+			case 0x24: // CVT.W.S
+			{
+				const u32 w0 = TwFpr(fs);
+				if ((w0 & 0x7f800000) > 0x4E800000u)
+					TwFpr(fd) = (w0 & 0x80000000) ? 0x80000000u : 0x7fffffffu;
+				else
+					TwFpr(fd) = TwFcvtzs(w0);
+				return;
+			}
+			case 0x28: case 0x29: // MAX.S/MIN.S
+			{
+				const u32 a = TwFpr(fs), b = TwFpr(ft);
+				const u32 mx = (s32)a > (s32)b ? a : b, mn = (s32)a < (s32)b ? a : b;
+				const bool both_neg = (a & b) & 0x80000000;
+				TwFpr(fd) = (funct == 0x28) ? (both_neg ? mn : mx) : (both_neg ? mx : mn);
+				TwFcr31() &= ~0xC000u;
+				return;
+			}
+			case 0x30: TwFcr31() &= ~0x00800000u; return; // C.F
+			case 0x32: case 0x34: case 0x36: // C.EQ/C.LT/C.LE
+			{
+				u32 a = TwFpr(fs), b = TwFpr(ft);
+				if (!(a & 0x7f800000)) a = 0;
+				if (!(b & 0x7f800000)) b = 0;
+				a ^= (u32)((s32)a >> 31) >> 1;
+				b ^= (u32)((s32)b >> 31) >> 1;
+				const bool c = funct == 0x32 ? (s32)a == (s32)b : funct == 0x34 ? (s32)a < (s32)b : (s32)a <= (s32)b;
+				TwFcr31() = (TwFcr31() & ~0x00800000u) | ((u32)c << 23);
+				return;
+			}
+		}
+		const u32 w0 = TwFpr(fs);
+		if (funct == 0x06) { TwFpr(fd) = w0; return; }      // MOV.S
+		TwFpr(fd) = (funct == 0x05) ? (w0 & 0x7fffffff) : (w0 ^ 0x80000000); // ABS.S / NEG.S
+		TwFcr31() &= ~0xC000u;
+	}
+
+	// EmitMulDiv; off: 0 (pipeline 0) or 1 (the MMI pipeline-1 forms, HI1/LO1)
+	void TwinMulDiv(u32 funct, u32 rs, u32 rt, u32 rd, u32 k)
+	{
+		switch (funct)
+		{
+			case 0x10: if (rd) TwG(rd).UD[0] = cpuRegs.HI.UD[k]; return; // MFHI
+			case 0x12: if (rd) TwG(rd).UD[0] = cpuRegs.LO.UD[k]; return; // MFLO
+			case 0x11: cpuRegs.HI.UD[k] = TwR64(rs); return;              // MTHI
+			case 0x13: cpuRegs.LO.UD[k] = TwR64(rs); return;              // MTLO
+			case 0x18: case 0x19: // MULT/MULTU
+			{
+				const u32 a = TwR32(rs), b = TwR32(rt);
+				const u64 res = funct == 0x18 ? (u64)((s64)(s32)a * (s64)(s32)b) : (u64)a * (u64)b;
+				const s64 lo = (s32)(u32)res, hi = (s32)(u32)(res >> 32);
+				cpuRegs.LO.SD[k] = lo;
+				cpuRegs.HI.SD[k] = hi;
+				if (rd) TwG(rd).SD[0] = lo;
+				return;
+			}
+			case 0x1a: // DIV
+			{
+				const s32 a = (s32)TwR32(rs), b = (s32)TwR32(rt);
+				s64 lo, hi;
+				if (!b) { lo = a < 0 ? 1 : -1; hi = a; }
+				else if (a == (s32)0x80000000 && b == -1) { lo = (s32)0x80000000; hi = 0; }
+				else { lo = a / b; hi = a % b; }
+				cpuRegs.LO.SD[k] = lo;
+				cpuRegs.HI.SD[k] = hi;
+				return;
+			}
+			case 0x1b: // DIVU
+			{
+				const u32 a = TwR32(rs), b = TwR32(rt);
+				s64 lo, hi;
+				if (!b) { lo = -1; hi = (s32)a; }
+				else { lo = (s32)(a / b); hi = (s32)(a % b); }
+				cpuRegs.LO.SD[k] = lo;
+				cpuRegs.HI.SD[k] = hi;
+				return;
+			}
+		}
+	}
+	// EmitMadd
+	void TwinMadd(bool is_unsigned, u32 rs, u32 rt, u32 rd, u32 k)
+	{
+		const u64 acc = (u64)cpuRegs.LO.UL[2 * k] | ((u64)cpuRegs.HI.UL[2 * k] << 32);
+		const u32 a = TwR32(rs), b = TwR32(rt);
+		const u64 p = is_unsigned ? (u64)a * (u64)b : (u64)((s64)(s32)a * (s64)(s32)b);
+		const u64 t = acc + p;
+		const s64 lo = (s32)(u32)t, hi = (s32)(u32)(t >> 32);
+		cpuRegs.LO.SD[k] = lo;
+		cpuRegs.HI.SD[k] = hi;
+		if (rd) TwG(rd).SD[0] = lo;
+	}
+
+	// An op the emitter hands to its interpreter implementation (EmitInterpOpCall): cpuRegs.code
+	// is staged and left so.
+	inline void TwinInterpCall(u32 insn, void (*fn)()) { cpuRegs.code = insn; fn(); }
+	// An op whose emitter is the interpreter's arithmetic, run by that implementation; the
+	// emitted code leaves cpuRegs.code alone, so this does too. TwinSelfTest holds each such op
+	// to its emitter.
+	inline void TwinAsInterp(u32 insn)
+	{
+		const u32 code = cpuRegs.code;
+		cpuRegs.code = insn;
+		R5900::GetInstruction(insn).interpret();
+		cpuRegs.code = code;
+	}
+
+	// EmitCop2Transfer (the caller has checked Cop2XferSupported)
+	void TwinCop2Transfer(u32 insn)
+	{
+		const u32 rs = (insn >> 21) & 31, rt = (insn >> 16) & 31, fs = (insn >> 11) & 31;
+		const bool is_read = (rs == 0x01 || rs == 0x02);
+		vu0Sync();
+		if (insn & 1)
+		{
+			if (is_read) _vu0FinishMicro(); else _vu0WaitMicro();
+		}
+		switch (rs)
+		{
+			case 0x01: if (rt) TwG(rt).UQ = vuRegs[0].VF[fs].UQ; return;    // QMFC2
+			case 0x05: if (fs) vuRegs[0].VF[fs].UQ = TwG(rt).UQ; return;    // QMTC2 (memory, r0 included)
+			case 0x02: // CFC2
+			{
+				if (!rt) return;
+				const u32 v = vuRegs[0].VI[fs].UL;
+				if (fs == REG_R) TwG(rt).UL[0] = v & 0x7fffff;
+				else TwG(rt).SD[0] = (s32)v;
+				return;
+			}
+			case 0x06: // CTC2
+			{
+				if (!fs || fs == REG_MAC_FLAG || fs == REG_TPC || fs == REG_VPU_STAT) return;
+				const u32 v = TwR32(rt);
+				vuRegs[0].VI[fs].UL = (fs == REG_R) ? ((v & 0x7fffff) | 0x3f800000) : v;
+				return;
+			}
+		}
+	}
+
+	// EmitSimple's verdict: whether it emits insn (it emits nothing otherwise)
+	bool TwinSimpleOk(u32 insn)
+	{
+		const u32 op = insn >> 26, rs = (insn >> 21) & 31, rt = (insn >> 16) & 31, funct = insn & 0x3f;
+		switch (op)
+		{
+			case 0x00:
+				switch (funct)
+				{
+					case 0x00: case 0x02: case 0x03: case 0x04: case 0x06: case 0x07:
+					case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27:
+					case 0x2a: case 0x2b: case 0x2c: case 0x2d: case 0x2e: case 0x2f:
+					case 0x14: case 0x16: case 0x17: case 0x38: case 0x3a: case 0x3b: case 0x3c: case 0x3e: case 0x3f:
+					case 0x10: case 0x11: case 0x12: case 0x13: case 0x18: case 0x19: case 0x1a: case 0x1b:
+					case 0x0f: case 0x28: case 0x29: case 0x0a: case 0x0b:
+						return true;
+				}
+				return false;
+			case 0x08: case 0x09: case 0x18: case 0x19: case 0x0a: case 0x0b: case 0x0c: case 0x0d: case 0x0e: case 0x0f:
+				return true;
+			case 0x01: return rt == 0x18 || rt == 0x19;
+			case 0x20: case 0x24: case 0x21: case 0x25: case 0x23: case 0x27: case 0x37:
+			case 0x22: case 0x26: case 0x1a: case 0x1b: case 0x2a: case 0x2e: case 0x2c: case 0x2d:
+			case 0x28: case 0x29: case 0x2b: case 0x3f: case 0x33: case 0x1f:
+				return true;
+			case 0x1e: return rt != 0;
+			case 0x11: return Cop1RegSupported(insn);
+			case 0x1c:
+				switch (funct)
+				{
+					case 0x10: case 0x11: case 0x12: case 0x13: case 0x18: case 0x19: case 0x1a: case 0x1b:
+					case 0x00: case 0x01: case 0x20: case 0x21: case 0x04:
+						return true;
+				}
+				return MmiSupported(insn) || MmiHiLoAction(insn) || MmiDivAction(insn) || MmiPermAction(insn) ||
+				       MmiMulAction(insn) || MmiMaccAction(insn) || MmiHmaccAction(insn) || IsPcpyh(insn) || IsQfsrv(insn);
+			case 0x12: return rs != 0x08;
+			case 0x2f: return true;
+			case 0x10: return rs == 0x00 || rs == 0x04 || (rs == 0x10 && (funct == 0x38 || funct == 0x39));
+			case 0x31: case 0x39: case 0x36: case 0x3e: return true;
+		}
+		return false;
+	}
+
+	// The misalign cancel (EmitMisalignGuard's stub): pc still the block's, its cycles not yet
+	// accounted, every GPR write so far in memory -- as the stub leaves them.
+	inline void TwMisalign(u32 addr, u32 amask)
+	{
+		if (addr & amask)
+			eeCancelInstruction_arm64(); // never returns
+	}
+
+	// EmitSimple (TwinSimpleOk(insn))
+	void TwinSimple(u32 insn)
+	{
+		const u32 op = insn >> 26;
+		const u32 rs = (insn >> 21) & 31, rt = (insn >> 16) & 31, rd = (insn >> 11) & 31, sa = (insn >> 6) & 31;
+		const u32 funct = insn & 0x3f;
+		const s32 simm = (int16_t)(insn & 0xffff);
+		const u32 zimm = insn & 0xffff;
+		switch (op)
+		{
+			case 0x00:
+			{
+				const u64 a = TwR64(rs), b = TwR64(rt);
+				u64 d;
+				switch (funct)
+				{
+					case 0x00: d = (u64)(s64)(s32)((u32)b << sa); break;                 // SLL
+					case 0x02: d = (u64)(s64)(s32)((u32)b >> sa); break;                 // SRL
+					case 0x03: d = (u64)(s64)((s32)(u32)b >> sa); break;                 // SRA
+					case 0x04: d = (u64)(s64)(s32)((u32)b << (a & 31)); break;           // SLLV
+					case 0x06: d = (u64)(s64)(s32)((u32)b >> (a & 31)); break;           // SRLV
+					case 0x07: d = (u64)(s64)((s32)(u32)b >> (a & 31)); break;           // SRAV
+					case 0x20: case 0x21: d = (u64)(s64)(s32)((u32)a + (u32)b); break;   // ADD/ADDU
+					case 0x22: case 0x23: d = (u64)(s64)(s32)((u32)a - (u32)b); break;   // SUB/SUBU
+					case 0x24: d = a & b; break;
+					case 0x25: d = a | b; break;
+					case 0x26: d = a ^ b; break;
+					case 0x27: d = ~(a | b); break;
+					case 0x2a: d = (s64)a < (s64)b; break;                               // SLT
+					case 0x2b: d = a < b; break;                                         // SLTU
+					case 0x2c: case 0x2d: d = a + b; break;                              // DADD/DADDU
+					case 0x2e: case 0x2f: d = a - b; break;                              // DSUB/DSUBU
+					case 0x14: d = b << (a & 63); break;                                 // DSLLV
+					case 0x16: d = b >> (a & 63); break;                                 // DSRLV
+					case 0x17: d = (u64)((s64)b >> (a & 63)); break;                     // DSRAV
+					case 0x38: d = b << sa; break;
+					case 0x3a: d = b >> sa; break;
+					case 0x3b: d = (u64)((s64)b >> sa); break;
+					case 0x3c: d = b << (sa + 32); break;
+					case 0x3e: d = b >> (sa + 32); break;
+					case 0x3f: d = (u64)((s64)b >> (sa + 32)); break;
+					case 0x10: case 0x11: case 0x12: case 0x13: case 0x18: case 0x19: case 0x1a: case 0x1b:
+						TwinMulDiv(funct, rs, rt, rd, 0);
+						return;
+					case 0x0f: return; // SYNC
+					case 0x28: if (rd) TwG(rd).UD[0] = cpuRegs.sa; return;              // MFSA
+					case 0x29: cpuRegs.sa = (u32)a & 0xf; return;                       // MTSA
+					case 0x0a: case 0x0b:                                                // MOVZ/MOVN
+						if (rd && ((b == 0) == (funct == 0x0a)))
+							TwG(rd).UD[0] = a;
+						return;
+					default: return;
+				}
+				if (rd)
+					TwG(rd).UD[0] = d;
+				return;
+			}
+			case 0x08: case 0x09: if (rt) TwG(rt).SD[0] = (s32)(TwR32(rs) + (u32)simm); return; // ADDI/ADDIU
+			case 0x18: case 0x19: if (rt) TwG(rt).UD[0] = TwR64(rs) + (u64)(s64)simm; return;   // DADDI/DADDIU
+			case 0x0a: if (rt) TwG(rt).UD[0] = (s64)TwR64(rs) < (s64)simm; return;               // SLTI
+			case 0x0b: if (rt) TwG(rt).UD[0] = TwR64(rs) < (u64)(s64)simm; return;               // SLTIU
+			case 0x0c: if (rt) TwG(rt).UD[0] = TwR64(rs) & zimm; return;                         // ANDI
+			case 0x0d: if (rt) TwG(rt).UD[0] = TwR64(rs) | zimm; return;                         // ORI
+			case 0x0e: if (rt) TwG(rt).UD[0] = TwR64(rs) ^ zimm; return;                         // XORI
+			case 0x0f: if (rt) TwG(rt).SD[0] = (s32)(zimm << 16); return;                        // LUI
+			case 0x01:
+				if (rt == 0x18) cpuRegs.sa = (TwR32(rs) & 0xF) ^ (zimm & 0xF);                    // MTSAB
+				else cpuRegs.sa = ((TwR32(rs) & 0x7) ^ (zimm & 0x7)) << 1;                         // MTSAH
+				return;
+			case 0x20: case 0x24: case 0x21: case 0x25: case 0x23: case 0x27: case 0x37:
+			{
+				const u32 addr = TwR32(rs) + (u32)simm;
+				TwMisalign(addr, op == 0x37 ? 7 : (op == 0x23 || op == 0x27) ? 3 : (op == 0x21 || op == 0x25) ? 1 : 0);
+				u64 v;
+				switch (op)
+				{
+					case 0x20: v = (u64)(s64)(int8_t)eeRead8_arm64(addr); break;
+					case 0x24: v = eeRead8_arm64(addr); break;
+					case 0x21: v = (u64)(s64)(int16_t)eeRead16_arm64(addr); break;
+					case 0x25: v = eeRead16_arm64(addr); break;
+					case 0x23: v = (u64)(s64)(s32)eeRead32_arm64(addr); break;
+					case 0x27: v = eeRead32_arm64(addr); break;
+					default:   v = eeRead64_arm64(addr); break;
+				}
+				if (rt)
+					TwG(rt).UD[0] = v;
+				return;
+			}
+			case 0x22: eeLWL_arm64(TwR32(rs) + (u32)simm, rt); return;
+			case 0x26: eeLWR_arm64(TwR32(rs) + (u32)simm, rt); return;
+			case 0x1a: eeLDL_arm64(TwR32(rs) + (u32)simm, rt); return;
+			case 0x1b: eeLDR_arm64(TwR32(rs) + (u32)simm, rt); return;
+			case 0x2a: eeSWL_arm64(TwR32(rs) + (u32)simm, rt); return;
+			case 0x2e: eeSWR_arm64(TwR32(rs) + (u32)simm, rt); return;
+			case 0x2c: eeSDL_arm64(TwR32(rs) + (u32)simm, rt); return;
+			case 0x2d: eeSDR_arm64(TwR32(rs) + (u32)simm, rt); return;
+			case 0x28: case 0x29: case 0x2b: case 0x3f:
+			{
+				const u32 addr = TwR32(rs) + (u32)simm;
+				TwMisalign(addr, op == 0x3f ? 7 : op == 0x2b ? 3 : op == 0x29 ? 1 : 0);
+				const u64 v = TwR64(rt);
+				switch (op)
+				{
+					case 0x28: eeWrite8_arm64(addr, (u32)v); break;
+					case 0x29: eeWrite16_arm64(addr, (u32)v); break;
+					case 0x2b: eeWrite32_arm64(addr, (u32)v); break;
+					default:   eeWrite64_arm64(addr, v); break;
+				}
+				return;
+			}
+			case 0x33: return; // PREF
+			case 0x1e: eeRead128_arm64((TwR32(rs) + (u32)simm) & 0xfffffff0, &TwG(rt).UQ); return;  // LQ (rt != 0)
+			case 0x1f: eeWrite128_arm64((TwR32(rs) + (u32)simm) & 0xfffffff0, &TwG(rt).UQ); return; // SQ
+			case 0x11: TwinCop1(insn); return;
+			case 0x1c:
+				switch (funct)
+				{
+					case 0x10: case 0x11: case 0x12: case 0x13: case 0x18: case 0x19: case 0x1a: case 0x1b:
+						TwinMulDiv(funct, rs, rt, rd, 1);
+						return;
+					case 0x00: case 0x01: TwinMadd(funct == 0x01, rs, rt, rd, 0); return;
+					case 0x20: case 0x21: TwinMadd(funct == 0x21, rs, rt, rd, 1); return;
+					case 0x04: // PLZCW
+						if (rd)
+						{
+							const u64 a = TwR64(rs);
+							TwG(rd).UD[0] = (u64)(u32)__builtin_clrsb((int)(u32)a) | ((u64)(u32)__builtin_clrsb((int)(u32)(a >> 32)) << 32);
+						}
+						return;
+				}
+				if (IsPcpyh(insn))
+				{
+					if (rd)
+					{
+						const u64 lo = TwG(rt).US[0], hi = TwG(rt).US[4];
+						TwG(rd).UD[0] = lo * 0x0001000100010001ull;
+						TwG(rd).UD[1] = hi * 0x0001000100010001ull;
+					}
+					return;
+				}
+				if (IsQfsrv(insn))
+				{
+					TwinInterpCall(insn, &R5900::Interpreter::OpcodeImpl::MMI::QFSRV);
+					return;
+				}
+				TwinAsInterp(insn); // EmitMmi/HiLo/Div/Perm/Mul/Macc/Hmacc: the interpreter's arithmetic
+				return;
+			case 0x12: // COP2, rs != BC2. AOT: the macro ops are interpreted.
+				if (Cop2XferSupported(insn)) { TwinCop2Transfer(insn); return; }
+				TwinInterpCall(insn, &R5900::Interpreter::OpcodeImpl::COP2);
+				return;
+			case 0x2f: TwinInterpCall(insn, &R5900::Interpreter::OpcodeImpl::CACHE); return;
+			case 0x10:
+				if (rs == 0x00)
+				{
+					if (!rt && rd != 9) return;
+					if (rd == 9 || rd == 25) { TwinInterpCall(insn, &R5900::Interpreter::OpcodeImpl::COP0::MFC0); return; }
+					if (rd == 24) return;
+					TwG(rt).SD[0] = (s32)(cpuRegs.CP0.r[rd] & (rd == 12 ? 0xf0c79c1fu : 0xffffffffu));
+					return;
+				}
+				if (rs == 0x04) { TwinInterpCall(insn, &R5900::Interpreter::OpcodeImpl::COP0::MTC0); return; }
+				TwinInterpCall(insn, funct == 0x38 ? &R5900::Interpreter::OpcodeImpl::COP0::EI : &R5900::Interpreter::OpcodeImpl::COP0::DI);
+				return;
+			case 0x31: // LWC1: a misaligned address is skipped
+			{
+				const u32 addr = TwR32(rs) + (u32)simm;
+				if (!(addr & 3)) TwFpr(rt) = eeRead32_arm64(addr);
+				return;
+			}
+			case 0x39: // SWC1
+			{
+				const u32 addr = TwR32(rs) + (u32)simm;
+				if (!(addr & 3)) eeWrite32_arm64(addr, TwFpr(rt));
+				return;
+			}
+			case 0x36: vu0Sync(); eeRead128_arm64(TwR32(rs) + (u32)simm, rt ? &vuRegs[0].VF[rt].UQ : &s_lqc2_sink); return; // LQC2
+			case 0x3e: vu0Sync(); eeWrite128_arm64(TwR32(rs) + (u32)simm, &vuRegs[0].VF[rt].UQ); return;            // SQC2
+		}
+	}
+
+	// EmitUnalignedPair
+	void TwinPair(u32 a, u32 b)
+	{
+		UPair u;
+		UnalignedPair(a, b, &u);
+		const u32 addr = TwR32(u.rs) + (u32)u.off;
+		if (u.load)
+			TwG(u.rt).UD[0] = u.is64 ? eeReadU64_arm64(addr) : (u64)(s64)(s32)eeReadU32_arm64(addr);
+		else if (u.is64)
+			eeWriteU64_arm64(addr, TwR64(u.rt));
+		else
+			eeWriteU32_arm64(addr, TwR32(u.rt));
+	}
+
+	// EmitBranch's decisions for one branch
+	enum : u8 { TC_EQ, TC_NE, TC_LE, TC_GT, TC_LT, TC_GE };
+	struct TwinBranch
+	{
+		u32 bpc = 0, insn = 0, ds = 0, tconst = 0, rs = 0, rt = 0;
+		int link = -1, cyc_leading = 0, cyc_taken = 0, cyc_nt = 0;
+		u8 cond = TC_EQ;
+		bool uncond = false, is_jr = false, two = false, one = false, likely = false;
+		bool bc0 = false, bc1 = false, bc2 = false, ds_interp = false, idle_skip = false, nt_evt = false;
+	};
+	bool TwinBranchDecode(u32 bpc, u32 insn, int cyc_leading, TwinBranch& b)
+	{
+		b = TwinBranch{};
+		const u32 op = insn >> 26, rs = (insn >> 21) & 31, rt = (insn >> 16) & 31, funct = insn & 0x3f;
+		const s32 simm = (int16_t)(insn & 0xffff);
+		const u32 jtarget = ((bpc + 4) & 0xf0000000) | ((insn & 0x3ffffff) << 2);
+		const u32 t = bpc + 4 + simm * 4;
+		b.bpc = bpc; b.insn = insn; b.rs = rs; b.rt = rt; b.cyc_leading = cyc_leading;
+		if      (op == 0x00 && funct == 0x08) { b.uncond = true; b.is_jr = true; }
+		else if (op == 0x00 && funct == 0x09) { b.uncond = true; b.is_jr = true; b.link = (int)((insn >> 11) & 31); }
+		else if (op == 0x02) { b.uncond = true; b.tconst = jtarget; }
+		else if (op == 0x03) { b.uncond = true; b.link = 31; b.tconst = jtarget;
+			if (jtarget == 0x3563b8 || jtarget == 0x35d628 || jtarget == 0x35c118) return false; }
+		else if (op == 0x04) { b.two = true; b.cond = TC_EQ; b.tconst = t; }
+		else if (op == 0x05) { b.two = true; b.cond = TC_NE; b.tconst = t; }
+		else if (op == 0x06) { b.one = true; b.cond = TC_LE; b.tconst = t; }
+		else if (op == 0x07) { b.one = true; b.cond = TC_GT; b.tconst = t; }
+		else if (op == 0x14) { b.two = true; b.cond = TC_EQ; b.tconst = t; b.likely = true; }
+		else if (op == 0x15) { b.two = true; b.cond = TC_NE; b.tconst = t; b.likely = true; }
+		else if (op == 0x16) { b.one = true; b.cond = TC_LE; b.tconst = t; b.likely = true; }
+		else if (op == 0x17) { b.one = true; b.cond = TC_GT; b.tconst = t; b.likely = true; }
+		else if (op == 0x01)
+		{
+			if      (rt == 0x00) { b.one = true; b.cond = TC_LT; b.tconst = t; }
+			else if (rt == 0x01) { b.one = true; b.cond = TC_GE; b.tconst = t; }
+			else if (rt == 0x02) { b.one = true; b.cond = TC_LT; b.tconst = t; b.likely = true; }
+			else if (rt == 0x03) { b.one = true; b.cond = TC_GE; b.tconst = t; b.likely = true; }
+			else if (rt == 0x10) { b.one = true; b.cond = TC_LT; b.tconst = t; b.link = 31; }
+			else if (rt == 0x11) { b.one = true; b.cond = TC_GE; b.tconst = t; b.link = 31; }
+			else return false;
+		}
+		else if ((op == 0x10 || op == 0x11 || op == 0x12) && rs == 0x08)
+		{
+			if (rt > 3) return false;
+			b.bc0 = op == 0x10; b.bc1 = op == 0x11; b.bc2 = op == 0x12;
+			b.cond = (rt & 1) ? TC_NE : TC_EQ;
+			b.tconst = t;
+			b.likely = (rt & 2) != 0;
+		}
+		else return false;
+
+		b.ds = memRead32(bpc + 4);
+		b.ds_interp = !IsTranslatable(b.ds);
+		if (b.ds_interp && !(b.likely && (b.two || b.one) && !b.bc0 && !b.bc1 && !b.bc2 && b.link < 0))
+			return false;
+		b.cyc_taken = cyc_leading + OpCycles(insn) + OpCycles(b.ds);
+		b.cyc_nt = cyc_leading + OpCycles(insn);
+		b.idle_skip = EmuConfig.Speedhacks.WaitLoop && !b.is_jr && ((b.tconst & 0x1fffffff) == 0x00081fc0);
+		b.nt_evt = (op == 0x04 || op == 0x05 || (b.likely && !b.bc0 && !b.bc1 && !b.bc2));
+		return true;
+	}
+
+	enum : u8 { TE_TAIL, TE_CAP, TE_BRANCH, TE_ERET };
+	struct Twin
+	{
+		struct Step { u32 a, b; bool pair; };
+		std::vector<Step> steps; // the leading run, in order
+		u32 p = 0;               // where it ended: CAP's exit, TAIL's first untranslated word
+		int n = 0, cyc = 0;      // its op count (a pair is two) and raw cycle sum
+		u8 end = TE_TAIL;
+		u32 eret = 0;
+		TwinBranch br;
+		u32 ne = 0;              // Norm(one past what the block's code would cover)
+		bool live = true;
+		std::vector<u32> src;    // the words [Norm(pc), ne), for a revive (Revive's src)
+	};
+
+	// CompileBlock's extent, read as it reads it
+	void TwinDecode(u32 pc, Twin& t)
+	{
+		int n = 0, cyc = 0;
+		u32 p = pc;
+		bool done = false, branch_end = false;
+		while (n < kMaxInsns)
+		{
+			const u32 insn = memRead32(p);
+			if (n + 2 <= kMaxInsns)
+			{
+				UPair up;
+				const u32 next = memRead32(p + 4);
+				if (UnalignedPair(insn, next, &up))
+				{
+					t.steps.push_back({insn, next, true});
+					cyc += OpCycles(insn) + OpCycles(next);
+					p += 8; n += 2;
+					continue;
+				}
+			}
+			if (TwinSimpleOk(insn))
+			{
+				t.steps.push_back({insn, 0, false});
+				cyc += OpCycles(insn); p += 4; n++;
+				continue;
+			}
+			if (TwinBranchDecode(p, insn, cyc, t.br)) { t.end = TE_BRANCH; done = branch_end = true; break; }
+			if ((insn >> 26) == 0x10 && ((insn >> 21) & 31) == 0x10 && (insn & 0x3f) == 0x18)
+			{
+				t.eret = insn; t.end = TE_ERET; p += 4; n++; done = true; break;
+			}
+			break;
+		}
+		if (!done)
+			t.end = (n == kMaxInsns) ? TE_CAP : TE_TAIL;
+		t.p = p; t.n = n; t.cyc = cyc;
+		t.ne = Norm(branch_end ? p + 8 : p);
+		const u32 ns = Norm(pc);
+		if (t.ne > ns)
+		{
+			t.src.resize((t.ne - ns) >> 2);
+			for (u32 q = 0; q < (u32)t.src.size(); q++)
+				t.src[q] = memRead32(pc + q * 4);
+		}
+	}
+
+	u32 s_twin_red = 0; // LRPS2_TWIN_RED=N: N raw cycles too many on every twin block (the red receipt)
+	// EmitCycleBookkeeping: cpuBlockCycles += cyc * (2 - Config[18]), Config read at the tail
+	inline void TwBook(int cyc)
+	{
+		const u32 c = (u32)cyc;
+		cpuBlockCycles += (cpuRegs.CP0.n.Config & (1u << 18)) ? c : c * 2;
+	}
+	// EmitTailCycles(with_update): the inline default-rate update is intUpdateCPUCycles' rate-0 arm
+	inline void TwTail(int cyc) { TwBook(cyc); eeUpdateCycles_arm64(); }
+	inline bool TwDue() { return (s64)(cpuRegs.cycle - cpuRegs.nextEventCycle) >= 0; }
+	// EmitKnownExit: a target outside RAM has no LUT slot, and its event test is not gated
+	inline void TwKnownExit(u32 target, bool evt)
+	{
+		if (evt && (!InRam(Norm(target)) || TwDue()))
+			eeEventTest_arm64();
+	}
+	inline void TwIdleSkip()
+	{
+		if (!TwDue())
+			cpuRegs.cycle = cpuRegs.nextEventCycle;
+	}
+
+	void TwinBranchRun(const TwinBranch& b)
+	{
+		if (b.link > 0)
+			TwG(b.link).UD[0] = (u32)(b.bpc + 8);
+		const u32 jr = b.is_jr ? TwR32(b.rs) : 0; // read after the link, as the code does
+		if (b.uncond)
+		{
+			TwinSimple(b.ds);
+			cpuRegs.pc = b.is_jr ? jr : b.tconst;
+			TwTail(b.cyc_taken);
+			if (b.idle_skip) TwIdleSkip();
+			if (b.is_jr) { if (TwDue()) eeEventTest_arm64(); }
+			else TwKnownExit(b.tconst, true);
+			return;
+		}
+		bool taken;
+		if (b.bc0) taken = (R5900::Interpreter::OpcodeImpl::COP0::CPCOND0() == 0) == (b.cond == TC_EQ);
+		else if (b.bc1) taken = ((fpuRegs.fprc[31] & 0x00800000) == 0) == (b.cond == TC_EQ);
+		else if (b.bc2) taken = ((vuRegs[0].VI[REG_VPU_STAT].UL & 0x100) == 0) == (b.cond == TC_EQ);
+		else
+		{
+			const s64 a = (s64)TwR64(b.rs), c = (b.two && b.rt) ? (s64)TwR64(b.rt) : 0;
+			switch (b.cond)
+			{
+				case TC_EQ: taken = a == c; break;
+				case TC_NE: taken = a != c; break;
+				case TC_LE: taken = a <= c; break;
+				case TC_GT: taken = a > c; break;
+				case TC_LT: taken = a < c; break;
+				default:    taken = a >= c; break;
+			}
+		}
+		if (taken)
+		{
+			if (b.ds_interp)
+			{
+				cpuRegs.pc = b.bpc;
+				TwBook(b.cyc_leading);
+				eeRunBasicBlock_arm64();
+				return;
+			}
+			TwinSimple(b.ds);
+			cpuRegs.pc = b.tconst;
+			TwTail(b.cyc_taken);
+			if (b.idle_skip) TwIdleSkip();
+			TwKnownExit(b.tconst, true);
+			return;
+		}
+		TwBook(b.cyc_nt);
+		const u32 nt = b.bpc + (b.likely ? 8 : 4);
+		cpuRegs.pc = nt;
+		TwKnownExit(nt, b.nt_evt);
+	}
+
+	// EmitEret
+	void TwinEret(int cyc)
+	{
+		const u32 st = cpuRegs.CP0.n.Status.val;
+		const bool erl = (st & 4) != 0;
+		cpuRegs.pc = erl ? cpuRegs.CP0.n.ErrorEPC : cpuRegs.CP0.n.EPC;
+		cpuRegs.CP0.n.Status.val = erl ? (st & ~4u) : (st & ~2u);
+		const u64 c = cpuRegs.cycle;
+		if ((s32)((u32)cpuRegs.nextEventCycle - (u32)c) > 4)
+			cpuRegs.nextEventCycle = c + 4;
+		TwBook(cyc);
+	}
+
+	void TwinRun(const Twin& t)
+	{
+		if (s_twin_red)
+			cpuBlockCycles += s_twin_red;
+		for (const Twin::Step& s : t.steps)
+		{
+			if (s.pair) TwinPair(s.a, s.b);
+			else TwinSimple(s.a);
+		}
+		switch (t.end)
+		{
+			case TE_CAP:
+				cpuRegs.pc = t.p;
+				TwBook(t.cyc);
+				return;
+			case TE_TAIL:
+				if (t.n > 0)
+				{
+					cpuRegs.pc += 4 * t.n;
+					TwBook(t.cyc);
+				}
+				eeRunBasicBlock_arm64();
+				return;
+			case TE_ERET:
+				TwinEret(t.cyc + OpCycles(t.eret));
+				return;
+			default:
+				TwinBranchRun(t.br);
+				return;
+		}
+	}
+
+	// Interp's twins, by pc like s_blocks; never in the LUT (a chain jumps into what the LUT
+	// holds), so every entry is the dispatcher's, through InstallBlock.
+	std::unordered_map<u32, Twin> s_twins;
+	const Twin* s_twin_cur = nullptr;
+	u64 s_twin_runs = 0, s_twin_decodes = 0, s_twin_revives = 0;
+	void TwinBlock(void**) { s_twin_runs++; TwinRun(*s_twin_cur); }
+	void TwinReport()
+	{
+		fprintf(stderr, "lrps2 AOT interp: EE twin %llu blocks decoded, %llu revived, %llu runs\n",
+			(unsigned long long)s_twin_decodes, (unsigned long long)s_twin_revives, (unsigned long long)s_twin_runs);
+	}
+	// The twin of pc's block if it holds (live, or its words as they were: Revive's rule), else
+	// none, its record gone.
+	BlockFn TwinCached(u32 pc)
+	{
+		auto it = s_twins.find(pc);
+		if (it == s_twins.end())
+			return nullptr;
+		Twin& t = it->second;
+		if (!t.live && InRam(Norm(pc)))
+		{
+			bool same = true;
+			for (u32 q = 0; same && q < (u32)t.src.size(); q++)
+				same = memRead32(pc + q * 4) == t.src[q];
+			if (same)
+			{
+				t.live = true;
+				s_twin_revives++;
+				RegisterPages(pc, Norm(pc), t.ne);
+			}
+		}
+		if (!t.live)
+		{
+			s_twins.erase(it);
+			return nullptr;
+		}
+		s_twin_cur = &t;
+		return &TwinBlock;
+	}
+	BlockFn TwinNew(u32 pc)
+	{
+		static const bool reported = (atexit(TwinReport), true);
+		(void)reported;
+		Twin& t = s_twins[pc];
+		t = Twin{};
+		TwinDecode(pc, t);
+		s_twin_decodes++;
+		RegisterPages(pc, Norm(pc), t.ne);
+		s_twin_cur = &t;
+		return &TwinBlock;
+	}
+
 	aot::Block s_aot_block; // HH-37: the last compiled block's key and code (CompileBlock)
 
 	// HH-37 Emit: whether the record being re-compiled kept guest_pc's access off fastmem
@@ -4553,9 +5411,11 @@ namespace {
 	// where CompileBlock would have put the JIT's (its record, the LUT, its pages), preferring
 	// the variant compiled with the fastmem mask the faults so far give this block (any variant
 	// with the same words computes the same thing; the mask only says which accesses fault).
-	void InterpMissBlock(void**) { eeRunBasicBlock_arm64(); }
 	BlockFn InstallBlock(u32 pc)
 	{
+		if (aot::mode() == aot::Interp)
+			if (BlockFn f = TwinCached(pc))
+				return f;
 		const aot::Block* pick = nullptr;
 		if (const std::vector<const aot::Block*>* v = aot::imageBlocks(aot::UnitEE, pc))
 			for (const aot::Block* b : *v)
@@ -4576,10 +5436,9 @@ namespace {
 			}
 		if (!pick)
 		{
-			// Load stops the process here. Interp: until the EE rec's C twin exists, the
-			// interpreter's basic block (correct, but timed as the interpreter times it).
+			// Load stops the process here; Interp runs the block's C twin.
 			aot::miss(aot::UnitEE, pc);
-			return &InterpMissBlock;
+			return TwinNew(pc);
 		}
 		BlockFn fn = reinterpret_cast<BlockFn>(const_cast<u8*>(pick->code));
 		const u32 ns = Norm(pc), ne = ns + pick->native * 4;
@@ -4659,6 +5518,7 @@ void eeJitReserve_arm64(void)
 		if (s_lut == MAP_FAILED) s_lut = nullptr;
 	}
 	s_page_clears.assign(kRamBytes >> kPageShift, 0); // C.60
+	s_twin_red = getenv("LRPS2_TWIN_RED") ? (u32)atoi(getenv("LRPS2_TWIN_RED")) : 0; // HH-37
 	s_ok = s_ok && (s_code || aot::imageOnly()) && s_lut;
 	if (aot::shaped() && s_lut)
 		aot::setValueImport(kLutImport, s_lut);
@@ -4676,6 +5536,7 @@ bool eeJitAvailable_arm64(void)
 void eeJitReset_arm64(void)
 {
 	s_blocks.clear();
+	s_twins.clear();
 	s_page.clear();
 	LutClearAll();
 	s_code_pos = 0;
@@ -4717,7 +5578,7 @@ void eeJitClear_arm64(u32 addr, u32 size)
 	// surviving block would go stale silently. Blocks are marked dead (records
 	// and native code kept); the next dispatch revalidates the source snapshot
 	// and revives the block without recompiling when the code bytes survived.
-	if (s_blocks.empty())
+	if (s_blocks.empty() && s_twins.empty())
 		return;
 	const u32 a0 = Norm(addr);
 	const u32 a1 = Norm(addr + (size ? size : 1) * 4 - 1);
@@ -4733,6 +5594,9 @@ void eeJitClear_arm64(u32 addr, u32 size)
 			auto bit = s_blocks.find(spc);
 			if (bit != s_blocks.end())
 				bit->second.live = false;
+			auto tit = s_twins.find(spc); // HH-37: Interp's twins die with their pages too
+			if (tit != s_twins.end())
+				tit->second.live = false;
 			const u32 np = Norm(spc);
 			if (InRam(np)) s_lut[np >> 2] = nullptr;
 		}
@@ -4743,6 +5607,7 @@ void eeJitClear_arm64(u32 addr, u32 size)
 void eeJitShutdown_arm64(void)
 {
 	s_blocks.clear();
+	s_twins.clear();
 	s_page.clear();
 	if (s_code && aot::mode() == aot::Emit) { munmap(s_code, kCodeCacheSize); s_code = nullptr; }
 	if (s_code) { armJitUnmap(s_code, kCodeCacheSize, "EE"); s_code = nullptr; }
@@ -4841,8 +5706,313 @@ extern "C" bool eeFastmemFault_arm64(uintptr_t code_address, uintptr_t* resume_p
 }
 
 
+namespace
+{
+
+	// ---- HH-37: LRPS2_TWIN_SELFTEST=N (the stock JIT): the twin against the JIT, block by block ----
+	// N random blocks, each written into EE RAM, compiled by CompileBlock and run, and run again
+	// from the same state by its twin; every guest register file, cpuBlockCycles, the cycle
+	// counters and a 64 KB data window must come out the same. The blocks are shaped so that
+	// neither run can leave through anything a test cannot undo (no event test is due, no
+	// interpreter tail meets a branch, no access misaligns): an op or a fused pair, then ERET;
+	// runs of ops, ending in ERET, at the 64-op cap, or in an interpreter tail (TLBP, ERET); a
+	// branch with its delay slot. The macro COP2 ops are left out: the stock JIT emits them and
+	// the AOT form, whose twin this is, interprets them. The process exits when it is done.
+	constexpr u32 kTwCode = 0x01e00000, kTwData = 0x01f00000, kTwDataLen = 0x10000;
+	u64 s_tw_rng = 0x9e3779b97f4a7c15ull;
+	inline u64 TwRnd() { s_tw_rng ^= s_tw_rng << 13; s_tw_rng ^= s_tw_rng >> 7; s_tw_rng ^= s_tw_rng << 17; return s_tw_rng; }
+	inline u32 TwRndBelow(u32 n) { return (u32)(TwRnd() % n); }
+	u32 TwEdge32()
+	{
+		static const u32 e[] = {0, 1, 0xffffffff, 0x7fffffff, 0x80000000, 0x8000, 0x7fff, 0xffff, 0x10000, 0xffff8000, 31, 32, 63};
+		switch (TwRndBelow(4))
+		{
+			case 0: return e[TwRndBelow(sizeof e / sizeof e[0])];
+			case 1: return TwRndBelow(64);
+			default: return (u32)TwRnd();
+		}
+	}
+	u32 TwEdgeF()
+	{
+		static const u32 e[] = {0, 0x80000000, 0x00000001, 0x807fffff, 0x3f800000, 0xbf800000, 0x7f800000, 0xff800000,
+			0x7fffffff, 0xffffffff, 0x7f7fffff, 0xff7fffff, 0x00800000, 0x80800000, 0x4e800000, 0xcf000000, 0x7fc00000};
+		switch (TwRndBelow(4))
+		{
+			case 0: return e[TwRndBelow(sizeof e / sizeof e[0])];
+			case 1: return (u32)TwRnd();
+			default: return (TwRnd() & 0x807fffff) | ((0x7c + TwRndBelow(9)) << 23); // exponents near each other
+		}
+	}
+	// A register field: mostly a few registers, so ops depend on each other and on r0
+	inline u32 TwReg() { return TwRndBelow(4) ? TwRndBelow(6) : TwRndBelow(32); }
+
+	// A random op EmitSimple emits, or 0 for none. mem: memory ops allowed (their base register
+	// is set up by the caller); ds: a delay slot (no COP2 or VU0 traffic).
+	u32 TwRandomOp(bool mem, bool ds)
+	{
+		for (int tries = 0; tries < 1000; tries++)
+		{
+			u32 w = (u32)TwRnd();
+			w = (w & ~(0x1fu << 21)) | (TwReg() << 21);
+			w = (w & ~(0x1fu << 16)) | (TwReg() << 16);
+			w = (w & ~(0x1fu << 11)) | (TwReg() << 11);
+			u32 op;
+			switch (TwRndBelow(12))
+			{
+				case 0: case 1: case 2: op = 0x00; break;
+				case 3: { static const u32 o[] = {0x08, 0x09, 0x18, 0x19, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x01}; op = o[TwRndBelow(11)]; break; }
+				case 4: case 5: op = 0x1c; break;
+				case 6: case 7:
+				{
+					op = 0x11;
+					static const u32 r[] = {0x00, 0x02, 0x04, 0x06, 0x10, 0x10, 0x10, 0x10, 0x14};
+					w = (w & ~(0x1fu << 21)) | (r[TwRndBelow(9)] << 21);
+					break;
+				}
+				case 8: op = 0x12; w = (w & ~(0x1fu << 21)) | ((TwRndBelow(2) ? 0x01 + TwRndBelow(2) : 0x05 + TwRndBelow(2)) << 21); break;
+				case 9: op = 0x10; w &= ~(0x1fu << 21); break; // MFC0
+				default:
+				{
+					static const u32 o[] = {0x20, 0x24, 0x21, 0x25, 0x23, 0x27, 0x37, 0x22, 0x26, 0x1a, 0x1b, 0x2a, 0x2e, 0x2c, 0x2d,
+						0x28, 0x29, 0x2b, 0x3f, 0x1e, 0x1f, 0x31, 0x39, 0x36, 0x3e, 0x33};
+					op = o[TwRndBelow(sizeof o / sizeof o[0])];
+					break;
+				}
+			}
+			w = (w & 0x03ffffffu) | (op << 26);
+			if (!TwinSimpleOk(w))
+				continue;
+			const bool is_mem = (op >= 0x1a && op <= 0x1b) || (op >= 0x1e && op <= 0x3f && op != 0x2f && op != 0x33);
+			if (is_mem && (!mem || ((w >> 21) & 31) == 0))
+				continue;
+			if (ds && (op == 0x12 || op == 0x36 || op == 0x3e))
+				continue;
+			if (op == 0x12 && !Cop2XferSupported(w))
+				continue; // CTC2 to FBRST/CMSAR1: a VU reset or a VU1 kick
+			if (op == 0x10 && (((w >> 11) & 31) == 9 || ((w >> 11) & 31) == 25))
+				continue; // Count/PERF: an interpreter call either way, and they move with the cycle
+			return w;
+		}
+		return 0;
+	}
+	// Point a memory op's base at the data window, aligned as its access must be.
+	void TwAimBase(u32 w)
+	{
+		const u32 op = w >> 26, rs = (w >> 21) & 31;
+		const bool is_mem = (op >= 0x1a && op <= 0x1b) || (op >= 0x1e && op <= 0x3f && op != 0x2f && op != 0x33);
+		if (!is_mem || !rs)
+			return;
+		const u32 amask = (op == 0x37 || op == 0x3f) ? 7 : (op == 0x23 || op == 0x27 || op == 0x2b) ? 3 :
+		                  (op == 0x21 || op == 0x25 || op == 0x29) ? 1 : (op == 0x36 || op == 0x3e) ? 15 : 0;
+		const u32 addr = (kTwData + 0x100 + TwRndBelow(kTwDataLen - 0x200)) & ~amask;
+		cpuRegs.GPR.r[rs].UD[0] = (u64)(s64)(s32)(addr - (u32)(s32)(int16_t)(w & 0xffff));
+	}
+	void TwRandomState()
+	{
+		for (u32 i = 1; i < 32; i++)
+			for (u32 j = 0; j < 4; j++)
+				cpuRegs.GPR.r[i].UL[j] = TwEdge32();
+		for (u32 j = 0; j < 4; j++) { cpuRegs.HI.UL[j] = TwEdge32(); cpuRegs.LO.UL[j] = TwEdge32(); }
+		cpuRegs.sa = TwRndBelow(16);
+		for (u32 i = 0; i < 32; i++) fpuRegs.fpr[i].UL = TwEdgeF();
+		fpuRegs.ACC.UL = TwEdgeF();
+		fpuRegs.fprc[31] = (u32)TwRnd();
+		for (u32 i = 1; i < 32; i++)
+			for (u32 j = 0; j < 4; j++)
+				vuRegs[0].VF[i].UL[j] = TwEdgeF();
+		for (u32 i = 1; i < 16; i++) vuRegs[0].VI[i].UL = TwEdge32() & 0xffff;
+		static const u32 vi[] = {16, 17, 18, 20, 21, 22, 27};
+		for (u32 i : vi) vuRegs[0].VI[i].UL = TwEdge32();
+		vuRegs[0].VI[REG_VPU_STAT].UL = TwRndBelow(2) ? 0x100 : 0;
+		cpuRegs.CP0.n.Status.val = (cpuRegs.CP0.n.Status.val & ~6u) | (TwRndBelow(4) << 1);
+		cpuRegs.CP0.n.Config = (cpuRegs.CP0.n.Config & ~(1u << 18)) | (TwRndBelow(2) << 18);
+		cpuRegs.CP0.n.EPC = kTwCode + 0x8000 + TwRndBelow(64) * 4;
+		cpuRegs.CP0.n.ErrorEPC = 0xbfc00000 + TwRndBelow(64) * 4;
+		static const u32 cp0[] = {0, 2, 3, 4, 5, 6, 8, 10, 13, 15, 17, 26, 27, 28, 29, 30};
+		for (u32 i : cp0) cpuRegs.CP0.r[i] = TwEdge32();
+		cpuRegs.nextEventCycle = cpuRegs.cycle + (1ull << 40);
+		cpuBlockCycles = TwRndBelow(8);
+		for (u32 q = 0; q < kTwDataLen; q += 4)
+			*(u32*)(eeMem->Main + kTwData + q) = (u32)TwRnd();
+	}
+	struct TwSnap
+	{
+		cpuRegisters c;
+		fpuRegisters f;
+		VURegs v;
+		u32 bc;
+		std::vector<u8> ram;
+		void take() { c = cpuRegs; f = fpuRegs; memcpy(&v, &vuRegs[0], sizeof v); bc = cpuBlockCycles; ram.assign(eeMem->Main + kTwData, eeMem->Main + kTwData + kTwDataLen); }
+		void put() const { cpuRegs = c; fpuRegs = f; memcpy(&vuRegs[0], &v, sizeof v); cpuBlockCycles = bc; memcpy(eeMem->Main + kTwData, ram.data(), kTwDataLen); }
+	};
+	// The first difference between two snapshots, described, or empty
+	std::string TwDiff(const TwSnap& a, const TwSnap& b)
+	{
+		char buf[256];
+		for (u32 i = 0; i < 32; i++)
+			for (u32 j = 0; j < 4; j++)
+				if (a.c.GPR.r[i].UL[j] != b.c.GPR.r[i].UL[j])
+					{ snprintf(buf, sizeof buf, "GPR r%u.UL[%u] twin %08x jit %08x", i, j, a.c.GPR.r[i].UL[j], b.c.GPR.r[i].UL[j]); return buf; }
+		for (u32 j = 0; j < 4; j++)
+		{
+			if (a.c.HI.UL[j] != b.c.HI.UL[j]) { snprintf(buf, sizeof buf, "HI.UL[%u] twin %08x jit %08x", j, a.c.HI.UL[j], b.c.HI.UL[j]); return buf; }
+			if (a.c.LO.UL[j] != b.c.LO.UL[j]) { snprintf(buf, sizeof buf, "LO.UL[%u] twin %08x jit %08x", j, a.c.LO.UL[j], b.c.LO.UL[j]); return buf; }
+		}
+		if (a.c.pc != b.c.pc) { snprintf(buf, sizeof buf, "pc twin %08x jit %08x", a.c.pc, b.c.pc); return buf; }
+		if (a.c.cycle != b.c.cycle) { snprintf(buf, sizeof buf, "cycle twin %llu jit %llu", (unsigned long long)a.c.cycle, (unsigned long long)b.c.cycle); return buf; }
+		if (a.bc != b.bc) { snprintf(buf, sizeof buf, "cpuBlockCycles twin %u jit %u", a.bc, b.bc); return buf; }
+		if (a.c.nextEventCycle != b.c.nextEventCycle) return "nextEventCycle";
+		if (a.c.sa != b.c.sa) { snprintf(buf, sizeof buf, "sa twin %u jit %u", a.c.sa, b.c.sa); return buf; }
+		if (a.c.code != b.c.code) { snprintf(buf, sizeof buf, "code twin %08x jit %08x", a.c.code, b.c.code); return buf; }
+		for (u32 i = 0; i < 32; i++)
+			if (a.c.CP0.r[i] != b.c.CP0.r[i]) { snprintf(buf, sizeof buf, "CP0 r%u twin %08x jit %08x", i, a.c.CP0.r[i], b.c.CP0.r[i]); return buf; }
+		if (memcmp(&a.c, &b.c, sizeof a.c)) return "cpuRegs (elsewhere)";
+		for (u32 i = 0; i < 32; i++)
+			if (a.f.fpr[i].UL != b.f.fpr[i].UL) { snprintf(buf, sizeof buf, "fpr%u twin %08x jit %08x", i, a.f.fpr[i].UL, b.f.fpr[i].UL); return buf; }
+		if (a.f.fprc[31] != b.f.fprc[31]) { snprintf(buf, sizeof buf, "FCR31 twin %08x jit %08x", a.f.fprc[31], b.f.fprc[31]); return buf; }
+		if (a.f.ACC.UL != b.f.ACC.UL) { snprintf(buf, sizeof buf, "ACC twin %08x jit %08x", a.f.ACC.UL, b.f.ACC.UL); return buf; }
+		if (memcmp(&a.f, &b.f, sizeof a.f)) return "fpuRegs (elsewhere)";
+		for (u32 i = 0; i < 32; i++)
+			if (memcmp(&a.v.VF[i], &b.v.VF[i], 16)) { snprintf(buf, sizeof buf, "VF%u", i); return buf; }
+		for (u32 i = 0; i < 32; i++)
+			if (a.v.VI[i].UL != b.v.VI[i].UL) { snprintf(buf, sizeof buf, "VI%u twin %08x jit %08x", i, a.v.VI[i].UL, b.v.VI[i].UL); return buf; }
+		if (memcmp(&a.v, &b.v, sizeof a.v)) return "vuRegs[0] (elsewhere)";
+		for (u32 q = 0; q < kTwDataLen; q++)
+			if (a.ram[q] != b.ram[q]) { snprintf(buf, sizeof buf, "RAM %08x twin %02x jit %02x", kTwData + q, a.ram[q], b.ram[q]); return buf; }
+		return std::string();
+	}
+
+	void TwinSelfTest(int rounds)
+	{
+		eeJitReset_arm64();
+		fprintf(stderr, "lrps2 twin selftest: %d blocks\n", rounds);
+		int ran = 0, failed = 0, skipped = 0;
+		int ends[4] = {};
+		std::unordered_map<std::string, int> fails;
+		std::unordered_map<std::string, int> seen;
+		// TwinSimpleOk is EmitSimple's verdict; IsTranslatable is the delay slot's. They must agree.
+		for (int i = 0; i < 2000000; i++)
+		{
+			const u32 w = (u32)TwRnd();
+			const u32 op = w >> 26;
+			if (op == 0x12 && ((w >> 21) & 31) == 0x08) continue; // BC2: neither, by design
+			if (TwinSimpleOk(w) != IsTranslatable(w))
+			{
+				fprintf(stderr, "lrps2 twin selftest: %08x TwinSimpleOk %d IsTranslatable %d\n", w, TwinSimpleOk(w), IsTranslatable(w));
+				failed++;
+			}
+		}
+		for (int r = 0; r < rounds; r++)
+		{
+			std::vector<u32> words;
+			const u32 kind = TwRndBelow(10);
+			const u32 kEret = 0x42000018, kTlbp = 0x42000008;
+			bool mem = true;
+			if (kind <= 3) // one op or a pair, then ERET
+			{
+				if (kind == 3) // a canonical unaligned pair (fused unless a load's rt is 0 or its base)
+				{
+					static const u32 pl[4][3] = {{0x1a, 0x1b, 7}, {0x22, 0x26, 3}, {0x2c, 0x2d, 7}, {0x2a, 0x2e, 3}};
+					const u32* q = pl[TwRndBelow(4)];
+					const u32 rs = 1 + TwRndBelow(5), rt = TwRndBelow(6), off = TwRndBelow(0x100);
+					words.push_back((q[0] << 26) | (rs << 21) | (rt << 16) | (off + q[2]));
+					words.push_back((q[1] << 26) | (rs << 21) | (rt << 16) | off);
+				}
+				else
+					words.push_back(TwRandomOp(true, false));
+				words.push_back(kEret);
+			}
+			else if (kind <= 5) // a run of ops ending in ERET or in an interpreter tail
+			{
+				const u32 k = 2 + TwRndBelow(8);
+				for (u32 i = 0; i < k; i++) words.push_back(TwRandomOp(false, false));
+				if (kind == 5) words.push_back(kTlbp);
+				words.push_back(kEret);
+				mem = false;
+			}
+			else if (kind == 6) // the cap
+			{
+				for (u32 i = 0; i < kMaxInsns + 3; i++) words.push_back(TwRandomOp(false, false));
+				mem = false;
+			}
+			else // a branch and its slot, a few ops before it
+			{
+				const u32 k = TwRndBelow(3);
+				for (u32 i = 0; i < k; i++) words.push_back(TwRandomOp(false, false));
+				static const u32 bo[] = {0x00, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x14, 0x15, 0x16, 0x17, 0x01, 0x10, 0x11, 0x12};
+				const u32 o = bo[TwRndBelow(sizeof bo / sizeof bo[0])];
+				u32 b = (o << 26) | (TwReg() << 21) | (TwReg() << 16) | (TwRndBelow(0x400) - 0x200 + 0x10000) % 0x10000;
+				if (o == 0x00) b = (TwReg() << 21) | (TwReg() << 11) | (TwRndBelow(2) ? 0x08 : 0x09);
+				if (o == 0x02 || o == 0x03) b = (o << 26) | ((kTwCode + 0x4000 + TwRndBelow(0x1000) * 4) >> 2);
+				if (o == 0x01) { static const u32 rt[] = {0, 1, 2, 3, 0x10, 0x11}; b = (b & ~(0x1fu << 16)) | (rt[TwRndBelow(6)] << 16); }
+				if (o >= 0x10 && o <= 0x12) b = (b & ~(0x3ffu << 16)) | (0x08u << 21) | (TwRndBelow(4) << 16);
+				words.push_back(b);
+				words.push_back(TwRandomOp(false, true));
+				mem = false;
+			}
+			bool bad = false;
+			for (u32 w : words) bad |= (w == 0);
+			if (bad) { skipped++; continue; }
+			// The code, in EE RAM (a store into its page drops the JIT's blocks there)
+			for (u32 i = 0; i < (u32)words.size(); i++)
+				memWrite32(kTwCode + i * 4, words[i]);
+			memWrite32(kTwCode + (u32)words.size() * 4, kEret);
+			Twin t;
+			TwinDecode(kTwCode, t);
+			// Shapes a test cannot undo: an interpreter tail that is not TLBP, ERET; a taken
+			// delay slot left to the interpreter; an exit whose event test is not gated
+			if (t.end == TE_TAIL && !(memRead32(t.p) == kTlbp && memRead32(t.p + 4) == kEret)) { skipped++; continue; }
+			if (t.end == TE_BRANCH)
+			{
+				const TwinBranch& b = t.br;
+				if (b.ds_interp || b.idle_skip || (!b.is_jr && !InRam(Norm(b.tconst)))) { skipped++; continue; }
+			}
+			TwRandomState();
+			if (mem)
+				for (const Twin::Step& s : t.steps) TwAimBase(s.a);
+			cpuRegs.pc = kTwCode;
+			TwSnap before, twin, jit;
+			before.take();
+			TwinRun(t);
+			twin.take();
+			before.put();
+			const BlockFn fn = CompileBlock(kTwCode);
+			s_lut[Norm(kTwCode) >> 2] = nullptr; // a chain never enters a test block, its own included
+			fn(aot::imports());
+			jit.take();
+			before.put();
+			ran++;
+			ends[t.end]++;
+			const std::string name = R5900::GetInstruction(words[0]).Name;
+			seen[name]++;
+			const std::string d = TwDiff(twin, jit);
+			if (!d.empty())
+			{
+				failed++;
+				if (fails[name]++ < 3)
+				{
+					fprintf(stderr, "lrps2 twin selftest FAIL (%s, end %d, n %d):", d.c_str(), t.end, t.n);
+					for (u32 w : words) fprintf(stderr, " %08x", w);
+					fprintf(stderr, "\n");
+				}
+			}
+		}
+		fprintf(stderr, "lrps2 twin selftest: %d blocks ran (ends: tail %d, cap %d, branch %d, eret %d), %d skipped, %d failed\n",
+			ran, ends[TE_TAIL], ends[TE_CAP], ends[TE_BRANCH], ends[TE_ERET], skipped, failed);
+		for (const auto& f : fails)
+			fprintf(stderr, "lrps2 twin selftest: %s failed %d of %d\n", f.first.c_str(), f.second, seen[f.first]);
+		fprintf(stderr, "lrps2 twin selftest: %zu first-op names covered\n", seen.size());
+		fflush(stderr);
+		_Exit(failed ? 3 : 0);
+	}
+}
+
 extern "C" void eeJitRunBlock_arm64(void)
 {
+	// HH-37: LRPS2_TWIN_SELFTEST=N, the stock JIT only (TwinSelfTest)
+	static const int selftest = aot::mode() == aot::Off && getenv("LRPS2_TWIN_SELFTEST") ? atoi(getenv("LRPS2_TWIN_SELFTEST")) : 0;
+	if (selftest) [[unlikely]]
+		TwinSelfTest(selftest);
 	BlockForPC(cpuRegs.pc)(aot::imports());
 }
 
