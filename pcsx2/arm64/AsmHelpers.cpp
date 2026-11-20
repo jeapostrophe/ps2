@@ -118,8 +118,10 @@ u8* armStartBlock()
 	pxAssert(!armAsm);
 	// vixl writes the bytes through the write alias; armAsmPtr stays the
 	// execute address, so armGetCurrentCodePointer() -- every displacement,
-	// every published entry point -- is where the code runs.
-	armAsm = new (s_armAsmStorage) vixl::aarch64::MacroAssembler(static_cast<vixl::byte*>(armJitRW(armAsmPtr)), armAsmCapacity);
+	// every published entry point -- is where the code runs. HH-37: AOT Emit
+	// maps no code cache and writes into plain memory, which has no alias.
+	u8* const write = aot::mode() == aot::Emit ? armAsmPtr : armJitRW(armAsmPtr);
+	armAsm = new (s_armAsmStorage) vixl::aarch64::MacroAssembler(static_cast<vixl::byte*>(write), armAsmCapacity);
 	armAsm->GetScratchVRegisterList()->Remove(31);
 	armAsm->GetScratchRegisterList()->Remove(RSCRATCHADDR.GetCode());
 	return armAsmPtr;

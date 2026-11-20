@@ -12,15 +12,30 @@
 #include "arm64/Vif_UnpackNEON.h"
 #include <algorithm>
 #include "arm64/AsmHelpers.h"
+#include "arm64/aot_arm64.h"
 #include "MTVU.h"
 
 #include "common/Console.h"
 #include "common/General.h"
 
+#include <cstddef>
 #include <cstdlib>
 #include <sys/mman.h>
 
 namespace a64 = vixl::aarch64;
+
+// A routine: x0 the VU memory it writes, x1 the data it reads, x2 the vifStruct (MTVU_VifX) whose
+// MaskRow and MaskCol an AOT-shaped routine reaches off it (HH-37); the stock form ignores x2.
+typedef void (*VifRoutine)(uptr dest, uptr src, const vifStruct* vif);
+
+// HH-37: where a routine reaches a vifStruct member: off x2 in the AOT form, at its address in
+// the stock form (and under LRPS2_AOT_RED=vifhostaddr, the red receipt)
+static a64::MemOperand vifMember(const u128* addr, size_t offset)
+{
+	if (aot::shaped() && !aot::redVifHostAddr())
+		return a64::MemOperand(RXARG3, offset);
+	return armAbsMemOperand(RSCRATCHADDR, addr, sizeof(u128));
+}
 
 static void mVUmergeRegs(const vixl::aarch64::VRegister& dest, const vixl::aarch64::VRegister& src, int xyzw, bool modXYZW = false, bool canModifySrc = false)
 {
@@ -253,11 +268,11 @@ __fi void VifUnpackNEON_Dynarec::SetMasks(int cS) const
 
 	if ((doMask && m2) || doMode)
 	{
-		armLoadPtr(xmmRow, &vif.MaskRow);
+		armAsm->Ldr(xmmRow, vifMember(&vif.MaskRow, offsetof(vifStruct, MaskRow)));
 	}
 	if (doMask && m3)
 	{
-		armLoadPtr(xmmCol0, &vif.MaskCol);
+		armAsm->Ldr(xmmCol0, vifMember(&vif.MaskCol, offsetof(vifStruct, MaskCol)));
 		if ((cS >= 2) && (m3 & 0x0000ff00))
 			armAsm->Dup(xmmCol1.V4S(), xmmCol0.V4S(), 1);
 		if ((cS >= 3) && (m3 & 0x00ff0000))
@@ -339,7 +354,7 @@ void VifUnpackNEON_Dynarec::doMaskWrite(const vixl::aarch64::VRegister& regX) co
 void VifUnpackNEON_Dynarec::writeBackRow() const
 {
 	const int idx = v.idx;
-	armStorePtr(xmmRow, &(MTVU_VifX.MaskRow));
+	armAsm->Str(xmmRow, vifMember(&MTVU_VifX.MaskRow, offsetof(vifStruct, MaskRow)));
 }
 
 void VifUnpackNEON_Dynarec::ModUnpack(int upknum, bool PostOp)
@@ -524,9 +539,40 @@ _vifT __fi nVifBlock* dVifCompile(nVifBlock& block, bool isFill)
 
 	VifUnpackNEON_Dynarec(v, block).CompileRoutine();
 
+	u8* const start = s_vifCode[idx] + (block.f.startOffset - 1);
 	v.recWritePtr = armEndBlock();
+	if (aot::unitShaped(aot::UnitVIF))
+	{
+		// HH-37 Shape: the routine's key and code, for the shape log
+		aot::Block b;
+		b.unit = aot::UnitVIF;
+		b.pc = (u32)idx << 16 | block.k.hash_key;
+		b.words = {block.k.key0, block.k.key1};
+		b.codeLen = static_cast<u32>(v.recWritePtr - start);
+		aot::logBlock(b, start);
+	}
 
 	return &block;
+}
+
+// HH-37 Load and Interp: the image's routine for this key, put in the cache where dVifCompile
+// would have put the JIT's (its startOffset counts from the image's code). One the image lacks
+// stops a Load; in Interp it is null, and the C path runs the unpack.
+_vifT static nVifBlock* dVifInstall(nVifBlock& block, bool isFill)
+{
+	const u32 pc = (u32)idx << 16 | block.k.hash_key;
+	if (const std::vector<const aot::Block*>* v = aot::imageBlocks(aot::UnitVIF, pc))
+		for (const aot::Block* ib : *v)
+			if (ib->words[0] == block.k.key0 && ib->words[1] == block.k.key1)
+			{
+				block.f.startOffset = (u32)(ib->code - aot::imageCodeBase()) + 1;
+				block.f.length = dVifComputeLength(block.f.cl, block.f.wl, block.f.num, isFill);
+				vif_hash_add(&nVif[idx].vifBlocks, &block);
+				aot::countInstall(aot::UnitVIF);
+				return &block;
+			}
+	aot::miss(aot::UnitVIF, pc);
+	return nullptr;
 }
 
 _vifT __fi void dVifUnpack(const u8* data, int isFill)
@@ -536,8 +582,10 @@ _vifT __fi void dVifUnpack(const u8* data, int isFill)
 	VIFregisters& vifRegs = MTVU_VifXRegs;
 
 	// The C reference path runs when the code region failed to map
-	// (pre-C.19 arm64 behaviour).
-	if (!s_vifCode[idx])
+	// (pre-C.19 arm64 behaviour). HH-37: in Load and Interp the routines are the image's, counted
+	// from its code (none when it was refused).
+	const u8* const base = aot::imageOnly() ? aot::imageCodeBase() : s_vifCode[idx];
+	if (!base)
 	{
 		_nVifUnpack(idx, data, vifRegs.mode, isFill);
 		return;
@@ -571,7 +619,14 @@ _vifT __fi void dVifUnpack(const u8* data, int isFill)
 	// Seach in cache before trying to compile the block
 	nVifBlock* b = vif_hash_find(&v.vifBlocks, hash_key, (u64)key0 | ((u64)key1 << 32));
 	if (unlikely(b == nullptr))
-		b = dVifCompile<idx>(block, isFill);
+	{
+		b = aot::imageOnly() ? dVifInstall<idx>(block, isFill) : dVifCompile<idx>(block, isFill);
+		if (!b)
+		{
+			_nVifUnpack(idx, data, vifRegs.mode, isFill);
+			return;
+		}
+	}
 
 	{ // Execute the block
 		const VURegs& VU = vuRegs[idx];
@@ -583,7 +638,7 @@ _vifT __fi void dVifUnpack(const u8* data, int isFill)
 		if (likely((startmem + b->f.length) <= endmem))
 		{
 			// No wrapping, you can run the fast dynarec
-			((nVifrecCall)(s_vifCode[idx] + (b->f.startOffset - 1)))((uptr)startmem, (uptr)data);
+			((VifRoutine)(base + (b->f.startOffset - 1)))((uptr)startmem, (uptr)data, &vif);
 		}
 		else
 		{
@@ -594,3 +649,72 @@ _vifT __fi void dVifUnpack(const u8* data, int isFill)
 
 template void dVifUnpack<0>(const u8* data, int isFill);
 template void dVifUnpack<1>(const u8* data, int isFill);
+
+// ---- HH-37: the VIF's part of the AOT form (aot_arm64.cpp) ----
+
+#ifdef LRPS2_AOT_FORM
+void vifAotEmitKernels(u8* buf, size_t cap); // Vif_UnpackNEON.cpp
+
+// What VIF code addresses off x2, by offset and size: a layout that differs refuses the image.
+u64 aot::vifLayoutHash()
+{
+	u64 h = 1469598103934665603ULL;
+	const auto mix = [&h](const char* name, size_t off, size_t size) {
+		for (const char* c = name; *c; c++) { h ^= (u8)*c; h *= 1099511628211ULL; }
+		const u64 w[2] = {off, size};
+		for (size_t i = 0; i < sizeof w; i++) { h ^= ((const u8*)w)[i]; h *= 1099511628211ULL; }
+	};
+	mix("vifStruct.MaskRow", offsetof(vifStruct, MaskRow), sizeof(vifStruct::MaskRow));
+	mix("vifStruct.MaskCol", offsetof(vifStruct, MaskCol), sizeof(vifStruct::MaskCol));
+	mix("nVifMask", sizeof(nVifMask), sizeof(nVifMask[0]));
+	return h;
+}
+
+const char* aot::vifAbiText()
+{
+	return "vif: a routine is (x0 VU memory, x1 data, x2 vifStruct), a kernel (x0, x1, x2 nVifMask); "
+	       "each clobbers q0-q7, q29-q31, x4, x16, x17 and returns; x2 is the only base either reaches";
+}
+
+// Emit: re-compile each logged routine from its key into plain memory, then the kernels, and hand
+// each one's code to aot::emitted. LRPS2_AOT_CORRUPT=vif:pc emits that routine as a bare return
+// (the red receipt).
+void vifAotEmit()
+{
+	constexpr size_t cap = 1 << 20; // past any routine: the JIT leaves 256 KiB at its cache's end
+	u8* buf = static_cast<u8*>(mmap(nullptr, cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+	if (buf == MAP_FAILED)
+	{
+		for (const aot::Block& r : aot::emitRecords(aot::UnitVIF))
+			aot::emitFailed(r, "no memory to emit into");
+		return;
+	}
+	const u32 corrupt = aot::emitCorrupt(aot::UnitVIF);
+	for (const aot::Block& r : aot::emitRecords(aot::UnitVIF))
+	{
+		const u32 idx = r.pc >> 16;
+		if (idx > 1 || r.words.size() != 2)
+		{
+			aot::emitFailed(r, "it is no VIF routine's key");
+			continue;
+		}
+		nVifBlock block = {};
+		block.k.hash_key = static_cast<u16>(r.pc);
+		block.k.key0 = r.words[0];
+		block.k.key1 = r.words[1];
+		armSetAsmPtr(buf, cap, nullptr);
+		u8* start = armStartBlock();
+		if (corrupt && r.pc == corrupt)
+		{
+			armAsm->Ret();
+			fprintf(stderr, "lrps2 AOT emit: VIF routine %08x emitted as a bare return, on purpose\n", r.pc);
+		}
+		else
+			VifUnpackNEON_Dynarec(nVif[idx], block).CompileRoutine();
+		const u32 len = static_cast<u32>(armEndBlock() - start);
+		aot::emitted(r, start, len, {});
+	}
+	vifAotEmitKernels(buf, cap);
+	munmap(buf, cap);
+}
+#endif

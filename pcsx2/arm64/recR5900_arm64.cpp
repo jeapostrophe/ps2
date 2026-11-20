@@ -4928,7 +4928,7 @@ const char* aot::eeAbiText()
 // emitted from a changed word (its first ADDIU/ORI immediate one higher): the red receipt.
 void eeAotEmit()
 {
-	const u32 corrupt = aot::emitCorrupt();
+	const u32 corrupt = aot::emitCorrupt(aot::UnitEE);
 	bool corrupted = false;
 	for (const aot::Block& r : aot::emitRecords(aot::UnitEE))
 	{
