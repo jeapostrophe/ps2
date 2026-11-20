@@ -37,6 +37,8 @@ namespace aot
 		UnitEE = 0,
 		UnitIOP = 1,
 		UnitVU1 = 2,
+		UnitVIF = 3,       // the VIF unpack dynarec's routines (Vif_Dynarec_arm64.cpp)
+		UnitVIFUnpack = 4, // the VIF's 256 simple unpack kernels, nVifUpk (Vif_UnpackNEON.cpp)
 		UnitCount,
 	};
 
@@ -94,16 +96,17 @@ namespace aot
 	// The slot of what holds p: a region (static, or one whose start was set), else a value import
 	// whose value is p (off 0).
 	u32 slotOf(const void* p, u32* off);
-	// recR5900_arm64.cpp and recR3000A_arm64.cpp: the guest state each unit's code addresses off a
-	// base (the header's layout_hash covers both) and the text of what its code and this C++
-	// share (abi_hash, both).
+	// recR5900_arm64.cpp, recR3000A_arm64.cpp, aVU.cpp (microVU1) and Vif_Dynarec_arm64.cpp (both
+	// VIF units): the guest state each unit's code addresses off a base (the header's layout_hash
+	// covers all) and the text of what its code and this C++ share (abi_hash, all).
 	u64 eeLayoutHash();
 	const char* eeAbiText();
 	u64 iopLayoutHash();
 	const char* iopAbiText();
-	// aVU.cpp: the same for microVU1 (its x19/x27 bases, its settings and its stubs' ABI).
 	u64 vu1LayoutHash();
 	const char* vu1AbiText();
+	u64 vifLayoutHash();
+	const char* vifAbiText();
 	// An import whose VALUE is set at run time (a pointer the core maps, e.g. the EE's block LUT).
 	void setValueImport(const char* name, void* value);
 
@@ -119,6 +122,8 @@ namespace aot
 	void logBlock(const Block& b, const u8* code);
 	// Load: the image's blocks at a unit's pc, in image order.
 	const std::vector<const Block*>* imageBlocks(Unit u, u32 pc);
+	// Load: where the image's code starts (null while no image is open).
+	const u8* imageCodeBase();
 	// Load: every image block's fastmem site (absolute code address) and its stub, sorted.
 	struct Site { uintptr_t code, stub; u32 pc, block; }; // pc: the access's; block: its block's
 	const std::vector<Site>& imageSites();
@@ -127,6 +132,8 @@ namespace aot
 	void countInstall(Unit u);
 	// A fastmem fault a shaped block's access took (resumed at its stub).
 	void countFault(Unit u);
+	// An unpack that wraps VU memory, which runs on the kernels (or, with a mode, on the C table)
+	void countVifWrap(bool kernels);
 	// LRPS2_AOT_RED=hostaddr (the Mac's tooling): one EE helper's address is materialized into
 	// the code as the stock form does, so Emit's comparison must find every block that has it
 	// (the red receipt for "a shaped block holds no host address").
@@ -135,10 +142,14 @@ namespace aot
 	bool redIopHostAddr();
 	// LRPS2_AOT_RED=vu1hostaddr: the same for one microVU1 helper (mVU1clearlpStateJIT).
 	bool redVu1HostAddr();
+	// LRPS2_AOT_RED=vifhostaddr: the VIF's code reaches MaskRow, MaskCol and nVifMask at their
+	// addresses, as the stock form does (the VIF's red receipt).
+	bool redVifHostAddr();
 
 	// Emit: the unit's logged blocks, for its emitter to re-compile, and the unit's corrupt pc (a
-	// red receipt: that block is emitted from a changed word, its true words kept in the meta;
-	// LRPS2_AOT_CORRUPT=pc names an EE block, iop:pc an IOP one; 0 when none of this unit's).
+	// red receipt: that block is emitted otherwise than its record says, its true key kept in the
+	// meta; LRPS2_AOT_CORRUPT=pc names an EE block, iop:pc an IOP one, vif:pc a VIF routine and
+	// vifk:index a VIF kernel; 0 when none of this unit's).
 	const std::vector<Block>& emitRecords(Unit u);
 	u32 emitCorrupt(Unit u);
 	// LRPS2_AOT_CORRUPT_VU1=<pc>: every microVU1 record at that pc is emitted from a changed word.
@@ -165,15 +176,18 @@ namespace aot
 	inline void setValueImport(const char*, void*) {}
 	inline void logBlock(const Block&, const u8*) {}
 	inline const std::vector<const Block*>* imageBlocks(Unit, u32) { return nullptr; }
+	inline const u8* imageCodeBase() { return nullptr; }
 	struct Site { uintptr_t code, stub; u32 pc, block; };
 	inline const std::vector<Site>& imageSites() { static const std::vector<Site> none; return none; }
 	inline void miss(Unit, u32) {}
 	inline void countInstall(Unit) {}
 	inline void countFault(Unit) {}
+	inline void countVifWrap(bool) {}
 	inline bool redHostAddr() { return false; }
 	inline bool redIopHostAddr() { return false; }
 	inline bool redVu1HostAddr() { return false; }
 	inline bool emitCorruptVu1(u32*) { return false; }
+	inline bool redVifHostAddr() { return false; }
 	inline const std::vector<Block>& emitRecords(Unit) { static const std::vector<Block> none; return none; }
 	inline u32 emitCorrupt(Unit) { return 0; }
 	inline void emitted(const Block&, const u8*, u32, const std::vector<u32>&) {}
