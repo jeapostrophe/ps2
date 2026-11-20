@@ -864,7 +864,10 @@ void cdvdReset(void)
 	{
 		// CDVD internally uses GMT+9.  If you think the time's wrong, you're wrong.
 		// Set up your time zone and winter/summer in the BIOS.  No PS2 BIOS I know of features automatic DST.
-		const std::time_t utc_time = std::time(nullptr);
+		// retro-trainer lane hh37 (lane-only): LRPS2_RTC=<epoch> fixes the boot clock, so two
+		// replays started at different times boot the same.
+		const char* lane_rtc = getenv("LRPS2_RTC");
+		const std::time_t utc_time = lane_rtc && *lane_rtc ? (std::time_t)strtoll(lane_rtc, nullptr, 10) : std::time(nullptr);
 		const std::time_t gmt9_time = (utc_time + (60 * 60 * 9));
 		struct tm curtime = {};
 #ifdef _WIN32

@@ -362,11 +362,15 @@ static bool update_option_visibility(void)
 	return updated;
 }
 
+void LaneLockstepFrame();   // MTGS.cpp, lane hh37 (lane-only)
+void LaneLockstepRelease(bool on);
 static void cpu_thread_pause(void)
 {
 	VMManager::SetPaused(true);
+	LaneLockstepRelease(true);
 	while((VMState)retro_atomic_load_acquire_int(&cpu_thread_state) != VMState::Paused)
 		MTGS::MainLoop(true);
+	LaneLockstepRelease(false);
 }
 
 /* Counterpart to cpu_thread_pause().  Store the new state, then Post:
@@ -3001,6 +3005,7 @@ void retro_run(void)
 		update_av_info();
 
 	Input::Update();
+	LaneLockstepFrame();
 
 	if (!MTGS::IsOpen())
 		MTGS::TryOpenGS();

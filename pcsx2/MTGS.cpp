@@ -15,6 +15,7 @@
  */
 
 #include "Common.h"
+void LaneLockstepVsync();
 
 #include <cstring>
 #include <list>
@@ -181,6 +182,70 @@ void MTGS::PostVsyncStart()
 	// (Letting the EE run 1-2 frames ahead of the GS was tried and measured: no
 	// change in wall time, because the EE is not actually waiting here.)
 	WaitGS(false);
+	LaneLockstepVsync();
+}
+
+// retro-trainer lane hh37 (lane-only diagnostics, never shipped):
+// - LRPS2_LOCKSTEP=1: the EE waits at each vsync until the frontend's next retro_run has taken
+//   its input (LaneLockstepFrame), so the frontend's RAM read between two retro_runs and the
+//   guest's pad poll never race the EE;
+// - LRPS2_CPU_REPORT=N: every N vsyncs, the EE thread's CPU time on stderr.
+#include <mutex>
+#include <condition_variable>
+#include <mach/mach.h>
+static std::mutex s_ls_mutex;
+static std::condition_variable s_ls_cv;
+static u64 s_ls_fe, s_ls_ee;
+static bool s_ls_release;
+static int s_ls_on = -1;
+static long s_cpu_every = -1;
+static double LaneThreadCpu()
+{
+	thread_basic_info_data_t info;
+	mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+	mach_port_t t = mach_thread_self();
+	kern_return_t kr = thread_info(t, THREAD_BASIC_INFO, (thread_info_t)&info, &count);
+	mach_port_deallocate(mach_task_self(), t);
+	if (kr != KERN_SUCCESS)
+		return -1;
+	return info.user_time.seconds + info.user_time.microseconds / 1e6 + info.system_time.seconds + info.system_time.microseconds / 1e6;
+}
+void LaneLockstepVsync()
+{
+	if (s_cpu_every < 0)
+	{
+		const char* e = getenv("LRPS2_CPU_REPORT");
+		s_cpu_every = e ? atol(e) : 0;
+	}
+	if (s_ls_on < 0)
+	{
+		const char* e = getenv("LRPS2_LOCKSTEP");
+		s_ls_on = e && *e == '1';
+	}
+	std::unique_lock<std::mutex> lock(s_ls_mutex);
+	s_ls_ee++;
+	if (s_cpu_every > 0 && s_ls_ee % s_cpu_every == 0)
+		fprintf(stderr, "lrps2 lane: vsync %llu ee-thread cpu %.3f s\n", (unsigned long long)s_ls_ee, LaneThreadCpu());
+	if (!s_ls_on)
+		return;
+	s_ls_cv.wait(lock, [] { return s_ls_release || s_ls_fe >= s_ls_ee + 1; });
+}
+void LaneLockstepFrame()
+{
+	{
+		std::lock_guard<std::mutex> lock(s_ls_mutex);
+		s_ls_fe++;
+	}
+	s_ls_cv.notify_all();
+}
+// While the frontend pauses the EE (a reset, a state), no vsync waits: the EE must reach its pause.
+void LaneLockstepRelease(bool on)
+{
+	{
+		std::lock_guard<std::mutex> lock(s_ls_mutex);
+		s_ls_release = on;
+	}
+	s_ls_cv.notify_all();
 }
 
 void MTGS::InitAndReadFIFO(u8* mem, u32 qwc)

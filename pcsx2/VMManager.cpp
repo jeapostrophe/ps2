@@ -993,7 +993,13 @@ void VMManager::UpdateCPUImplementations()
 	// C.30-1: microVU0 runs VU0 micro programs natively (macro-mode COP2 is
 	// the EE rec's, emitted through microVU0's emitters whatever runs VU0's
 	// micro programs). Only with a code cache (mVUavailable).
-	if (EmuConfig.Cpu.Recompiler.EnableVU0 && !CHECK_VU_SOFT_REC(0) && mVUavailable(0))
+	// retro-trainer lane hh37 (lane-only): LRPS2_VU_INTERP=1 runs both VUs' micro programs on
+	// the interpreters (the stock EE rec's macro COP2 is unchanged), to measure their cost.
+	// (=vu0 or =vu1: that one alone)
+	const char* lane_vu = getenv("LRPS2_VU_INTERP");
+	const bool lane_vu0_interp = lane_vu && (!strcmp(lane_vu, "1") || !strcmp(lane_vu, "vu0"));
+	const bool lane_vu1_interp = lane_vu && (!strcmp(lane_vu, "1") || !strcmp(lane_vu, "vu1"));
+	if (EmuConfig.Cpu.Recompiler.EnableVU0 && !CHECK_VU_SOFT_REC(0) && mVUavailable(0) && !lane_vu0_interp)
 		CpuVU0 = &vucpu_rec_vu0;
 #endif
 
@@ -1006,7 +1012,7 @@ void VMManager::UpdateCPUImplementations()
 #else
 	// C.28-4: microVU1 (the armsx2 transplant, native VU codegen) is the VU1
 	// provider -- verified register-exact against the interpreter.
-	if (EmuConfig.Cpu.Recompiler.EnableVU1 && !CHECK_VU_SOFT_REC(1) && mVUavailable(1))
+	if (EmuConfig.Cpu.Recompiler.EnableVU1 && !CHECK_VU_SOFT_REC(1) && mVUavailable(1) && !lane_vu1_interp)
 	{
 		CpuVU1 = &vucpu_rec_vu1;
 		Console.WriteLn("arm64 VU1 rec: microVU1 (native codegen) is the default provider.");
