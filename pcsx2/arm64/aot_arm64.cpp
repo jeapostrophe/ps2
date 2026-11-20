@@ -8,7 +8,7 @@
 // - Shape (the Mac's tooling): the JIT, emitting AOT-shaped blocks (each recompiler, wherever it
 //   tests aot::shaped()). Such a block holds no host address: everything it calls or reads that
 //   is not reached off a guest-register base reaches it through the import table (the EE: x20,
-//   which the block's prologue takes from its argument); it chains to another block only through
+//   the IOP: x28, which the block's prologue takes from its argument); it chains to another block only through
 //   the block lookup table, whose base is an import; and nothing ever patches it (a fastmem fault
 //   resumes at the access's stub through PageFaultInfo::resume_pc). So its bytes are a function
 //   of its guest address, the guest words it was compiled from, its key flags and this build, and
@@ -53,6 +53,7 @@
 #endif
 
 void eeAotEmit(); // recR5900_arm64.cpp
+void iopAotEmit(); // recR3000A_arm64.cpp
 u32 eeAotFastmemMode();
 u32 eeAotFlags();
 
@@ -88,8 +89,9 @@ namespace aot
 		                  // neighbours are the game's, so another game is refused here)
 		u64 imports_hash; // fnv64 of the import table's names and region sizes, in order
 		u64 layout_hash;  // fnv64 of the guest-state members the code addresses off a base, by
-		                  // name, offset and size (LAYOUT)
-		u64 abi_hash;     // fnv64 of what the code and this core's C++ share (ABI_TEXT)
+		                  // name, offset and size (LAYOUT): of the units' hashes, EE then IOP
+		u64 abi_hash;     // fnv64 of what the code and this core's C++ share (ABI_TEXT): the
+		                  // units' texts, EE then IOP, and BlockAlign
 		u32 fastmem;      // the EE's fastmem mode at its first compile (shared readers: count_per_op)
 		u32 ee_flags;     // the settings EE code depends on, EE_FLAG_* (count_per_op_denom_pot)
 		u32 code_size;    // the bytes between rt_aot_code and rt_aot_code_end
@@ -108,7 +110,7 @@ namespace aot
 	{
 		Mode mode = Off;
 		std::string image, log;
-		u32 corrupt = 0;
+		u32 corrupt = 0, corruptUnit = UnitEE;
 		bool hasCoreUuid = false;
 		u8 coreUuid[16]{};
 	} cfg;
@@ -177,6 +179,12 @@ namespace aot
 		const char* log = getenv("LRPS2_AOT_LOG");
 		cfg.log = (env && *env && log) ? log : "";
 		const char* corrupt = getenv("LRPS2_AOT_CORRUPT");
+		cfg.corruptUnit = UnitEE;
+		if (env && *env && corrupt && !strncmp(corrupt, "iop:", 4))
+		{
+			cfg.corruptUnit = UnitIOP;
+			corrupt += 4;
+		}
 		cfg.corrupt = (env && *env && corrupt && *corrupt) ? (u32)strtoul(corrupt, nullptr, 16) : 0;
 		const char* uuid = getenv("LRPS2_AOT_CORE_UUID");
 		cfg.hasCoreUuid = env && *env && uuid && *uuid;
@@ -198,11 +206,11 @@ namespace aot
 		// Shape: the shaped recompilers and the vixl self-test that comes up with them; every other
 		// recompiler (and microVU0, which the AOT form never runs) on its interpreter, as on a device
 		if (cfg.mode == Shape)
-			return !strcmp(what, "EE") || !strcmp(what, "self-test");
+			return !strcmp(what, "EE") || !strcmp(what, "IOP") || !strcmp(what, "self-test");
 		return false;
 	}
 
-	bool unitShaped(Unit u) { return cfg.mode != Off && u == UnitEE; }
+	bool unitShaped(Unit u) { return cfg.mode != Off && (u == UnitEE || u == UnitIOP); }
 
 	/**** the import table ****/
 
@@ -225,7 +233,8 @@ namespace aot
 	{
 		if (!importList.empty())
 			return;
-		eeImports(addImport);
+		eeImports(addImport); // the slot order is fixed: the EE's, then the IOP's
+		iopImports(addImport);
 		for (u32 s = 0; s < importList.size(); s++)
 			if (importList[s].size)
 				regionsByStart.push_back(s);
@@ -348,9 +357,11 @@ namespace aot
 		if (!contentDigest(h.rom_md5))
 			missing |= HEADER_NO_DIGEST;
 		h.imports_hash = importsHash();
-		h.layout_hash = eeLayoutHash();
-		const char* abi = eeAbiText();
-		h.abi_hash = fnv(fnv(FNV_BASIS, abi, strlen(abi) + 1), &BlockAlign, sizeof BlockAlign);
+		const u64 layouts[2] = {eeLayoutHash(), iopLayoutHash()};
+		h.layout_hash = fnv(FNV_BASIS, layouts, sizeof layouts);
+		const char* ee = eeAbiText();
+		const char* iop = iopAbiText();
+		h.abi_hash = fnv(fnv(fnv(FNV_BASIS, ee, strlen(ee) + 1), iop, strlen(iop) + 1), &BlockAlign, sizeof BlockAlign);
 		h.fastmem = eeAotFastmemMode();
 		h.ee_flags = eeAotFlags();
 		h.code_size = codeSize;
@@ -674,6 +685,16 @@ namespace aot
 #endif
 	}
 
+	bool redIopHostAddr()
+	{
+#ifdef AOT_TOOLING
+		static const bool red = [] { const char* e = getenv("LRPS2_AOT_RED"); return e && !strcmp(e, "iophostaddr"); }();
+		return red;
+#else
+		return false;
+#endif
+	}
+
 	void miss(Unit u, u32 pc)
 	{
 		stats.misses[u]++;
@@ -693,12 +714,12 @@ namespace aot
 	static u32 emitBlocks;
 
 	const std::vector<Block>& emitRecords(Unit u) { return emitRecs[u]; }
-	u32 emitCorrupt() { return cfg.corrupt; }
+	u32 emitCorrupt(Unit u) { return u == cfg.corruptUnit ? cfg.corrupt : 0; }
 
 	void emitted(const Block& b, const u8* code, u32 len, const std::vector<u32>& sites)
 	{
 		const u64 h = fnv(FNV_BASIS, code, len);
-		const bool corrupt = cfg.corrupt != 0 && b.pc == cfg.corrupt;
+		const bool corrupt = cfg.corrupt != 0 && b.unit == cfg.corruptUnit && b.pc == cfg.corrupt;
 		if (!corrupt && (len != b.codeLen || h != b.hash || sites != b.sites))
 		{
 			if (stats.emitDiffers++ < 10)
@@ -806,9 +827,10 @@ namespace aot
 			v = std::move(uniq);
 		}
 		eeAotEmit();
+		iopAotEmit();
 		const int status = stats.emitDiffers ? 3 : stats.emitSkipped ? 4 : 0;
-		fprintf(stderr, "lrps2 AOT emit: %lu records, %zu EE blocks, %u emitted (%zu bytes of code), %lu skipped, %lu differ from the JIT's\n",
-			nrecs, emitRecs[UnitEE].size(), emitBlocks, emitCode.size(), stats.emitSkipped, stats.emitDiffers);
+		fprintf(stderr, "lrps2 AOT emit: %lu records, %zu EE blocks, %zu IOP blocks, %u emitted (%zu bytes of code), %lu skipped, %lu differ from the JIT's\n",
+			nrecs, emitRecs[UnitEE].size(), emitRecs[UnitIOP].size(), emitBlocks, emitCode.size(), stats.emitSkipped, stats.emitDiffers);
 		const std::string codePath = cfg.image + ".code", metaPath = cfg.image + ".meta";
 		unlink(codePath.c_str());
 		unlink(metaPath.c_str());
@@ -841,9 +863,11 @@ namespace aot
 	{
 		if (cfg.mode == Off)
 			return;
-		fprintf(stderr, "lrps2 AOT %s: EE %lu compiled, %lu installed, %lu missed, %lu fastmem faults resumed at a stub\n",
+		fprintf(stderr, "lrps2 AOT %s: EE %lu compiled, %lu installed, %lu missed, %lu fastmem faults resumed at a stub; "
+			"IOP %lu compiled, %lu installed, %lu missed\n",
 			cfg.mode == Shape ? "shape" : cfg.mode == Emit ? "emit" : cfg.mode == Load ? "load" : "interp",
-			stats.compiled[UnitEE], stats.installs[UnitEE], stats.misses[UnitEE], stats.faults[UnitEE]);
+			stats.compiled[UnitEE], stats.installs[UnitEE], stats.misses[UnitEE], stats.faults[UnitEE],
+			stats.compiled[UnitIOP], stats.installs[UnitIOP], stats.misses[UnitIOP]);
 		vmReport("end of run");
 		fflush(stderr);
 	}
