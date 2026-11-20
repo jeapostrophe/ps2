@@ -32,7 +32,7 @@ typedef void (*VifRoutine)(uptr dest, uptr src, const vifStruct* vif);
 // the stock form (and under LRPS2_AOT_RED=vifhostaddr, the red receipt)
 static a64::MemOperand vifMember(const u128* addr, size_t offset)
 {
-	if (aot::shaped() && !aot::redVifHostAddr())
+	if (aot::shaped() && !aot::red(aot::UnitVIF))
 		return a64::MemOperand(RXARG3, offset);
 	return armAbsMemOperand(RSCRATCHADDR, addr, sizeof(u128));
 }
@@ -556,9 +556,9 @@ _vifT __fi nVifBlock* dVifCompile(nVifBlock& block, bool isFill)
 	return &block;
 }
 
-// HH-37 Load and Interp: the image's routine for this key, put in the cache where dVifCompile
-// would have put the JIT's (its startOffset counts from the image's code). One the image lacks
-// stops a Load; in Interp it is null, and the C path runs the unpack.
+// HH-37 Load and Interp, with the image admitted: the image's routine for this key, put in the
+// cache where dVifCompile would have put the JIT's (its startOffset counts from the image's code).
+// One the image lacks stops a Load; in Interp it is null, and the C path runs the unpack.
 _vifT static nVifBlock* dVifInstall(nVifBlock& block, bool isFill)
 {
 	const u32 pc = (u32)idx << 16 | block.k.hash_key;
@@ -585,7 +585,7 @@ _vifT __fi void dVifUnpack(const u8* data, int isFill)
 	// The C reference path runs when the code region failed to map
 	// (pre-C.19 arm64 behaviour). HH-37: in Load and Interp the routines are the image's, counted
 	// from its code (none when it was refused).
-	const u8* const base = aot::imageOnly() ? aot::imageCodeBase() : s_vifCode[idx];
+	const u8* const base = aot::fromImage(aot::UnitVIF) ? aot::imageCodeBase() : s_vifCode[idx];
 	if (!base)
 	{
 		_nVifUnpack(idx, data, vifRegs.mode, isFill);
@@ -621,7 +621,7 @@ _vifT __fi void dVifUnpack(const u8* data, int isFill)
 	nVifBlock* b = vif_hash_find(&v.vifBlocks, hash_key, (u64)key0 | ((u64)key1 << 32));
 	if (unlikely(b == nullptr))
 	{
-		b = aot::imageOnly() ? dVifInstall<idx>(block, isFill) : dVifCompile<idx>(block, isFill);
+		b = aot::fromImage(aot::UnitVIF) ? dVifInstall<idx>(block, isFill) : dVifCompile<idx>(block, isFill);
 		if (!b)
 		{
 			_nVifUnpack(idx, data, vifRegs.mode, isFill);
@@ -660,12 +660,8 @@ void vifAotEmitKernels(u8* buf, size_t cap); // Vif_UnpackNEON.cpp
 // What VIF code addresses off x2, by offset and size: a layout that differs refuses the image.
 u64 aot::vifLayoutHash()
 {
-	u64 h = 1469598103934665603ULL;
-	const auto mix = [&h](const char* name, size_t off, size_t size) {
-		for (const char* c = name; *c; c++) { h ^= (u8)*c; h *= 1099511628211ULL; }
-		const u64 w[2] = {off, size};
-		for (size_t i = 0; i < sizeof w; i++) { h ^= ((const u8*)w)[i]; h *= 1099511628211ULL; }
-	};
+	u64 h = aot::FNV_BASIS;
+	const auto mix = [&h](const char* name, size_t off, size_t size) { h = aot::fnvMember(h, name, off, size); };
 	mix("vifStruct.MaskRow", offsetof(vifStruct, MaskRow), sizeof(vifStruct::MaskRow));
 	mix("vifStruct.MaskCol", offsetof(vifStruct, MaskCol), sizeof(vifStruct::MaskCol));
 	mix("nVifMask", sizeof(nVifMask), sizeof(nVifMask[0]));
@@ -678,20 +674,16 @@ const char* aot::vifAbiText()
 	       "each clobbers q0-q7, q29-q31, x4, x16, x17 and returns; x2 is the only base either reaches";
 }
 
+#ifdef AOT_TOOLING
 // Emit: re-compile each logged routine from its key into plain memory, then the kernels, and hand
 // each one's code to aot::emitted. LRPS2_AOT_CORRUPT=vif:pc emits that routine as a bare return
 // (the red receipt).
 void vifAotEmit()
 {
-	constexpr size_t cap = 1 << 20; // past any routine: the JIT leaves 256 KiB at its cache's end
-	u8* buf = static_cast<u8*>(mmap(nullptr, cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-	if (buf == MAP_FAILED)
-	{
-		for (const aot::Block& r : aot::emitRecords(aot::UnitVIF))
-			aot::emitFailed(r, "no memory to emit into");
-		return;
-	}
-	const u32 corrupt = aot::emitCorrupt(aot::UnitVIF);
+	constexpr size_t cap = aot::EMIT_BUFFER_BYTES; // past any routine: the JIT leaves 256 KiB at its cache's end
+	u8* const buf = aot::emitBuffer();
+	u32 corrupt;
+	const bool hasCorrupt = aot::emitCorrupt(aot::UnitVIF, &corrupt);
 	for (const aot::Block& r : aot::emitRecords(aot::UnitVIF))
 	{
 		const u32 idx = r.pc >> 16;
@@ -706,7 +698,7 @@ void vifAotEmit()
 		block.k.key1 = r.words[1];
 		armSetAsmPtr(buf, cap, nullptr);
 		u8* start = armStartBlock();
-		if (corrupt && r.pc == corrupt)
+		if (hasCorrupt && r.pc == corrupt)
 		{
 			armAsm->Ret();
 			fprintf(stderr, "lrps2 AOT emit: VIF routine %08x emitted as a bare return, on purpose\n", r.pc);
@@ -717,6 +709,6 @@ void vifAotEmit()
 		aot::emitted(r, start, len, {});
 	}
 	vifAotEmitKernels(buf, cap);
-	munmap(buf, cap);
 }
+#endif
 #endif

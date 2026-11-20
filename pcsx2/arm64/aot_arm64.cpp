@@ -7,18 +7,18 @@
 //
 // - Shape (the Mac's tooling): the JIT, emitting AOT-shaped blocks (each recompiler, wherever it
 //   tests aot::shaped()). Such a block holds no host address: everything it calls or reads that
-//   is not reached off a guest-register base reaches it through the import table (the EE: x20,
-//   the IOP: x28, which the block's prologue takes from its argument); it chains to another block only through
-//   the block lookup table, whose base is an import; and nothing ever patches it (a fastmem fault
+//   is not reached off a guest-register base reaches it through the import table, whose base the
+//   unit keeps in a register (aot_emit_arm64.h); it chains to another block only through the
+//   block lookup table, whose base is an import; and nothing ever patches it (a fastmem fault
 //   resumes at the access's stub through PageFaultInfo::resume_pc). So its bytes are a function
-//   of its guest address, the guest words it was compiled from, its key flags and this build, and
-//   it runs anywhere. Every compiled block is logged (logBlock). The VIF's code (its unpack
-//   routines and kernels) is shaped the same way with no import table: what it reaches besides its
-//   two pointer arguments it reaches off a third, x2 (Vif_Dynarec_arm64.cpp's vifAbiText). Only
-//   the shaped recompilers get a code cache (jitAllowed): the others, and microVU0 whatever the
-//   mode, run their interpreters, so a Shape run and an image's run differ in nothing but where
-//   the shaped code lives. The shaped recompilers are the EE's, the IOP's, microVU1's (aVU.cpp,
-//   "microVU1's AOT form") and the VIF's.
+//   of its guest address, the guest words it was compiled from, its key flags, the settings the
+//   header names and this build, and it runs anywhere. Every compiled block is logged
+//   (logBlock). The VIF's code (its unpack routines and kernels) is shaped the same way with no
+//   import table: what it reaches besides its two pointer arguments it reaches off a third, x2
+//   (Vif_Dynarec_arm64.cpp's vifAbiText). Only the shaped recompilers get a code cache
+//   (jitAllowed): the others, and microVU0 whatever the mode, run their interpreters, so a Shape
+//   run and an image's run differ in nothing but where the shaped code lives. The shaped
+//   recompilers are the EE's, the IOP's, microVU1's (aVU.cpp, "microVU1's AOT form") and the VIF's.
 // - Emit: re-compiles each distinct logged block from its logged words into plain memory, checks
 //   its code against the JIT's (length and fnv64: the two processes load the core at different
 //   slides, so a host address left in a block would differ), writes `image`.code and
@@ -26,12 +26,15 @@
 // - Load: no code cache; a block is installed from the image where the JIT would compile one,
 //   when the image holds a block for that address whose words guest memory holds now; a block
 //   the image lacks stops the process.
-// - Interp: Load, but a block the image lacks runs on its recompiler's C twin (the device's mode).
-//   microVU1 has no C twin yet: in Interp, VU1 runs on its interpreter (unitShaped).
+// - Interp: Load, but a block the image lacks runs on the EE's C twin, the IOP's interpreter or
+//   the VIF's C path (the device's mode); microVU1 has no C twin, so in Interp VU1 runs on its
+//   interpreter (unitShaped).
 //
 // admit(), from VMManager::UpdateCPUImplementations, opens the image in Load and Interp and
-// refuses one made for another core build or another game (checkHeader): the interpreters run
-// the game instead, and the frontend hears of it (takeReport).
+// refuses one made for another core build, another game or other settings (checkHeader): the
+// interpreters run the game instead, and the frontend hears of it (takeReport). The settings are
+// checked again whenever they change in the VM (recheck), as the game's fixes apply once the BIOS
+// has loaded its ELF, or an option changes.
 
 #include "arm64/aot_arm64.h"
 
@@ -40,27 +43,24 @@
 #include "CDVD/CDVD.h"
 
 #include <algorithm>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <mach-o/loader.h>
 #include <mutex>
-#include <TargetConditionals.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <unordered_map>
 
-#if !TARGET_OS_IPHONE
-// The Mac's tooling: Shape, Emit and the VM report. A device core carries Load and Interp alone.
-#define AOT_TOOLING
+#ifdef AOT_TOOLING
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #endif
 
-void eeAotEmit(); // recR5900_arm64.cpp
+// The units' parts (their files say what each does)
+void eeAotEmit();  // recR5900_arm64.cpp
 void iopAotEmit(); // recR3000A_arm64.cpp
 void vu1AotEmit(); // aVU.cpp
-void vifAotEmit(); // Vif_Dynarec_arm64.cpp
+void vifAotEmit(); // Vif_Dynarec_arm64.cpp: the routines, then the kernels
 // Vif_UnpackNEON.cpp: the kernels' part of admission and release (Shape logs them; Load and
 // Interp put the image's in nVifUpk, and take them out again when the image goes)
 void vifAotLogKernels();
@@ -71,10 +71,6 @@ u32 eeAotFlags();
 
 namespace aot
 {
-#define AOT_CHECK(cond, ...) do { if (!(cond)) { \
-		fprintf(stderr, "lrps2 AOT: "); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); \
-		fflush(stderr); _Exit(70); } } while (0)
-
 	/*
 	 * **The image format: this is its one home** (retro-trainer's cores/README.md, "AOT images",
 	 * says how an image is made, keyed and shipped). Its meta, little-endian, is this header (the
@@ -86,20 +82,22 @@ namespace aot
 	 * and its code is each block's at its code_off (BlockAlign apart). What `words` holds is the
 	 * unit's (the units that are not a guest CPU put their key in the same fields, with flags,
 	 * mask and sites 0):
-	 *   - UnitEE, UnitIOP: the guest words from pc on (at most 96); `native` of them are the block's.
+	 *   - UnitEE, UnitIOP: the guest words from pc on (at most GUEST_WORDS_MAX); `native` of them
+	 *     are the block's.
 	 *   - UnitVU1, a block: its incoming pipeline state (microRegInfo, native = VU1_STATE_WORDS =
 	 *     24 words), then the micro-memory words its compile read, as runs: a word
-	 *     (first index << 16 | count) and that many words (indices are of 32-bit micro words,
-	 *     below 4096). No mask, no sites.
+	 *     (first index << 16 | count, count > 0) and that many words (indices are of 32-bit micro
+	 *     words, below VU1_MICRO_WORDS). No mask, no sites.
 	 *   - UnitVU1 at VU1_STUB_PC (one record): the dispatchers and helper stubs every VU1 block
-	 *     calls or leaves through; `words` (native = nwords) are their entries' offsets in its code,
-	 *     in aVU.cpp's Vu1Stub order.
+	 *     calls or leaves through; `words` (native = nwords = VU1_STUB_ENTRIES) are their entries'
+	 *     offsets in its code, in aVU.cpp's Vu1Stub order.
 	 *   - UnitVIF, an unpack routine: pc = VIF index << 16 | nVifBlock hash_key (upkType << 8 | num),
 	 *     words = {key0 (the mask), key1 (mode | aligned << 8 | cl << 16 | wl << 24)}, native 0.
 	 *   - UnitVIFUnpack, a kernel: pc = its index in nVifUpk ((usn*32 + mask*16 + type) * 4 +
 	 *     cycle), no words; a Load stops at admission unless the image holds every kernel.
 	 * A load refuses an image unless each checked field is this core's (checkHeader names the
-	 * first that differs); layout_hash and abi_hash cover every unit's bases, settings and stubs.
+	 * first that differs), and unless every record is well formed (openImage names the first that
+	 * is not); layout_hash and abi_hash cover every unit's bases, settings and stubs.
 	 */
 	struct ImageHeader
 	{
@@ -111,14 +109,14 @@ namespace aot
 		                  // is told, LRPS2_AOT_CORE_UUID, or its own)
 		u8 emit_uuid[16]; // the LC_UUID of the build that emitted it: not checked here;
 		                  // retro-trainer's `cores.sh aot pin` requires the Mac build its lock pins
-		u8 rom_md5[16];   // the game: a 128-bit fnv of the disc's serial and its boot ELF's CRC (a
+		u8 rom_md5[16];   // the game: a 128-bit fnv of the disc's serial and its boot path (a
 		                  // block's words are checked where it is installed, but its timing and
 		                  // neighbours are the game's, so another game is refused here)
 		u64 imports_hash; // fnv64 of the import table's names and region sizes, in order
 		u64 layout_hash;  // fnv64 of the guest-state members the code addresses off a base, by
-		                  // name, offset and size (LAYOUT): of the units' hashes, EE, IOP, VU1, VIF
+		                  // name, offset and size (LAYOUT): of the units' hashes, in unit order
 		u64 abi_hash;     // fnv64 of what the code and this core's C++ share (ABI_TEXT): the
-		                  // units' texts, EE, IOP, VU1, VIF, and BlockAlign
+		                  // units' texts, in unit order, and BlockAlign
 		u32 fastmem;      // the EE's fastmem mode at its first compile (shared readers: count_per_op)
 		u32 ee_flags;     // the settings EE code depends on, EE_FLAG_* (count_per_op_denom_pot)
 		u32 code_size;    // the bytes between rt_aot_code and rt_aot_code_end
@@ -132,15 +130,44 @@ namespace aot
 	constexpr u32 BLOCK_FLAGS_KNOWN = 0; // no block flag is defined yet: every block's is 0
 	constexpr u32 VIF_KERNELS = 256;     // nVifUpk's entries
 
+	/**** the units ****/
+
+	// What the AOT form knows of each unit, in unit order (which is also the order of the import
+	// table's slots, of the header's layout and ABI hashes, and of Emit)
+	struct UnitInfo
+	{
+		const char* name;         // in messages
+		const char* cache[2];     // its code caches' names, as armJitMap is asked
+		const char* key;          // what an image block is found by, in a miss's message
+		const char* corrupt;      // LRPS2_AOT_CORRUPT's prefix for it
+		const char* red;          // LRPS2_AOT_RED's word for its red receipt
+		void (*imports)(ImportAdder); // its imports, or none
+		u64 (*layout)();          // its layout hash and ABI text, or none (another unit's cover it)
+		const char* (*abi)();
+	};
+	static const UnitInfo kUnits[UnitCount] = {
+		{"EE", {"EE", nullptr}, "the words guest memory holds there", "", "hostaddr", eeImports, eeLayoutHash, eeAbiText},
+		{"IOP", {"IOP", nullptr}, "the words guest memory holds there", "iop:", "iophostaddr", iopImports, iopLayoutHash, iopAbiText},
+		{"VU1", {"microVU1", nullptr}, "its pipeline state and the micro words memory holds", "vu1:", "vu1hostaddr", vu1Imports,
+			vu1LayoutHash, vu1AbiText},
+		{"VIF routines", {"VIF0", "VIF1"}, "the unpack's key", "vif:", "vifhostaddr", nullptr, vifLayoutHash, vifAbiText},
+		{"VIF kernels", {"VIF unpack", nullptr}, "the kernel's index", "vifk:", "vifhostaddr", nullptr, nullptr, nullptr},
+	};
+#ifdef AOT_TOOLING
+	static void (*const kEmitters[UnitCount])() = {eeAotEmit, iopAotEmit, vu1AotEmit, vifAotEmit, nullptr};
+#endif
+
 	/**** configuration ****/
+
+	Mode detail::mode = Off;
+	void** detail::imports = nullptr;
 
 	static struct
 	{
-		Mode mode = Off;
 		std::string image, log;
+		bool hasCorrupt = false;
 		u32 corrupt = 0, corruptUnit = UnitEE;
-		bool hasCorruptVu1 = false;
-		u32 corruptVu1 = 0;
+		u32 red = UnitCount + 1; // the unit word LRPS2_AOT_RED names (none: no unit's)
 		bool hasCoreUuid = false;
 		u8 coreUuid[16]{};
 	} cfg;
@@ -176,9 +203,10 @@ namespace aot
 	void configure(const char* option)
 	{
 		const char* env = getenv("LRPS2_AOT");
+		const bool fromEnv = env && *env;
 		Mode m = Off;
 		std::string image;
-		if (env && *env)
+		if (fromEnv)
 		{
 			if (!strcmp(env, "load"))
 				m = Load;
@@ -205,60 +233,80 @@ namespace aot
 		}
 		releaseImage();
 		admission = Unknown;
-		cfg.mode = m;
+		detail::mode = m;
 		cfg.image = image;
-		const char* log = getenv("LRPS2_AOT_LOG");
-		cfg.log = (env && *env && log) ? log : "";
-		const char* corrupt = getenv("LRPS2_AOT_CORRUPT");
-		cfg.corruptUnit = UnitEE;
-		if (env && *env && corrupt && !strncmp(corrupt, "iop:", 4))
+		cfg.hasCorrupt = false;
+		cfg.red = UnitCount + 1;
+		cfg.log.clear();
+		cfg.hasCoreUuid = false;
+#ifdef AOT_TOOLING
+		// The Mac's tooling reads the rest of the environment only when the environment chose the mode
+		if (fromEnv)
 		{
-			cfg.corruptUnit = UnitIOP;
-			corrupt += 4;
+			const char* log = getenv("LRPS2_AOT_LOG");
+			cfg.log = log ? log : "";
+			const char* corrupt = getenv("LRPS2_AOT_CORRUPT");
+			if (corrupt && *corrupt)
+			{
+				// the longest prefix that matches (the EE's is empty, so it matches last)
+				u32 unit = UnitCount;
+				size_t len = 0;
+				for (u32 u = 0; u < UnitCount; u++)
+					if (!strncmp(corrupt, kUnits[u].corrupt, strlen(kUnits[u].corrupt)) &&
+						(unit == UnitCount || strlen(kUnits[u].corrupt) > len))
+					{
+						unit = u;
+						len = strlen(kUnits[u].corrupt);
+					}
+				char* end;
+				cfg.corrupt = (u32)strtoul(corrupt + len, &end, 16);
+				AOT_CHECK(end != corrupt + len && !*end, "LRPS2_AOT_CORRUPT=%s is no [iop:|vu1:|vif:|vifk:]<hex>", corrupt);
+				cfg.corruptUnit = unit;
+				cfg.hasCorrupt = true;
+			}
+			const char* red = getenv("LRPS2_AOT_RED");
+			if (red && *red)
+			{
+				for (u32 u = 0; u < UnitCount; u++)
+					if (!strcmp(red, kUnits[u].red))
+						cfg.red = u;
+				AOT_CHECK(cfg.red < UnitCount, "LRPS2_AOT_RED=%s names no unit's red receipt", red);
+			}
+			const char* uuid = getenv("LRPS2_AOT_CORE_UUID");
+			cfg.hasCoreUuid = uuid && *uuid;
+			AOT_CHECK(!cfg.hasCoreUuid || parseHex16(uuid, cfg.coreUuid), "LRPS2_AOT_CORE_UUID=%s is not a uuid", uuid);
 		}
-		else if (env && *env && corrupt && !strncmp(corrupt, "vif:", 4))
-		{
-			cfg.corruptUnit = UnitVIF;
-			corrupt += 4;
-		}
-		else if (env && *env && corrupt && !strncmp(corrupt, "vifk:", 5))
-		{
-			cfg.corruptUnit = UnitVIFUnpack;
-			corrupt += 5;
-		}
-		cfg.corrupt = (env && *env && corrupt && *corrupt) ? (u32)strtoul(corrupt, nullptr, 16) : 0;
-		const char* corruptVu1 = getenv("LRPS2_AOT_CORRUPT_VU1");
-		cfg.hasCorruptVu1 = env && *env && corruptVu1 && *corruptVu1;
-		cfg.corruptVu1 = cfg.hasCorruptVu1 ? (u32)strtoul(corruptVu1, nullptr, 16) : 0;
-		const char* uuid = getenv("LRPS2_AOT_CORE_UUID");
-		cfg.hasCoreUuid = env && *env && uuid && *uuid;
-		AOT_CHECK(!cfg.hasCoreUuid || parseHex16(uuid, cfg.coreUuid), "LRPS2_AOT_CORE_UUID=%s is not a uuid", uuid);
+#endif
 		if (m != Off)
 		{
 			buildImports();
-			fprintf(stderr, "lrps2 AOT: mode %s%s%s\n", env && *env ? env : "interp (rt_aot_image)",
+			fprintf(stderr, "lrps2 AOT: mode %s%s%s\n", fromEnv ? env : "interp (rt_aot_image)",
 				cfg.image.empty() ? "" : ", image ", cfg.image.c_str());
 		}
 	}
 
-	Mode mode() { return cfg.mode; }
-
 	bool jitAllowed(const char* what)
 	{
-		if (cfg.mode == Off)
+		if (mode() == Off)
 			return true;
 		// Shape: the shaped recompilers and the vixl self-test that comes up with them; every other
 		// recompiler (and microVU0, which the AOT form never runs) on its interpreter, as on a device
-		if (cfg.mode == Shape)
-			return !strcmp(what, "EE") || !strcmp(what, "IOP") || !strcmp(what, "microVU1") || !strcmp(what, "VIF0") ||
-			       !strcmp(what, "VIF1") || !strcmp(what, "VIF unpack") || !strcmp(what, "self-test");
+		if (mode() != Shape)
+			return false;
+		if (!strcmp(what, "self-test"))
+			return true;
+		for (const UnitInfo& u : kUnits)
+			for (const char* c : u.cache)
+				if (c && !strcmp(what, c))
+					return true;
 		return false;
 	}
 
-	// The EE, the IOP and the VIF in every AOT mode (Interp misses to the EE's C twin, the IOP's
-	// interpreter and the VIF's C path); microVU1 in Shape, Emit and Load, and in Interp, which has
-	// no C twin for it to miss to, on its interpreter.
-	bool unitShaped(Unit u) { return cfg.mode != Off && (u != UnitVU1 || cfg.mode != Interp); }
+	bool red(Unit u)
+	{
+		// the VIF's two units share one receipt
+		return cfg.red < UnitCount && !strcmp(kUnits[cfg.red].red, kUnits[u].red);
+	}
 
 	/**** the import table ****/
 
@@ -284,9 +332,9 @@ namespace aot
 	{
 		if (!importList.empty())
 			return;
-		eeImports(addImport); // the slot order is fixed: the EE's, the IOP's, then microVU1's
-		iopImports(addImport);
-		vu1Imports(addImport);
+		for (const UnitInfo& u : kUnits) // the slot order is fixed: the units' in unit order
+			if (u.imports)
+				u.imports(addImport);
 		for (u32 s = 0; s < importList.size(); s++)
 			if (importList[s].dynamic)
 				dynamicRegions.push_back(s);
@@ -301,9 +349,8 @@ namespace aot
 		}
 		// an unsigned LDR's offset reaches 4095 slots
 		AOT_CHECK(importTable.size() <= 4096, "%zu imports, more than an LDR off one register reaches", importTable.size());
+		detail::imports = importTable.data(); // never reallocated again
 	}
-
-	void** imports() { return importTable.data(); }
 
 	// What p is, for the message of a block that reaches something no import holds
 	static std::string nameOf(const void* p)
@@ -342,23 +389,24 @@ namespace aot
 		return 0;
 	}
 
-	u32 slotOfValue(const char* name)
+	static u32 valueSlot(const char* name)
 	{
 		auto it = slotByName.find(name);
 		AOT_CHECK(it != slotByName.end() && (importList[it->second].size == 0 || importList[it->second].dynamic), "%s is no value import", name);
 		return it->second;
 	}
 
+	u32 slotOfValue(const char* name) { return valueSlot(name); }
+
 	void setValueImport(const char* name, void* value)
 	{
-		auto it = slotByName.find(name);
-		AOT_CHECK(it != slotByName.end() && (importList[it->second].size == 0 || importList[it->second].dynamic), "%s is no value import", name);
-		importTable[it->second] = value;
-		if (importList[it->second].dynamic)
-			importList[it->second].start = reinterpret_cast<uintptr_t>(value);
+		const u32 s = valueSlot(name);
+		importTable[s] = value;
+		if (importList[s].dynamic)
+			importList[s].start = reinterpret_cast<uintptr_t>(value);
 	}
 
-	static u64 fnv(u64 h, const void* p, size_t n)
+	u64 fnv(u64 h, const void* p, size_t n)
 	{
 		const u8* b = (const u8*)p;
 		while (n--)
@@ -368,7 +416,6 @@ namespace aot
 		}
 		return h;
 	}
-	constexpr u64 FNV_BASIS = 1469598103934665603ULL;
 
 	static u64 importsHash()
 	{
@@ -383,8 +430,6 @@ namespace aot
 	}
 
 	/**** the header ****/
-
-
 
 	static bool selfUuid(u8 out[16])
 	{
@@ -427,6 +472,7 @@ namespace aot
 
 	enum { HEADER_NO_UUID = 1, HEADER_NO_DIGEST = 2 };
 
+	// This core's header, with the settings in force now
 	static int makeHeader(ImageHeader& h, u32 nblocks, u32 codeSize, const u8* coreUuid)
 	{
 		memset(&h, 0, sizeof h);
@@ -439,14 +485,22 @@ namespace aot
 		if (!contentDigest(h.rom_md5))
 			missing |= HEADER_NO_DIGEST;
 		h.imports_hash = importsHash();
-		const u64 layouts[4] = {eeLayoutHash(), iopLayoutHash(), vu1LayoutHash(), vifLayoutHash()};
-		h.layout_hash = fnv(FNV_BASIS, layouts, sizeof layouts);
-		const char* ee = eeAbiText();
-		const char* iop = iopAbiText();
-		const char* vabi = vu1AbiText();
-		const char* vif = vifAbiText();
-		h.abi_hash = fnv(fnv(fnv(fnv(fnv(FNV_BASIS, ee, strlen(ee) + 1), iop, strlen(iop) + 1), vabi, strlen(vabi) + 1),
-		                     vif, strlen(vif) + 1), &BlockAlign, sizeof BlockAlign);
+		u64 layouts = FNV_BASIS, abi = FNV_BASIS;
+		for (const UnitInfo& u : kUnits)
+		{
+			if (u.layout)
+			{
+				const u64 l = u.layout();
+				layouts = fnv(layouts, &l, sizeof l);
+			}
+			if (u.abi)
+			{
+				const char* t = u.abi();
+				abi = fnv(abi, t, strlen(t) + 1);
+			}
+		}
+		h.layout_hash = layouts;
+		h.abi_hash = fnv(abi, &BlockAlign, sizeof BlockAlign);
 		h.fastmem = eeAotFastmemMode();
 		h.ee_flags = eeAotFlags();
 		h.code_size = codeSize;
@@ -461,8 +515,8 @@ namespace aot
 		return s;
 	}
 
-	// Why this core may not load an image with header h (the first field that differs, with both
-	// values); empty when it may.
+	// Why this core, with the settings in force now, may not load an image with header h (the
+	// first field that differs, with both values); empty when it may.
 	static std::string checkHeader(const ImageHeader& h)
 	{
 		ImageHeader w;
@@ -477,7 +531,7 @@ namespace aot
 			return "core_uuid: this core has no LC_UUID to match";
 		AOT_BYTES(core_uuid, "core")
 		if (missing & HEADER_NO_DIGEST)
-			return "rom_md5: this game has no serial or CRC to match";
+			return "rom_md5: this game has no serial or boot path to match";
 		AOT_BYTES(rom_md5, "the game whose digest is")
 		AOT_FIELD(import_count, "%u")
 		AOT_FIELD(imports_hash, "%016llx")
@@ -568,9 +622,11 @@ namespace aot
 #ifdef AOT_TOOLING
 	static FILE* logFile;
 	static std::string logPath;
+	// The settings line the next logged block is compiled under: this build's and game's header
+	// fields, which Emit refuses a log without (a log from another build, other settings or
+	// another game). A change of settings in the VM (recheck) writes a new one.
+	static std::string settingsLine;
 
-	// The log's first line: this build's and game's header fields, which Emit refuses a log
-	// without (a log from another build, other settings or another game)
 	static std::string buildLine()
 	{
 		ImageHeader h;
@@ -586,7 +642,7 @@ namespace aot
 	{
 		stats.compiled[b.unit]++;
 #ifdef AOT_TOOLING
-		if (cfg.mode != Shape || cfg.log.empty())
+		if (mode() != Shape || cfg.log.empty())
 			return;
 		if (logFile == nullptr || logPath != cfg.log)
 		{
@@ -595,7 +651,7 @@ namespace aot
 			logFile = fopen(cfg.log.c_str(), "w");
 			AOT_CHECK(logFile != nullptr, "cannot write %s", cfg.log.c_str());
 			logPath = cfg.log;
-			fputs(buildLine().c_str(), logFile);
+			fputs(settingsLine.c_str(), logFile);
 		}
 		fprintf(logFile, "B %u %08x %x %u %zu %u %016llx %x %x %x %zu", b.unit, b.pc, b.flags, b.native, b.words.size(),
 			b.codeLen, (unsigned long long)fnv(FNV_BASIS, code, b.codeLen), b.mask[0], b.mask[1], b.mask[2], b.sites.size() / 3);
@@ -614,6 +670,7 @@ namespace aot
 
 	static void* imageLib;
 	static const u8* imageCode;
+	static ImageHeader imageHeader;
 	static std::vector<Block> imageBlockList;
 	static std::unordered_map<u64, std::vector<const Block*>> imageIndex;
 	static std::vector<Site> imageSiteList;
@@ -636,13 +693,43 @@ namespace aot
 
 	static u64 indexKey(u32 unit, u32 pc) { return ((u64)unit << 32) | pc; }
 
+	// Why the block record b (the i-th, of nwords words at w) is no record of its unit; empty when it is
+	static std::string checkRecord(u32 i, const Block& b, u32 nwords, u32 nsites, const u32* w)
+	{
+		char k[200];
+		const bool vu1 = b.unit == UnitVU1, stub = vu1 && b.pc == VU1_STUB_PC;
+		const bool vif = b.unit == UnitVIF, kern = b.unit == UnitVIFUnpack;
+		if (vu1 && stub)
+		{
+			for (u32 e = 0; e < nwords; e++)
+				if (w[e] >= b.codeLen)
+				{
+					snprintf(k, sizeof k, "vu1_stubs: block %u's entry %u is at %u, past its %u bytes of code", i, e, w[e], b.codeLen);
+					return k;
+				}
+			return "";
+		}
+		if (vu1 && !vu1RunsValid(w + VU1_STATE_WORDS, nwords - VU1_STATE_WORDS))
+		{
+			snprintf(k, sizeof k, "vu1_runs: block %u (%08x) has a run of micro words past micro memory's %u or its own %u words",
+				i, b.pc, VU1_MICRO_WORDS, nwords);
+			return k;
+		}
+		if ((vif || kern) && (b.mask[0] || b.mask[1] || b.mask[2] || (vif ? (b.pc >> 16) > 1 : b.pc >= VIF_KERNELS)))
+		{
+			snprintf(k, sizeof k, "meta: block %u (unit %u, %08x) is no key of its unit (%u words)", i, b.unit, b.pc, nwords);
+			return k;
+		}
+		return "";
+	}
+
 	static std::string openImage(const std::string& path)
 	{
 		releaseImage();
 		std::string why;
 		const u8* codeEnd;
 		const u32 *meta, *metaEnd, *p;
-		ImageHeader h;
+		ImageHeader& h = imageHeader;
 		imageLib = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
 		if (imageLib == nullptr)
 		{
@@ -706,31 +793,30 @@ namespace aot
 				why = k;
 				goto refuse;
 			}
-			// each unit's payload (the format's comment): the EE's and the IOP's at most 96 guest
-			// words; microVU1's a state and at most every micro word with a run header each, or its
-			// stubs' entries; a VIF routine's two key words; a VIF kernel's none
-			const bool vu1 = b.unit == UnitVU1, stub = vu1 && b.pc == VU1_STUB_PC;
-			const bool vif = b.unit == UnitVIF, kern = b.unit == UnitVIFUnpack;
-			const u32 maxWords = vu1 ? (stub ? 64 : VU1_STATE_WORDS + 2 * 4096) : vif ? 2 : kern ? 0 : 96;
-			const bool shapeOk = vu1 ? (stub ? b.native == nwords : b.native == VU1_STATE_WORDS) && nsites == 0
-			                   : (vif || kern) ? nwords == maxWords && b.native == 0 && nsites == 0 : nwords > 0;
-			if (nwords > maxWords || b.native > nwords || !shapeOk || nsites > 256 || left < BlockWords + nwords + 3 * (size_t)nsites)
 			{
-				why = "meta: block " + std::to_string(i) + " has " + std::to_string(nwords) + " words or overruns the meta";
-				goto refuse;
-			}
-			if ((vif || kern) && (b.mask[0] || b.mask[1] || b.mask[2] || (vif ? (b.pc >> 16) > 1 : b.pc >= VIF_KERNELS)))
-			{
-				char k[160];
-				snprintf(k, sizeof k, "meta: block %u (unit %u, %08x) is no key of its unit (%u words)", i, b.unit, b.pc, nwords);
-				why = k;
-				goto refuse;
+				// each unit's payload (the format's comment): the EE's and the IOP's at most
+				// GUEST_WORDS_MAX guest words; microVU1's a state and at most every micro word with
+				// a run header each, or its stubs' entries; a VIF routine's two key words; a VIF
+				// kernel's none
+				const bool vu1 = b.unit == UnitVU1, stub = vu1 && b.pc == VU1_STUB_PC;
+				const bool vif = b.unit == UnitVIF, kern = b.unit == UnitVIFUnpack;
+				const u32 maxWords = vu1 ? (stub ? VU1_STUB_ENTRIES : VU1_STATE_WORDS + 2 * VU1_MICRO_WORDS) : vif ? 2 : kern ? 0 : GUEST_WORDS_MAX;
+				const bool shapeOk = vu1 ? (stub ? b.native == nwords && nwords == VU1_STUB_ENTRIES : b.native == VU1_STATE_WORDS) && nsites == 0
+				                         : (vif || kern) ? nwords == maxWords && b.native == 0 && nsites == 0 : nwords > 0;
+				if (nwords > maxWords || b.native > nwords || !shapeOk || nsites > 256 || left < BlockWords + nwords + 3 * (size_t)nsites)
+				{
+					why = "meta: block " + std::to_string(i) + " has " + std::to_string(nwords) + " words or overruns the meta";
+					goto refuse;
+				}
 			}
 			if (b.codeOff > h.code_size || b.codeLen > h.code_size - b.codeOff || (b.codeOff % BlockAlign))
 			{
 				why = "meta: block " + std::to_string(i) + " overruns the code";
 				goto refuse;
 			}
+			why = checkRecord(i, b, nwords, nsites, p + BlockWords);
+			if (!why.empty())
+				goto refuse;
 			b.words.assign(p + BlockWords, p + BlockWords + nwords);
 			b.sites.assign(p + BlockWords + nwords, p + BlockWords + nwords + 3 * nsites);
 			for (u32 s = 0; s < b.sites.size(); s++)
@@ -783,53 +869,12 @@ namespace aot
 		stats.vifWrapsOnKernels += kernels;
 	}
 
-	bool redHostAddr()
-	{
-#ifdef AOT_TOOLING
-		static const bool red = [] { const char* e = getenv("LRPS2_AOT_RED"); return e && !strcmp(e, "hostaddr"); }();
-		return red;
-#else
-		return false;
-#endif
-	}
-
-	bool redIopHostAddr()
-	{
-#ifdef AOT_TOOLING
-		static const bool red = [] { const char* e = getenv("LRPS2_AOT_RED"); return e && !strcmp(e, "iophostaddr"); }();
-		return red;
-#else
-		return false;
-#endif
-	}
-
-	bool redVu1HostAddr()
-	{
-#ifdef AOT_TOOLING
-		static const bool red = [] { const char* e = getenv("LRPS2_AOT_RED"); return e && !strcmp(e, "vu1hostaddr"); }();
-		return red;
-#else
-		return false;
-#endif
-	}
-
-	bool redVifHostAddr()
-	{
-#ifdef AOT_TOOLING
-		static const bool red = [] { const char* e = getenv("LRPS2_AOT_RED"); return e && !strcmp(e, "vifhostaddr"); }();
-		return red;
-#else
-		return false;
-#endif
-	}
-
 	void miss(Unit u, u32 pc)
 	{
 		stats.misses[u]++;
-		if (cfg.mode == Load)
+		if (mode() == Load)
 		{
-			fprintf(stderr, "lrps2 AOT load: unit %u has no image block at %08x for the %s: stopping\n", u, pc,
-				u == UnitEE ? "words guest memory holds there" : u == UnitVIF ? "unpack's key" : "kernel's index");
+			fprintf(stderr, "lrps2 AOT load: the image has no %s block at %08x for %s: stopping\n", kUnits[u].name, pc, kUnits[u].key);
 			fflush(stderr);
 			_Exit(5);
 		}
@@ -837,29 +882,44 @@ namespace aot
 
 	/**** Emit ****/
 
+	u8* emitBuffer()
+	{
+#ifdef AOT_TOOLING
+		static u8* buf;
+		if (!buf)
+		{
+			void* m = mmap(nullptr, EMIT_BUFFER_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			AOT_CHECK(m != MAP_FAILED, "no memory for Emit's %zu-byte buffer", EMIT_BUFFER_BYTES);
+			buf = static_cast<u8*>(m);
+		}
+		return buf;
+#else
+		return nullptr;
+#endif
+	}
+
+#ifdef AOT_TOOLING
 	static std::vector<Block> emitRecs[UnitCount];
 	static std::vector<u8> emitCode;
 	static std::vector<u32> emitMeta;
 	static u32 emitBlocks;
 
 	const std::vector<Block>& emitRecords(Unit u) { return emitRecs[u]; }
-	u32 emitCorrupt(Unit u) { return u == cfg.corruptUnit ? cfg.corrupt : 0; }
-	bool emitCorruptVu1(u32* pc)
+	bool emitCorrupt(Unit u, u32* pc)
 	{
-		*pc = cfg.corruptVu1;
-		return cfg.hasCorruptVu1;
+		*pc = cfg.corrupt;
+		return cfg.hasCorrupt && cfg.corruptUnit == u;
 	}
 
 	void emitted(const Block& b, const u8* code, u32 len, const std::vector<u32>& sites)
 	{
 		const u64 h = fnv(FNV_BASIS, code, len);
-		const bool corrupt = b.unit == UnitVU1 ? cfg.hasCorruptVu1 && b.pc == cfg.corruptVu1
-		                                       : cfg.corrupt != 0 && b.unit == cfg.corruptUnit && b.pc == cfg.corrupt;
+		const bool corrupt = cfg.hasCorrupt && b.unit == cfg.corruptUnit && b.pc == cfg.corrupt;
 		if (!corrupt && (len != b.codeLen || h != b.hash || sites != b.sites))
 		{
 			if (stats.emitDiffers++ < 10)
-				fprintf(stderr, "lrps2 AOT emit: unit %u %08x re-emits as %u bytes %016llx (%zu sites), the JIT ran %u bytes %016llx (%zu sites)\n",
-					b.unit, b.pc, len, (unsigned long long)h, sites.size() / 3, b.codeLen, (unsigned long long)b.hash, b.sites.size() / 3);
+				fprintf(stderr, "lrps2 AOT emit: %s %08x re-emits as %u bytes %016llx (%zu sites), the JIT ran %u bytes %016llx (%zu sites)\n",
+					kUnits[b.unit].name, b.pc, len, (unsigned long long)h, sites.size() / 3, b.codeLen, (unsigned long long)b.hash, b.sites.size() / 3);
 		}
 		emitCode.resize((emitCode.size() + BlockAlign - 1) & ~(size_t)(BlockAlign - 1));
 		const u32 off = (u32)emitCode.size();
@@ -875,10 +935,46 @@ namespace aot
 	void emitFailed(const Block& b, const char* why)
 	{
 		if (stats.emitSkipped++ < 10)
-			fprintf(stderr, "lrps2 AOT emit: unit %u %08x: %s\n", b.unit, b.pc, why);
+			fprintf(stderr, "lrps2 AOT emit: %s %08x: %s\n", kUnits[b.unit].name, b.pc, why);
 	}
 
-#ifdef AOT_TOOLING
+	void emitGuest(Unit u, CodeReader& reader, const Block& (*compile)(u32 pc))
+	{
+		u32 corrupt;
+		const bool hasCorrupt = emitCorrupt(u, &corrupt);
+		bool corrupted = false;
+		for (const Block& r : emitRecs[u])
+		{
+			Block src = r;
+			if (hasCorrupt && r.pc == corrupt && !corrupted)
+			{
+				for (u32 q = 0; q < src.native; q++)
+				{
+					const u32 op = src.words[q] >> 26;
+					if (op == 0x09 || op == 0x0d)
+					{
+						src.words[q] = (src.words[q] & 0xffff0000u) | ((src.words[q] + 1) & 0xffffu);
+						corrupted = true;
+						fprintf(stderr, "lrps2 AOT emit: %s %08x re-emitted with the word at %08x changed, on purpose\n", kUnits[u].name, r.pc, r.pc + q * 4);
+						break;
+					}
+				}
+			}
+			reader.rec = &src;
+			reader.oob = false;
+			const Block& b = compile(r.pc);
+			reader.rec = nullptr;
+			if (reader.oob)
+				emitFailed(r, "it reads a word beyond the ones the shape run logged");
+			else if (b.words.size() != r.words.size() || b.native != r.native)
+				emitFailed(r, "it compiles to another extent than the shape run's");
+			else
+				emitted(r, emitBuffer(), b.codeLen, b.sites);
+		}
+		if (hasCorrupt && !corrupted)
+			fprintf(stderr, "lrps2 AOT emit: LRPS2_AOT_CORRUPT=%s%08x names no logged %s block with an ADDIU or ORI\n", kUnits[u].corrupt, corrupt, kUnits[u].name);
+	}
+
 	static bool sameKey(const Block& a, const Block& b)
 	{
 		return a.unit == b.unit && a.pc == b.pc && a.flags == b.flags && a.native == b.native &&
@@ -888,27 +984,29 @@ namespace aot
 	// Read the shape log, emit every distinct block through its unit's emitter, write the image,
 	// and exit: 0 when it was written, 3 when a block re-emits otherwise than the JIT ran it (or
 	// the JIT compiled one block two ways), 4 when a block could not be emitted or the log is
-	// another build's; on 3 or 4 no image is left behind.
+	// another build's, game's or settings' (its settings changed during the shape run included:
+	// an image is for one settings line); on 3 or 4 no image is left behind.
 	[[noreturn]] static void emitAll()
 	{
 		AOT_CHECK(!cfg.log.empty() && !cfg.image.empty(), "emit needs LRPS2_AOT_LOG to read and LRPS2_AOT_IMAGE to write");
 		FILE* f = fopen(cfg.log.c_str(), "r");
 		AOT_CHECK(f != nullptr, "cannot read %s", cfg.log.c_str());
 		static char line[1 << 20]; // a microVU1 record reads up to 4096 words
-		bool buildOk = false;
-		unsigned long nrecs = 0;
+		const std::string mine = buildLine();
+		unsigned long nrecs = 0, lineNo = 0, settingsLines = 0;
 		while (fgets(line, sizeof line, f))
 		{
+			lineNo++;
 			if (line[0] == 'R')
 			{
-				const std::string mine = buildLine();
 				if (mine != line)
 				{
-					fprintf(stderr, "lrps2 AOT emit: the log's build line is %sthis build's is %s", line, mine.c_str());
+					fprintf(stderr, "lrps2 AOT emit: %s's settings line %lu (%s) is %sthis build's, with the settings in force now, is %s",
+						cfg.log.c_str(), lineNo, settingsLines ? "the shape run's settings changed there" : "its first", line, mine.c_str());
 					fclose(f);
 					_Exit(4);
 				}
-				buildOk = true;
+				settingsLines++;
 				continue;
 			}
 			Block b;
@@ -916,7 +1014,7 @@ namespace aot
 			size_t nw, ns;
 			int n;
 			AOT_CHECK(sscanf(line, "B %u %x %x %u %zu %u %llx %x %x %x %zu%n", &b.unit, &b.pc, &b.flags, &b.native, &nw, &b.codeLen,
-						  &hash, &b.mask[0], &b.mask[1], &b.mask[2], &ns, &n) == 11 && b.unit < UnitCount,
+			              &hash, &b.mask[0], &b.mask[1], &b.mask[2], &ns, &n) == 11 && b.unit < UnitCount,
 				"a bad record in %s: %.60s", cfg.log.c_str(), line);
 			b.hash = hash;
 			const char* s = line + n;
@@ -932,9 +1030,9 @@ namespace aot
 			nrecs++;
 		}
 		fclose(f);
-		if (!buildOk)
+		if (!settingsLines)
 		{
-			fprintf(stderr, "lrps2 AOT emit: %s has no build line\n", cfg.log.c_str());
+			fprintf(stderr, "lrps2 AOT emit: %s has no settings line\n", cfg.log.c_str());
 			_Exit(4);
 		}
 		for (u32 u = 0; u < UnitCount; u++)
@@ -954,22 +1052,22 @@ namespace aot
 				{
 					if (b.hash != uniq.back().hash || b.codeLen != uniq.back().codeLen || b.sites != uniq.back().sites)
 						if (stats.emitDiffers++ < 10)
-							fprintf(stderr, "lrps2 AOT emit: the JIT compiled unit %u %08x two ways\n", u, b.pc);
+							fprintf(stderr, "lrps2 AOT emit: the JIT compiled %s %08x two ways\n", kUnits[u].name, b.pc);
 					continue;
 				}
 				uniq.push_back(std::move(b));
 			}
 			v = std::move(uniq);
 		}
-		eeAotEmit();
-		iopAotEmit();
-		vu1AotEmit();
-		vifAotEmit();
+		for (u32 u = 0; u < UnitCount; u++)
+			if (kEmitters[u])
+				kEmitters[u]();
 		const int status = stats.emitDiffers ? 3 : stats.emitSkipped ? 4 : 0;
-		fprintf(stderr, "lrps2 AOT emit: %lu records, %zu EE blocks, %zu IOP blocks, %zu VU1 blocks (and stubs), %zu VIF routines, "
-			"%zu VIF kernels, %u emitted (%zu bytes of code), %lu skipped, %lu differ from the JIT's\n",
-			nrecs, emitRecs[UnitEE].size(), emitRecs[UnitIOP].size(), emitRecs[UnitVU1].size(), emitRecs[UnitVIF].size(),
-			emitRecs[UnitVIFUnpack].size(), emitBlocks, emitCode.size(), stats.emitSkipped, stats.emitDiffers);
+		std::string counts;
+		for (u32 u = 0; u < UnitCount; u++)
+			counts += ", " + std::to_string(emitRecs[u].size()) + " " + kUnits[u].name;
+		fprintf(stderr, "lrps2 AOT emit: %lu records%s; %u emitted (%zu bytes of code), %lu skipped, %lu differ from the JIT's\n",
+			nrecs, counts.c_str(), emitBlocks, emitCode.size(), stats.emitSkipped, stats.emitDiffers);
 		const std::string codePath = cfg.image + ".code", metaPath = cfg.image + ".meta";
 		unlink(codePath.c_str());
 		unlink(metaPath.c_str());
@@ -1000,18 +1098,18 @@ namespace aot
 
 	static void endOfRun()
 	{
-		if (cfg.mode == Off)
-			return;
-		fprintf(stderr, "lrps2 AOT %s: EE %lu compiled, %lu installed, %lu missed, %lu fastmem faults resumed at a stub; "
-			"IOP %lu compiled, %lu installed, %lu missed; VU1 %lu compiled, %lu installed, %lu missed; "
-			"VIF routines %lu compiled, %lu installed, %lu missed; VIF kernels %lu compiled, %lu installed, %lu missed; "
-			"%lu unpacks wrapped VU memory, %lu of them on the kernels\n",
-			cfg.mode == Shape ? "shape" : cfg.mode == Emit ? "emit" : cfg.mode == Load ? "load" : "interp",
-			stats.compiled[UnitEE], stats.installs[UnitEE], stats.misses[UnitEE], stats.faults[UnitEE],
-			stats.compiled[UnitIOP], stats.installs[UnitIOP], stats.misses[UnitIOP],
-			stats.compiled[UnitVU1], stats.installs[UnitVU1], stats.misses[UnitVU1],
-			stats.compiled[UnitVIF], stats.installs[UnitVIF], stats.misses[UnitVIF],
-			stats.compiled[UnitVIFUnpack], stats.installs[UnitVIFUnpack], stats.misses[UnitVIFUnpack],
+		static const char* const names[] = {"off", "shape", "emit", "load", "interp"};
+		std::string units;
+		for (u32 u = 0; u < UnitCount; u++)
+		{
+			char s[200];
+			snprintf(s, sizeof s, "%s%s %lu compiled, %lu installed, %lu missed", u ? "; " : "", kUnits[u].name, stats.compiled[u],
+				stats.installs[u], stats.misses[u]);
+			units += s;
+			if (u == UnitEE)
+				units += ", " + std::to_string(stats.faults[u]) + " fastmem faults resumed at a stub";
+		}
+		fprintf(stderr, "lrps2 AOT %s: %s; %lu unpacks wrapped VU memory, %lu of them on the kernels\n", names[mode()], units.c_str(),
 			stats.vifWraps, stats.vifWrapsOnKernels);
 		vmReport("end of run");
 		fflush(stderr);
@@ -1021,19 +1119,20 @@ namespace aot
 
 	bool admit()
 	{
+		if (mode() == Off)
+			return true;
+		if (admission != Unknown)
+			return admission == Admitted;
 		static bool atExit;
 		if (!atExit)
 		{
 			atexit(endOfRun);
 			atExit = true;
 		}
-		if (cfg.mode == Off)
-			return true;
-		if (admission != Unknown)
-			return admission == Admitted;
 		readContent();
 #ifdef AOT_TOOLING
-		if (cfg.mode == Emit)
+		settingsLine = buildLine();
+		if (mode() == Emit)
 			emitAll();
 #endif
 		if (!imageOnly())
@@ -1056,6 +1155,52 @@ namespace aot
 		vmReport("image loaded");
 		report(true, imagePath + ": " + std::to_string(imageBlockList.size()) + " blocks");
 		return true;
+	}
+
+	bool recheck()
+	{
+		if (mode() == Off || admission == Unknown)
+			return false;
+#ifdef AOT_TOOLING
+		if (mode() == Shape)
+		{
+			const std::string line = buildLine();
+			if (line != settingsLine)
+			{
+				settingsLine = line;
+				if (logFile)
+				{
+					fputs(line.c_str(), logFile);
+					fflush(logFile);
+				}
+				fprintf(stderr, "lrps2 AOT shape: the settings changed; later blocks are logged under %s", line.c_str());
+			}
+			return false;
+		}
+#endif
+		// Load and Interp: an image still open (one refused by its settings stays open, its code
+		// mapped: a block of it may be on the stack below this call) is checked again. Only its
+		// settings can have changed, so checkHeader's answer is about them.
+		if (!imageOnly() || imageLib == nullptr)
+			return false;
+		const std::string why = checkHeader(imageHeader);
+		if (admission == Admitted && !why.empty())
+		{
+			fprintf(stderr, "lrps2 AOT: refused %s once the settings changed: %s; the interpreters run instead\n", imagePath.c_str(), why.c_str());
+			admission = Refused;
+			vifAotDropKernels();
+			report(false, why);
+			return true;
+		}
+		if (admission == Refused && why.empty())
+		{
+			fprintf(stderr, "lrps2 AOT: admitted %s again: the settings match it once more\n", imagePath.c_str());
+			admission = Admitted;
+			vifAotInstallKernels();
+			report(true, imagePath + ": " + std::to_string(imageBlockList.size()) + " blocks");
+			return true;
+		}
+		return false;
 	}
 } // namespace aot
 

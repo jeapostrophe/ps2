@@ -549,7 +549,7 @@ bool mVUavailable(int vuIndex)
 {
 	// HH-37: an image's VU1 runs from its stubs and blocks, with no code cache
 	if (vuIndex && aot::imageOnly())
-		return aot::unitShaped(aot::UnitVU1) && aot::admitted() && aot::imageBlocks(aot::UnitVU1, aot::VU1_STUB_PC);
+		return aot::fromImage(aot::UnitVU1) && aot::imageBlocks(aot::UnitVU1, aot::VU1_STUB_PC);
 	return (vuIndex ? microVU1 : microVU0).cache != nullptr;
 }
 
@@ -1829,6 +1829,7 @@ static_assert(alignof(microBlock) == 16, "microBlock must stay 16-byte aligned")
 namespace
 {
 	enum Vu1Stub { StubStart, StubExit, StubStartXG, StubExitXG, StubExactMul, StubWaitMTVU, StubCopyPL, StubCompare, StubCount };
+	static_assert(StubCount == aot::VU1_STUB_ENTRIES, "the image format's stub record holds every Vu1Stub");
 	const char* const kVu1StubImport[StubCount] = {"vu1.start", "vu1.exit", "vu1.startXG", "vu1.exitXG", "vu1.exactMul",
 		"vu1.waitMTVU", "vu1.copyPLState", "vu1.compareState"};
 	u8** vu1StubField(microVU& mVU, int i)
@@ -1959,7 +1960,7 @@ static void vu1AotEmitLink(microVU& mVU, const microRegInfo& st, int pc)
 static std::vector<u32> vu1AotRuns(const u64* mask, const u32* micro)
 {
 	std::vector<u32> runs;
-	for (u32 i = 0; i < 4096;)
+	for (u32 i = 0; i < aot::VU1_MICRO_WORDS;)
 	{
 		if (!((mask[i >> 6] >> (i & 63)) & 1))
 		{
@@ -1967,7 +1968,7 @@ static std::vector<u32> vu1AotRuns(const u64* mask, const u32* micro)
 			continue;
 		}
 		u32 n = 0;
-		while (i + n < 4096 && ((mask[(i + n) >> 6] >> ((i + n) & 63)) & 1))
+		while (i + n < aot::VU1_MICRO_WORDS && ((mask[(i + n) >> 6] >> ((i + n) & 63)) & 1))
 			n++;
 		runs.push_back((i << 16) | n);
 		runs.insert(runs.end(), micro + i, micro + i + n);
@@ -2001,7 +2002,7 @@ static u8* vu1AotCompileBody(microVU& mVU, u32 pc, const microRegInfo& st, std::
 	mVU.prog.cur = s_vu1Prog;
 	std::memset(&mVU.prog.IRinfo, 0, sizeof(mVU.prog.IRinfo));
 	s_vu1Lits.clear();
-	u64 mask[4096 / 64] = {};
+	u64 mask[aot::VU1_MICRO_WORDS / 64] = {};
 	microRegInfo state;
 	std::memcpy(&state, &st, sizeof state);
 	mvuReadMask = mask;
@@ -2132,7 +2133,7 @@ static void vu1AotSetImports(microVU& mVU)
 	aot::setValueImport("vu1.Micro", mVU.regs().Micro);
 	for (int i = 0; i < StubCount; i++)
 		aot::setValueImport(kVu1StubImport[i], *vu1StubField(mVU, i));
-	armAotRedCall = aot::redVu1HostAddr() ? reinterpret_cast<const void*>(&mVU1clearlpStateJIT) : nullptr;
+	armAotRedCall = aot::red(aot::UnitVU1) ? reinterpret_cast<const void*>(&mVU1clearlpStateJIT) : nullptr;
 }
 
 // mVUreset's part in the AOT form: no blocks; the stubs compiled (Shape, logged) or the image's
@@ -2143,13 +2144,9 @@ static void vu1AotReset(microVU& mVU)
 	if (aot::imageOnly())
 	{
 		const std::vector<const aot::Block*>* v = aot::imageBlocks(aot::UnitVU1, aot::VU1_STUB_PC);
-		const aot::Block* b = v ? (*v)[0] : nullptr;
-		if (!b || b->words.size() != StubCount)
-		{
-			std::fprintf(stderr, "lrps2 AOT load: the image's VU1 stubs have %zu entries, this core %d: stopping\n", b ? b->words.size() : 0, (int)StubCount);
-			std::fflush(stderr);
-			std::_Exit(5);
-		}
+		const aot::Block* b = v ? (*v)[0] : nullptr; // mVUavailable chose VU1's recompiler only with one
+		AOT_CHECK(b && b->words.size() == StubCount, "the image's VU1 stub record has %zu entries, this core %d",
+			b ? b->words.size() : 0, (int)StubCount);
 		for (int i = 0; i < StubCount; i++)
 			*vu1StubField(mVU, i) = const_cast<u8*>(b->code) + b->words[i];
 		mVU.prog.codeStart = mVU.prog.codePtr = nullptr;
@@ -2168,25 +2165,25 @@ static void vu1AotReset(microVU& mVU)
 	vu1AotSetImports(mVU);
 }
 
+#ifdef AOT_TOOLING
 // Emit: re-compile every logged VU1 record from its words, into plain memory, at one offset past
 // the stubs (where nothing but the block's own words, state and this build decides its bytes).
-// LRPS2_AOT_CORRUPT_VU1 names a pc whose records are emitted from a changed word (the first upper
-// ADD made a SUB, or MUL an ADD): the red receipt for "the image's code is what runs".
+// LRPS2_AOT_CORRUPT=vu1:pc names a pc whose records are emitted from a changed word (the first
+// upper ADD made a SUB, or MUL an ADD): the red receipt for "the image's code is what runs".
 void vu1AotEmit()
 {
 	microVU& mVU = microVU1;
 	const std::vector<aot::Block>& recs = aot::emitRecords(aot::UnitVU1);
 	if (recs.empty())
 		return;
-	constexpr size_t kBuf = 8u << 20;
-	u8* const buf = static_cast<u8*>(mmap(nullptr, kBuf, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-	static u32 micro[4096];
+	constexpr size_t kBuf = aot::EMIT_BUFFER_BYTES;
+	u8* const buf = aot::emitBuffer();
+	static u32 micro[aot::VU1_MICRO_WORDS];
 	alignas(16) static u8 mem[0x4000];
 	u8* const savedMicro = mVU.regs().Micro;
 	u8* const savedMem = mVU.regs().Mem;
 	mVU.regs().Micro = reinterpret_cast<u8*>(micro);
 	mVU.regs().Mem = mem;
-	armAotDirect = true;
 
 	armSetAsmPtr(buf, kBuf, nullptr);
 	u8* const stubs = armStartBlock();
@@ -2197,7 +2194,7 @@ void vu1AotEmit()
 	const size_t blockOff = (stubLen + 4095) & ~size_t(4095);
 
 	u32 corruptPC;
-	const bool corrupt = aot::emitCorruptVu1(&corruptPC);
+	const bool corrupt = aot::emitCorrupt(aot::UnitVU1, &corruptPC);
 	unsigned long corrupted = 0;
 	for (const aot::Block& r : recs)
 	{
@@ -2214,25 +2211,22 @@ void vu1AotEmit()
 			aot::emitFailed(r, "a VU1 record without its state");
 			continue;
 		}
-		std::memset(micro, 0, sizeof micro);
-		bool ok = true;
-		for (size_t i = aot::VU1_STATE_WORDS; i < r.words.size() && ok;)
-		{
-			const u32 start = r.words[i] >> 16, count = r.words[i] & 0xffff;
-			ok = count && start + count <= 4096 && i + 1 + count <= r.words.size();
-			if (ok)
-				std::memcpy(micro + start, &r.words[i + 1], count * 4);
-			i += 1 + count;
-		}
-		if (!ok)
+		if (!aot::vu1RunsValid(r.words.data() + aot::VU1_STATE_WORDS, r.words.size() - aot::VU1_STATE_WORDS))
 		{
 			aot::emitFailed(r, "a VU1 record whose runs overrun micro memory or the record");
 			continue;
 		}
+		std::memset(micro, 0, sizeof micro);
+		for (size_t i = aot::VU1_STATE_WORDS; i < r.words.size();)
+		{
+			const u32 start = r.words[i] >> 16, count = r.words[i] & 0xffff;
+			std::memcpy(micro + start, &r.words[i + 1], count * 4);
+			i += 1 + count;
+		}
 		const bool corruptThis = corrupt && r.pc == corruptPC;
 		if (corruptThis)
 		{
-			for (u32 q = r.pc / 4 + 1; q < 4096; q += 2) // upper ops are the odd words
+			for (u32 q = r.pc / 4 + 1; q < aot::VU1_MICRO_WORDS; q += 2) // upper ops are the odd words
 			{
 				const u32 op = micro[q] & 0x3f;
 				if ((micro[q] & 0x7e000000u) == 0 && (op == 0x28 || op == 0x2a))
@@ -2258,11 +2252,10 @@ void vu1AotEmit()
 	}
 	if (corrupt)
 		std::fprintf(stderr, "lrps2 AOT emit: %lu VU1 records at %04x re-emitted from a changed word, on purpose\n", corrupted, corruptPC);
-	armAotDirect = false;
 	mVU.regs().Micro = savedMicro;
 	mVU.regs().Mem = savedMem;
-	munmap(buf, kBuf);
 }
+#endif
 
 #ifdef LRPS2_AOT_FORM
 // Everything a shaped microVU1 block or stub reaches that is not off x19 or x27, in slot order.
@@ -2296,12 +2289,8 @@ void aot::vu1Imports(ImportAdder add)
 // offset and size: a layout that differs refuses the image.
 u64 aot::vu1LayoutHash()
 {
-	u64 h = 1469598103934665603ULL;
-	const auto mix = [&h](const char* name, size_t off, size_t size) {
-		for (const char* c = name; *c; c++) { h ^= (u8)*c; h *= 1099511628211ULL; }
-		const u64 w[2] = {off, size};
-		for (size_t i = 0; i < sizeof w; i++) { h ^= ((const u8*)w)[i]; h *= 1099511628211ULL; }
-	};
+	u64 h = aot::FNV_BASIS;
+	const auto mix = [&h](const char* name, size_t off, size_t size) { h = aot::fnvMember(h, name, off, size); };
 	const VURegs& r = vuRegs[1];
 	const microVU& m = microVU1;
 #define AOT_R(f) mix("VURegs." #f, (uintptr_t)&r.f - (uintptr_t)&r, sizeof(r.f))

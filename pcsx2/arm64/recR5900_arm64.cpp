@@ -47,6 +47,7 @@
 
 #include "arm64/aR5900Analysis.h"
 #include "arm64/aot_arm64.h"
+#include "arm64/aot_emit_arm64.h"
 #include "VUmicro.h" // _vu0FinishMicro
 // vu0Sync() lives in VU0.cpp with no header declaration (the interpreter ops call
 // it from the same TU); the C.58 COP2 transfers need it by address.
@@ -202,58 +203,38 @@ namespace
 	const Register vmapbase = x28;
 
 	// ---- HH-37: the AOT form (aot_arm64.cpp says what it is) ----
-	// A shaped block (aot::shaped()) holds no host address. Its prologue takes the import table
-	// from its argument (x0) into x20, and every helper it calls and every datum it reaches
-	// that is not guest state off x19 is loaded from that table: EmitCall, EmitAddr, AbsMem.
-	// It chains to a successor only through the LUT, whose base is a value import, and its
-	// prologue is kChainEntryOffsetAot long. The JR target that the stock form keeps in x20
-	// across the delay slot lives in the frame's free slot, [sp, #88].
+	// A shaped block's prologue takes the import table from its argument (x0) into x20, and loads
+	// x19 and x28 from it; EmitCall, EmitAddr and AbsMem reach everything else through it
+	// (aot_emit_arm64.h). It chains only through the LUT, whose base is a value import, past a
+	// prologue kChainEntryOffsetAot long. The JR target that the stock form keeps in x20 across
+	// the delay slot lives in the frame's free slot, [sp, #88].
 	const Register importsReg = x20;
 	constexpr u32 kJrSlot = 88;
 	// Sub + 5*Stp + Str (as stock), then mov x20, x0; ldr x19, [x20, #GPR]; ldr x28, [x20,
 	// #fastmem/vmap base]; ldr x28, [x28].
 	constexpr u32 kChainEntryOffsetAot = (1 + 5 + 1 + 1 + 1 + 2) * 4;
-	inline bool Aot() { return aot::shaped(); }
-	inline u32 ChainEntryOffset() { return Aot() ? kChainEntryOffsetAot : kChainEntryOffset; }
+	inline u32 ChainEntryOffset() { return aot::shaped() ? kChainEntryOffsetAot : kChainEntryOffset; }
 	u128 s_lqc2_sink; // LQC2 with ft == 0: the read happens, the value doesn't land
 
-	// The import slot's byte offset off x20 of the import that holds p, and p's offset in it
-	inline u32 ImportOff(const void* p, u32* off)
-	{
-		return aot::slotOf(p, off) * 8;
-	}
 	inline void EmitCall(MacroAssembler& m, uint64_t fn)
 	{
-		if (Aot())
-		{
-			u32 off;
-			const u32 slot = ImportOff(reinterpret_cast<const void*>(fn), &off);
-			pxAssert(off == 0);
-			m.Ldr(x16, MemOperand(importsReg, slot));
-		}
-		else
-			m.Mov(x16, fn);
+#ifdef LRPS2_AOT_FORM
+		if (aot::shaped())
+			return aot::emitBranch(m, importsReg, x16, reinterpret_cast<const void*>(fn), true);
+#endif
+		m.Mov(x16, fn);
 		m.Blr(x16);
 	}
 	inline void EmitAddr(MacroAssembler& m, const Register& r, uint64_t p)
 	{
-		if (!Aot())
-		{
-			m.Mov(r, p);
-			return;
-		}
-		u32 off;
-		const u32 slot = ImportOff(reinterpret_cast<const void*>(p), &off);
-		m.Ldr(r, MemOperand(importsReg, slot));
-		if (off)
-			m.Add(r, r, off);
+#ifdef LRPS2_AOT_FORM
+		if (aot::shaped())
+			return aot::emitAddr(m, importsReg, r, reinterpret_cast<const void*>(p));
+#endif
+		m.Mov(r, p);
 	}
 	// The LUT base, a value import (set when the reserve maps it)
 	constexpr const char* kLutImport = "ee.lut";
-	inline void EmitLutBase(MacroAssembler& m, const Register& r)
-	{
-		m.Ldr(r, MemOperand(importsReg, aot::slotOfValue(kLutImport) * 8));
-	}
 
 	inline u32  Norm(u32 a)  { return a & 0x1fffffff; }
 	inline bool InRam(u32 np) { return np < kRamBytes; }
@@ -358,39 +339,9 @@ namespace
 	// Guest pc of the op being emitted (compilation is EE-thread-only, like s_rc).
 	u32 s_emit_pc = 0;
 
-	// ---- HH-37: what a block was compiled from ----
-	// Every guest word CompileBlock reads goes through ReadCode, which records it: the words from
-	// the block's pc up to the last one read are its key (aot::Block::words), whatever decided its
-	// extent. In Emit the record being re-compiled stands in for guest memory, and a read outside
-	// its words fails the record rather than read memory the shape run's block never saw.
-	u32 s_read_pc = 0;
-	std::vector<u32> s_read_words;
-	const aot::Block* s_emit_rec = nullptr;
-	bool s_emit_oob = false;
-	u32 ReadCode(u32 a)
-	{
-		const u32 idx = (a - s_read_pc) >> 2;
-		u32 w;
-		if (s_emit_rec)
-		{
-			if (a < s_read_pc || idx >= s_emit_rec->words.size())
-			{
-				s_emit_oob = true;
-				return 0;
-			}
-			w = s_emit_rec->words[idx];
-		}
-		else
-			w = memRead32(a);
-		if (aot::shaped())
-		{
-			pxAssert(a >= s_read_pc && (a & 3) == 0);
-			if (idx >= s_read_words.size())
-				s_read_words.resize(idx + 1, 0);
-			s_read_words[idx] = w;
-		}
-		return w;
-	}
+	// HH-37: what a block was compiled from (aot::CodeReader): every guest word CompileBlock reads
+	aot::CodeReader s_reader;
+	inline u32 ReadCode(u32 a) { return s_reader.read(a, aot::shaped(), [](u32 x) { return memRead32(x); }); }
 
 	// Latched once: x28 holds the fastmem base in this mode, the vmap base
 	// otherwise, and every block's prologue must agree with every other block's
@@ -2404,16 +2355,10 @@ namespace
 	// encode or the page offset is not size-aligned.
 	MemOperand AbsMem(MacroAssembler& m, const Register& scratch, const void* addr, unsigned size)
 	{
-		if (Aot())
-		{
-			u32 off;
-			const u32 slot = ImportOff(addr, &off);
-			m.Ldr(scratch, MemOperand(importsReg, slot));
-			if (size && (off % size) == 0 && off / size < 4096)
-				return MemOperand(scratch, off);
-			m.Add(scratch, scratch, off);
-			return MemOperand(scratch);
-		}
+#ifdef LRPS2_AOT_FORM
+		if (aot::shaped())
+			return aot::absMem(m, importsReg, scratch, addr, size);
+#endif
 		const uintptr_t cur = reinterpret_cast<uintptr_t>(s_block_exec) + m.GetBuffer()->GetCursorOffset();
 		const s64 page_disp = (static_cast<s64>(reinterpret_cast<uintptr_t>(addr) & ~uintptr_t(0xFFF)) -
 		                       static_cast<s64>(cur & ~uintptr_t(0xFFF))) >> 12;
@@ -3453,7 +3398,7 @@ namespace {
 				if (rs == 0x08) return false; // BC2F/T(L) -> EmitBranch
 				// C.30-2: SPECIAL1/2 ALU ops emit natively via the microVU0
 				// single-op emitters.
-				if (rs >= 0x10 && !Aot() && EmitCop2Macro(m, gpr, insn)) // AOT: VU0 is interpreted
+				if (rs >= 0x10 && !aot::shaped() && EmitCop2Macro(m, gpr, insn)) // AOT: VU0 is interpreted
 					return true;
 				// C.58: the COP2 transfers (QMFC2/CFC2/QMTC2/CTC2) are register
 				// moves once the VU0 syncs are out of the way -- no reason to pay
@@ -3632,8 +3577,8 @@ namespace {
 		m.Ldr(w1, RegsField(&cpuRegs.pc));      // pc (may have been redirected by the event test)
 		m.Tst(w1, 0x1e000000);                  // outside the 32 MB RAM window?
 		m.B(s_blk_ret, ne);                     // -> return to the dispatcher
-		if (Aot())
-			EmitLutBase(m, x0);
+		if (aot::shaped())
+			aot::emitValue(m, importsReg, x0, kLutImport);
 		else
 			m.Mov(x0, reinterpret_cast<uint64_t>(s_lut)); // the LUT base itself, materialized
 		m.Ubfx(w2, w1, 2, 23);                  // idx = (pc & 0x01ffffff) >> 2
@@ -3698,9 +3643,9 @@ namespace {
 			s_exit_pending.push_back({slow, evt});
 		}
 		// Not due (or no test at all): pc == target_pc, guaranteed.
-		if (Aot())
+		if (aot::shaped())
 		{
-			EmitLutBase(m, x3);
+			aot::emitValue(m, importsReg, x3, kLutImport);
 			m.Mov(x4, (np >> 2) * 8);
 			m.Ldr(x3, MemOperand(x3, x4));
 		}
@@ -3829,8 +3774,8 @@ namespace {
 	void EmitTailCycles(MacroAssembler& m, int cyc, bool with_update)
 	{
 		const uint64_t upd = reinterpret_cast<uint64_t>(&eeUpdateCycles_arm64);
-		if (aot::redHostAddr())
-			m.Mov(x10, reinterpret_cast<uint64_t>(&cpuBlockCycles)); // the red receipt (aot_arm64.h)
+		if (aot::red(aot::UnitEE))
+			m.Mov(x10, reinterpret_cast<uint64_t>(&cpuBlockCycles)); // the red receipt (aot::red)
 		else
 			EmitAddr(m, x10, reinterpret_cast<uint64_t>(&cpuBlockCycles)); // once, for both halves
 		m.Ldr(w1, RegsField(&cpuRegs.CP0.n.Config));
@@ -4031,7 +3976,7 @@ namespace {
 		// Kernel return addresses (0x8xxxxxxx) otherwise get 0xffffffff upper
 		// halves that the interpreter path never produces.
 		if (link > 0) { m.Mov(w0, bpc + 8); StoreGpr(m, x0, gpr, (u32)link); }
-		if (is_jr && Aot()) { LoadGpr(m, x0, gpr, rs); m.Str(w0, MemOperand(sp, kJrSlot)); }
+		if (is_jr && aot::shaped()) { LoadGpr(m, x0, gpr, rs); m.Str(w0, MemOperand(sp, kJrSlot)); }
 		else if (is_jr) LoadGpr(m, x20, gpr, rs);
 
 		if (uncond)
@@ -4039,7 +3984,7 @@ namespace {
 			s_emit_pc = bpc + 4; // delay slot
 			Cop2RunInvalidate(); s_emit_budget = 1; // C.66
 			EmitSimple(m, gpr, ds);
-			if (is_jr && Aot()) { m.Ldr(w0, MemOperand(sp, kJrSlot)); StorePC(m, w0); }
+			if (is_jr && aot::shaped()) { m.Ldr(w0, MemOperand(sp, kJrSlot)); StorePC(m, w0); }
 			else if (is_jr) StorePC(m, w20);
 			else StorePCImm(m, tconst);
 			s_rc.FlushDirty(m, gpr); // block exit: the next block reads GPR memory
@@ -4554,50 +4499,6 @@ namespace {
 		}
 	}
 
-	// EmitSimple's verdict: whether it emits insn (it emits nothing otherwise)
-	bool TwinSimpleOk(u32 insn)
-	{
-		const u32 op = insn >> 26, rs = (insn >> 21) & 31, rt = (insn >> 16) & 31, funct = insn & 0x3f;
-		switch (op)
-		{
-			case 0x00:
-				switch (funct)
-				{
-					case 0x00: case 0x02: case 0x03: case 0x04: case 0x06: case 0x07:
-					case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27:
-					case 0x2a: case 0x2b: case 0x2c: case 0x2d: case 0x2e: case 0x2f:
-					case 0x14: case 0x16: case 0x17: case 0x38: case 0x3a: case 0x3b: case 0x3c: case 0x3e: case 0x3f:
-					case 0x10: case 0x11: case 0x12: case 0x13: case 0x18: case 0x19: case 0x1a: case 0x1b:
-					case 0x0f: case 0x28: case 0x29: case 0x0a: case 0x0b:
-						return true;
-				}
-				return false;
-			case 0x08: case 0x09: case 0x18: case 0x19: case 0x0a: case 0x0b: case 0x0c: case 0x0d: case 0x0e: case 0x0f:
-				return true;
-			case 0x01: return rt == 0x18 || rt == 0x19;
-			case 0x20: case 0x24: case 0x21: case 0x25: case 0x23: case 0x27: case 0x37:
-			case 0x22: case 0x26: case 0x1a: case 0x1b: case 0x2a: case 0x2e: case 0x2c: case 0x2d:
-			case 0x28: case 0x29: case 0x2b: case 0x3f: case 0x33: case 0x1f:
-				return true;
-			case 0x1e: return rt != 0;
-			case 0x11: return Cop1RegSupported(insn);
-			case 0x1c:
-				switch (funct)
-				{
-					case 0x10: case 0x11: case 0x12: case 0x13: case 0x18: case 0x19: case 0x1a: case 0x1b:
-					case 0x00: case 0x01: case 0x20: case 0x21: case 0x04:
-						return true;
-				}
-				return MmiSupported(insn) || MmiHiLoAction(insn) || MmiDivAction(insn) || MmiPermAction(insn) ||
-				       MmiMulAction(insn) || MmiMaccAction(insn) || MmiHmaccAction(insn) || IsPcpyh(insn) || IsQfsrv(insn);
-			case 0x12: return rs != 0x08;
-			case 0x2f: return true;
-			case 0x10: return rs == 0x00 || rs == 0x04 || (rs == 0x10 && (funct == 0x38 || funct == 0x39));
-			case 0x31: case 0x39: case 0x36: case 0x3e: return true;
-		}
-		return false;
-	}
-
 	// The misalign cancel (EmitMisalignGuard's stub): pc still the block's, its cycles not yet
 	// accounted, every GPR write so far in memory -- as the stub leaves them.
 	inline void TwMisalign(u32 addr, u32 amask)
@@ -4606,7 +4507,7 @@ namespace {
 			eeCancelInstruction_arm64(); // never returns
 	}
 
-	// EmitSimple (TwinSimpleOk(insn))
+	// EmitSimple (IsTranslatable(insn): its verdict on whether EmitSimple emits insn)
 	void TwinSimple(u32 insn)
 	{
 		const u32 op = insn >> 26;
@@ -4900,7 +4801,7 @@ namespace {
 					continue;
 				}
 			}
-			if (TwinSimpleOk(insn))
+			if (IsTranslatable(insn))
 			{
 				t.steps.push_back({insn, 0, false});
 				cyc += OpCycles(insn); p += 4; n++;
@@ -4927,6 +4828,7 @@ namespace {
 	}
 
 	u32 s_twin_red = 0; // LRPS2_TWIN_RED=N: N raw cycles too many on every twin block (the red receipt)
+	int s_twin_selftest = 0; // LRPS2_TWIN_SELFTEST=N: TwinSelfTest's block count
 	// EmitCycleBookkeeping: cpuBlockCycles += cyc * (2 - Config[18]), Config read at the tail
 	inline void TwBook(int cyc)
 	{
@@ -5104,25 +5006,42 @@ namespace {
 	// HH-37 Emit: whether the record being re-compiled kept guest_pc's access off fastmem
 	bool EmitMaskedOff(u32 guest_pc)
 	{
-		const u32 i = (guest_pc - s_emit_rec->pc) >> 2;
-		return i < 96 && ((s_emit_rec->mask[i >> 5] >> (i & 31)) & 1);
+		const u32 i = (guest_pc - s_reader.rec->pc) >> 2;
+		return i < aot::GUEST_WORDS_MAX && ((s_reader.rec->mask[i >> 5] >> (i & 31)) & 1);
 	}
 
-	BlockFn CompileBlock(u32 pc)
+	// The no-fastmem mask of a block at pc of n key words, as the faults so far make it (HH-37)
+	inline void FaultMask(u32 mask[3], u32 pc, size_t n)
 	{
-		s_read_pc = pc;
-		s_read_words.clear();
-		if (s_emit_rec)
-			s_code_pos = 0; // HH-37 Emit: each record alone, at the start of a plain buffer
-		else if (s_code_pos + 8192 > kCodeCacheSize)
+		aot::faultMask(mask, pc, FastmemMode() ? n : 0, [](u32 a) { return !FastmemOk(a); });
+	}
+
+	// The code cache's wrap: everything compiled goes, as the cache rewinds. HH-37: Load installs
+	// an image's block where the JIT would compile it and counts its code bytes alike
+	// (InstallBlock), so it wraps where its Shape run did; Interp does not (a miss runs on the twin,
+	// which adds no code), so there the wraps fall elsewhere. Interp's twins go with the pages
+	// that record them.
+	void WrapIfFull()
+	{
+		if (s_code_pos + 8192 > kCodeCacheSize)
 		{
 			s_blocks.clear();
+			s_twins.clear();
 			s_page.clear();
 			LutClearAll();
 			s_code_pos = 0;
 			s_fm_sites.clear(); // C.50: the code they point at gets overwritten
 			s_fm_pending.clear();
 		}
+	}
+
+	BlockFn CompileBlock(u32 pc)
+	{
+		s_reader.start(pc);
+		if (s_reader.rec)
+			s_code_pos = 0; // HH-37 Emit: each record alone, at the start of a plain buffer
+		else
+			WrapIfFull();
 
 		u8* start = s_code + s_code_pos;
 		// C.60: decided before emission (the entry check is part of the code we are
@@ -5151,7 +5070,7 @@ namespace {
 		// Written through the write alias, run at `start`: `start` is what is
 		// flushed, recorded in s_fm_sites and published as the BlockFn.
 		s_block_exec = start;
-		MacroAssembler masm(s_emit_rec ? start : armJitRW(start), kCodeCacheSize - s_code_pos, PositionDependentCode);
+		MacroAssembler masm(s_reader.rec ? start : armJitRW(start), kCodeCacheSize - s_code_pos, PositionDependentCode);
 		// The aVU macro emitters (C.30-2) hold RSCRATCHADDR (x17) and q31 across
 		// vixl macro expansions -- keep the assembler from synthesizing into them
 		// (mirrors armStartBlock in AsmHelpers.cpp).
@@ -5171,13 +5090,13 @@ namespace {
 		masm.Stp(x24, x25, MemOperand(sp, 48));
 		masm.Stp(x26, x27, MemOperand(sp, 64));
 		masm.Str(x28, MemOperand(sp, 80));
-		if (Aot())
+		if (aot::shaped())
 		{
 			// HH-37: x20 = the import table (the block's argument); x19 and x28 from it.
 			u32 goff, voff;
-			const u32 gslot = ImportOff(&cpuRegs.GPR.r[0], &goff);
-			const u32 vslot = ImportOff(FastmemMode() ? (const void*)&vtlbdata.fastmem_base : (const void*)&vtlbdata.vmap, &voff);
-			pxAssert(goff == 0 && voff == 0);
+			const u32 gslot = aot::slotOf(&cpuRegs.GPR.r[0], &goff) * 8;
+			const u32 vslot = aot::slotOf(FastmemMode() ? (const void*)&vtlbdata.fastmem_base : (const void*)&vtlbdata.vmap, &voff) * 8;
+			AOT_CHECK(goff == 0 && voff == 0, "the EE prologue's bases are not their imports' starts");
 			vixl::ExactAssemblyScope scope(&masm, 4 * kInstructionSize);
 			masm.mov(importsReg, x0);
 			masm.ldr(gpr, MemOperand(importsReg, gslot));
@@ -5215,7 +5134,10 @@ namespace {
 			masm.ldr(vmapbase, MemOperand(vmapbase));
 		}
 		}
-		pxAssert(masm.GetSizeOfCodeGenerated() == ChainEntryOffset());
+		// a chain enters past the prologue (ChainEntryOffset), so its length is the shaped form's invariant
+		if (aot::shaped())
+			AOT_CHECK(masm.GetSizeOfCodeGenerated() == ChainEntryOffset(), "the EE prologue is %zu bytes, a chain enters at %u",
+				masm.GetSizeOfCodeGenerated(), ChainEntryOffset());
 
 		// C.60: a block on a manual page is not protected by anything -- check its
 		// source before running it. This sits at kChainEntryOffset (the prologue
@@ -5308,21 +5230,19 @@ namespace {
 		masm.FinalizeCode();
 
 		const size_t sz = masm.GetSizeOfCodeGenerated();
-		if (!s_emit_rec)
+		if (!s_reader.rec)
 			HostSys::FlushInstructionCache(start, static_cast<u32>(sz));
-		if (Aot())
+		if (aot::shaped())
 		{
 			// HH-37: the block's key and code, for Shape's log or Emit's comparison
 			aot::Block& b = s_aot_block;
 			b = aot::Block{};
 			b.unit = aot::UnitEE;
 			b.pc = pc;
-			b.words = s_read_words;
+			b.words = s_reader.words;
 			b.native = (Norm(branch_end ? p + 8 : p) - Norm(pc)) >> 2;
-			pxAssert(b.native <= b.words.size());
-			for (u32 i = 0; i < b.words.size() && i < 96; i++)
-				if (FastmemMode() && !FastmemOk(pc + i * 4))
-					b.mask[i >> 5] |= 1u << (i & 31);
+			AOT_CHECK(b.native <= b.words.size(), "the EE block at %08x covers %u words and read %zu", pc, b.native, b.words.size());
+			FaultMask(b.mask, pc, b.words.size());
 			b.codeLen = static_cast<u32>(sz);
 			for (const FmPending& fp : s_fm_pending)
 			{
@@ -5330,7 +5250,7 @@ namespace {
 				b.sites.push_back(static_cast<u32>(fp.stub_off));
 				b.sites.push_back((fp.pc - pc) >> 2);
 			}
-			if (s_emit_rec)
+			if (s_reader.rec)
 			{
 				s_fm_pending.clear();
 				s_fm_labels.clear();
@@ -5432,16 +5352,22 @@ namespace {
 	}
 
 	// HH-37 Load and Interp: the image's block for pc whose words guest memory holds now, put
-	// where CompileBlock would have put the JIT's (its record, the LUT, its pages), preferring
-	// the variant compiled with the fastmem mask the faults so far give this block (any variant
-	// with the same words computes the same thing; the mask only says which accesses fault).
-	// Interp: a twin pc already has (TwinCached) comes first, and a block the image lacks
-	// becomes one (TwinNew).
+	// where CompileBlock would have put the JIT's (its record, the LUT, its pages, its code bytes
+	// counted toward the wrap). Of the variants with those words, the one compiled with the
+	// fastmem mask the faults so far give this block, else one whose mask covers it (it keeps
+	// every access known to fault off fastmem, and the others compute the same either way); none
+	// is a miss, since a variant that has a known-faulting access on fastmem faults on every run
+	// (Load stops, Interp runs the twin). Interp: a twin pc already has (TwinCached) comes first.
+	// An image refused once the settings changed (aot::recheck) runs nothing more: until the CPU
+	// providers are chosen again, the twin runs in its place.
 	BlockFn InstallBlock(u32 pc)
 	{
-		if (aot::mode() == aot::Interp)
+		const bool image = aot::fromImage(aot::UnitEE);
+		if (aot::mode() == aot::Interp || !image)
 			if (BlockFn f = TwinCached(pc))
 				return f;
+		if (!image)
+			return TwinNew(pc);
 		const aot::Block* pick = nullptr;
 		if (const std::vector<const aot::Block*>* v = aot::imageBlocks(aot::UnitEE, pc))
 			for (const aot::Block* b : *v)
@@ -5451,21 +5377,23 @@ namespace {
 					same = memRead32(pc + q * 4) == b->words[q];
 				if (!same)
 					continue;
-				u32 mask[3] = {};
-				for (u32 i = 0; i < b->words.size() && i < 96; i++)
-					if (FastmemMode() && !FastmemOk(pc + i * 4))
-						mask[i >> 5] |= 1u << (i & 31);
-				if (!pick || !memcmp(mask, b->mask, sizeof mask))
+				u32 want[3];
+				FaultMask(want, pc, b->words.size());
+				if (!memcmp(want, b->mask, sizeof want))
+				{
 					pick = b;
-				if (!memcmp(mask, b->mask, sizeof mask))
 					break;
+				}
+				if (!pick && (b->mask[0] & want[0]) == want[0] && (b->mask[1] & want[1]) == want[1] && (b->mask[2] & want[2]) == want[2])
+					pick = b;
 			}
 		if (!pick)
 		{
-			// Load stops the process here; Interp runs the block's C twin.
 			aot::miss(aot::UnitEE, pc);
 			return TwinNew(pc);
 		}
+		WrapIfFull();
+		s_code_pos += (pick->codeLen + 15) & ~u32(15);
 		BlockFn fn = reinterpret_cast<BlockFn>(const_cast<u8*>(pick->code));
 		const u32 ns = Norm(pc), ne = ns + pick->native * 4;
 		BlockRec rec{fn, ne, true, false, {}};
@@ -5522,14 +5450,15 @@ namespace {
 void eeJitReserve_arm64(void)
 {
 	// HH-37: an image mode maps no code (its blocks are the image's), and Emit compiles into
-	// plain memory, which it never runs.
+	// its plain buffer, which it never runs.
+	static_assert(kCodeCacheSize <= aot::EMIT_BUFFER_BYTES, "Emit compiles a block anywhere the cache could hold it");
 	if (aot::imageOnly())
 		s_ok = true;
 	else if (aot::mode() == aot::Emit)
 	{
 		s_ok = true;
 		if (!s_code)
-			s_code = static_cast<u8*>(mmap(nullptr, kCodeCacheSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+			s_code = aot::emitBuffer();
 	}
 	else
 		s_ok = armVixlSelfTest();
@@ -5544,7 +5473,11 @@ void eeJitReserve_arm64(void)
 		if (s_lut == MAP_FAILED) s_lut = nullptr;
 	}
 	s_page_clears.assign(kRamBytes >> kPageShift, 0); // C.60
-	s_twin_red = getenv("LRPS2_TWIN_RED") ? (u32)atoi(getenv("LRPS2_TWIN_RED")) : 0; // HH-37
+#ifdef AOT_TOOLING
+	// HH-37, the Mac's tooling: the twin's red receipt (TwinRun) and its self-test, on the stock JIT
+	s_twin_red = getenv("LRPS2_TWIN_RED") ? (u32)atoi(getenv("LRPS2_TWIN_RED")) : 0;
+	s_twin_selftest = aot::mode() == aot::Off && getenv("LRPS2_TWIN_SELFTEST") ? atoi(getenv("LRPS2_TWIN_SELFTEST")) : 0;
+#endif
 	s_ok = s_ok && (s_code || aot::imageOnly()) && s_lut;
 	if (aot::shaped() && s_lut)
 		aot::setValueImport(kLutImport, s_lut);
@@ -5635,7 +5568,7 @@ void eeJitShutdown_arm64(void)
 	s_blocks.clear();
 	s_twins.clear();
 	s_page.clear();
-	if (s_code && aot::mode() == aot::Emit) { munmap(s_code, kCodeCacheSize); s_code = nullptr; }
+	if (aot::mode() == aot::Emit) s_code = nullptr; // HH-37: Emit's buffer is aot's
 	if (s_code) { armJitUnmap(s_code, kCodeCacheSize, "EE"); s_code = nullptr; }
 	if (s_lut) { munmap(s_lut, (size_t)kRamWords * sizeof(BlockFn)); s_lut = nullptr; }
 	s_code_pos = 0;
@@ -5732,6 +5665,7 @@ extern "C" bool eeFastmemFault_arm64(uintptr_t code_address, uintptr_t* resume_p
 }
 
 
+#ifdef AOT_TOOLING
 namespace
 {
 
@@ -5806,7 +5740,7 @@ namespace
 				}
 			}
 			w = (w & 0x03ffffffu) | (op << 26);
-			if (!TwinSimpleOk(w))
+			if (!IsTranslatable(w))
 				continue;
 			const bool is_mem = (op >= 0x1a && op <= 0x1b) || (op >= 0x1e && op <= 0x3f && op != 0x2f && op != 0x33);
 			if (is_mem && (!mem || ((w >> 21) & 31) == 0))
@@ -5915,21 +5849,7 @@ namespace
 		int ran = 0, failed = 0, skipped = 0;
 		int ends[4] = {};
 		std::unordered_map<std::string, int> fails;
-		std::unordered_map<std::string, int> seen, every, accepted;
-		// TwinSimpleOk is EmitSimple's verdict; IsTranslatable is the delay slot's. They must agree.
-		for (int i = 0; i < 2000000; i++)
-		{
-			const u32 w = (u32)TwRnd();
-			const u32 op = w >> 26;
-			if (op == 0x12 && ((w >> 21) & 31) == 0x08) continue; // BC2: neither, by design
-			if (TwinSimpleOk(w))
-				accepted[R5900::GetInstruction(w).Name]++;
-			if (TwinSimpleOk(w) != IsTranslatable(w))
-			{
-				fprintf(stderr, "lrps2 twin selftest: %08x TwinSimpleOk %d IsTranslatable %d\n", w, TwinSimpleOk(w), IsTranslatable(w));
-				failed++;
-			}
-		}
+		std::unordered_map<std::string, int> seen, every;
 		for (int r = 0; r < rounds; r++)
 		{
 			std::vector<u32> words;
@@ -6032,20 +5952,20 @@ namespace
 			fprintf(stderr, "lrps2 twin selftest: %s failed %d of %d\n", f.first.c_str(), f.second, seen[f.first]);
 		fprintf(stderr, "lrps2 twin selftest: %zu op names ran:", every.size());
 		for (const auto& e : every) fprintf(stderr, " %s:%d", e.first.c_str(), e.second);
-		fprintf(stderr, "\nlrps2 twin selftest: emitted op names that never ran:");
-		for (const auto& a : accepted) if (!every.count(a.first)) fprintf(stderr, " %s", a.first.c_str());
 		fprintf(stderr, "\n");
 		fflush(stderr);
 		_Exit(failed ? 3 : 0);
 	}
 }
 
+#endif
+
 extern "C" void eeJitRunBlock_arm64(void)
 {
-	// HH-37: LRPS2_TWIN_SELFTEST=N, the stock JIT only (TwinSelfTest)
-	static const int selftest = aot::mode() == aot::Off && getenv("LRPS2_TWIN_SELFTEST") ? atoi(getenv("LRPS2_TWIN_SELFTEST")) : 0;
-	if (selftest) [[unlikely]]
-		TwinSelfTest(selftest);
+#ifdef AOT_TOOLING
+	if (s_twin_selftest) [[unlikely]]
+		TwinSelfTest(s_twin_selftest);
+#endif
 	BlockForPC(cpuRegs.pc)(aot::imports());
 }
 
@@ -6097,12 +6017,8 @@ void aot::eeImports(ImportAdder add)
 // a layout that differs refuses the image.
 u64 aot::eeLayoutHash()
 {
-	u64 h = 1469598103934665603ULL;
-	const auto mix = [&h](const char* name, size_t off, size_t size) {
-		for (const char* c = name; *c; c++) { h ^= (u8)*c; h *= 1099511628211ULL; }
-		const u64 w[2] = {off, size};
-		for (size_t i = 0; i < sizeof w; i++) { h ^= ((const u8*)w)[i]; h *= 1099511628211ULL; }
-	};
+	u64 h = aot::FNV_BASIS;
+	const auto mix = [&h](const char* name, size_t off, size_t size) { h = aot::fnvMember(h, name, off, size); };
 #define AOT_M(s, m) mix(#s "." #m, offsetof(s, m), sizeof(((s*)nullptr)->m))
 	AOT_M(cpuRegisters, GPR); AOT_M(cpuRegisters, HI); AOT_M(cpuRegisters, LO); AOT_M(cpuRegisters, CP0);
 	AOT_M(cpuRegisters, sa); AOT_M(cpuRegisters, pc); AOT_M(cpuRegisters, code); AOT_M(cpuRegisters, cycle);
@@ -6126,43 +6042,14 @@ const char* aot::eeAbiText()
 	return text;
 }
 
-// Emit: re-compile each logged EE block from its words (CompileBlock reads them through
-// ReadCode) into plain memory, and hand its code to aot::emitted. LRPS2_AOT_CORRUPT names a block
-// emitted from a changed word (its first ADDIU/ORI immediate one higher): the red receipt.
+#ifdef AOT_TOOLING
+// Emit: each logged EE block re-compiled from its words (aot::emitGuest)
 void eeAotEmit()
 {
-	const u32 corrupt = aot::emitCorrupt(aot::UnitEE);
-	bool corrupted = false;
-	for (const aot::Block& r : aot::emitRecords(aot::UnitEE))
-	{
-		aot::Block src = r;
-		if (corrupt && r.pc == corrupt && !corrupted)
-		{
-			for (u32 q = 0; q < src.native; q++)
-			{
-				const u32 op = src.words[q] >> 26;
-				if (op == 0x09 || op == 0x0d)
-				{
-					src.words[q] = (src.words[q] & 0xffff0000u) | ((src.words[q] + 1) & 0xffffu);
-					corrupted = true;
-					fprintf(stderr, "lrps2 AOT emit: %08x re-emitted with the word at %08x changed, on purpose\n", r.pc, r.pc + q * 4);
-					break;
-				}
-			}
-		}
-		s_emit_rec = &src;
-		s_emit_oob = false;
-		CompileBlock(r.pc);
-		s_emit_rec = nullptr;
-		const aot::Block& b = s_aot_block;
-		if (s_emit_oob)
-			aot::emitFailed(r, "it reads a word beyond the ones the shape run logged");
-		else if (b.words.size() != r.words.size() || b.native != r.native)
-			aot::emitFailed(r, "it compiles to another extent than the shape run's");
-		else
-			aot::emitted(r, s_code, b.codeLen, b.sites);
-	}
-	if (corrupt && !corrupted)
-		fprintf(stderr, "lrps2 AOT emit: LRPS2_AOT_CORRUPT=%08x names no logged block with an ADDIU or ORI\n", corrupt);
+	aot::emitGuest(aot::UnitEE, s_reader, [](u32 pc) -> const aot::Block& {
+		CompileBlock(pc);
+		return s_aot_block;
+	});
 }
+#endif
 #endif

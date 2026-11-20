@@ -384,7 +384,7 @@ void VifUnpackNEON_Simple::doMaskWrite(const vixl::aarch64::VRegister& regX) con
 
 	int offX = std::min(curCycle, 3);
 	// HH-37: an AOT-shaped kernel reaches nVifMask off its third argument (x2), never at its address
-	const bool shaped = aot::shaped() && !aot::redVifHostAddr();
+	const bool shaped = aot::shaped() && !aot::red(aot::UnitVIFUnpack);
 	if (!shaped)
 		armMoveAddressToReg(RXVIXLSCRATCH, nVifMask);
 	const a64::Register& base = shaped ? RXARG3 : RXVIXLSCRATCH;
@@ -502,6 +502,7 @@ void vifAotDropKernels()
 	s_upkFromImage = false;
 }
 
+#ifdef AOT_TOOLING
 // Emit: re-generate every kernel into buf, checking each against the one the shape log has (a
 // kernel the log lacks fails the image). LRPS2_AOT_CORRUPT=vifk:index emits that one as a bare
 // return (the red receipt).
@@ -515,7 +516,8 @@ void vifAotEmitKernels(u8* buf, size_t cap)
 		else
 			byIndex[r.pc] = &r;
 	}
-	const u32 corrupt = aot::emitCorrupt(aot::UnitVIFUnpack);
+	u32 corrupt;
+	const bool hasCorrupt = aot::emitCorrupt(aot::UnitVIFUnpack, &corrupt);
 	for (u32 index = 0; index < std::size(nVifUpk); index++)
 	{
 		if (nVifT[(index >> 2) & 15] == 0)
@@ -531,7 +533,7 @@ void vifAotEmitKernels(u8* buf, size_t cap)
 		armSetAsmPtr(buf, cap, nullptr);
 		u32 len;
 		u8* start;
-		if (corrupt && index == corrupt)
+		if (hasCorrupt && index == corrupt)
 		{
 			start = armStartBlock();
 			armAsm->Ret();
@@ -543,6 +545,7 @@ void vifAotEmitKernels(u8* buf, size_t cap)
 		aot::emitted(*byIndex[index], start, len, {});
 	}
 }
+#endif
 #endif
 
 void VifUnpackSSE_Destroy()

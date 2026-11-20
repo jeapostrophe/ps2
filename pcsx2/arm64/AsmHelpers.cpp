@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: GPL-3.0
 
 #include "arm64/aot_arm64.h"
+#include "arm64/aot_emit_arm64.h"
 #include "../../common/Threading.h"
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include "arm64/AsmHelpers.h"
@@ -78,49 +78,32 @@ thread_local u8* armAsmPtr PCSX2_TLS_INITIAL_EXEC;
 thread_local size_t armAsmCapacity PCSX2_TLS_INITIAL_EXEC;
 thread_local ArmConstantPool* armConstantPool PCSX2_TLS_INITIAL_EXEC;
 thread_local bool armAotRoute PCSX2_TLS_INITIAL_EXEC;
-thread_local bool armAotDirect PCSX2_TLS_INITIAL_EXEC;
 const void* armAotRedCall;
 
-// HH-37: the import-table forms (AsmHelpers.h, armAotRoute). x28 holds the table's base. (The
-// tree's release asserts are no-ops; these stop the process.)
-#define AOT_EMIT_CHECK(cond, msg) do { if (!(cond)) { std::fprintf(stderr, "lrps2 AOT: %s\n", msg); std::fflush(stderr); std::_Exit(70); } } while (0)
+// HH-37: the import-table forms (AsmHelpers.h, armAotRoute), off x28 (aot_emit_arm64.h). The
+// route is never set outside the AOT form.
+#ifdef LRPS2_AOT_FORM
 static const a64::Register& kAotImports = a64::x28;
-// rd = rn + off, off below 16 MiB: at most two adds, no scratch
-static void aotAddOffset(const a64::Register& rd, const a64::Register& rn, u32 off)
-{
-	AOT_EMIT_CHECK(off < (1u << 24), "an import offset beyond 16 MiB");
-	const a64::Register* src = &rn;
-	if (off & 0xfff000u)
-	{
-		armAsm->Add(rd, *src, off & 0xfff000u);
-		src = &rd;
-	}
-	if ((off & 0xfffu) || src != &rd)
-		armAsm->Add(rd, *src, off & 0xfffu);
-}
-static u32 aotSlot(const void* p, u32* off) { return aot::slotOf(p, off) * 8; }
-static void aotMoveAddress(const a64::Register& reg, const void* addr)
-{
-	u32 off;
-	const u32 slot = aotSlot(addr, &off);
-	armAsm->Ldr(reg.X(), a64::MemOperand(kAotImports, slot));
-	if (off)
-		aotAddOffset(reg.X(), reg.X(), off);
-}
+static void aotMoveAddress(const a64::Register& reg, const void* addr) { aot::emitAddr(*armAsm, kAotImports, reg.X(), addr); }
 static void aotBranchTo(const void* ptr, bool link)
 {
-	u32 off;
-	const u32 slot = aotSlot(ptr, &off);
-	AOT_EMIT_CHECK(off == 0, "an AOT call or jump into the middle of an import");
 	if (link && ptr == armAotRedCall)
+	{
 		armAsm->Mov(RXVIXLSCRATCH, reinterpret_cast<uintptr_t>(ptr)); // the red receipt: the stock form
-	else
-		armAsm->Ldr(RXVIXLSCRATCH, a64::MemOperand(kAotImports, slot));
-	if (link)
 		armAsm->Blr(RXVIXLSCRATCH);
-	else
-		armAsm->Br(RXVIXLSCRATCH);
+		return;
+	}
+	aot::emitBranch(*armAsm, kAotImports, RXVIXLSCRATCH, ptr, link);
 }
+static a64::MemOperand aotAbsMem(const a64::Register& scratch, const void* addr, unsigned size)
+{
+	return aot::absMem(*armAsm, kAotImports, scratch.X(), addr, size);
+}
+#else
+static void aotMoveAddress(const a64::Register&, const void*) { std::abort(); }
+static void aotBranchTo(const void*, bool) { std::abort(); }
+static a64::MemOperand aotAbsMem(const a64::Register&, const void*, unsigned) { std::abort(); }
+#endif
 
 #ifdef INCLUDE_DISASSEMBLER
 static Threading::Mutex armDisasmMutex;
@@ -165,7 +148,7 @@ u8* armStartBlock()
 	// execute address, so armGetCurrentCodePointer() -- every displacement,
 	// every published entry point -- is where the code runs. HH-37: AOT Emit
 	// maps no code cache and writes into plain memory, which has no alias.
-	u8* const write = (armAotDirect || aot::mode() == aot::Emit) ? armAsmPtr : armJitRW(armAsmPtr);
+	u8* const write = aot::mode() == aot::Emit ? armAsmPtr : armJitRW(armAsmPtr);
 	armAsm = new (s_armAsmStorage) vixl::aarch64::MacroAssembler(static_cast<vixl::byte*>(write), armAsmCapacity);
 	armAsm->GetScratchVRegisterList()->Remove(31);
 	armAsm->GetScratchRegisterList()->Remove(RSCRATCHADDR.GetCode());
@@ -533,15 +516,7 @@ void armMoveAddressToReg(const vixl::aarch64::Register& reg, const void* addr)
 a64::MemOperand armAbsMemOperand(const a64::Register& scratch, const void* addr, unsigned size)
 {
 	if (armAotRoute)
-	{
-		u32 off;
-		const u32 slot = aotSlot(addr, &off);
-		armAsm->Ldr(scratch.X(), a64::MemOperand(kAotImports, slot));
-		if (size && (off % size) == 0 && (off / size) <= 0xFFFu)
-			return a64::MemOperand(scratch.X(), off);
-		aotAddOffset(scratch.X(), scratch.X(), off);
-		return a64::MemOperand(scratch.X());
-	}
+		return aotAbsMem(scratch, addr, size);
 	const void* current_code_ptr_page = reinterpret_cast<const void*>(
 		reinterpret_cast<uintptr_t>(armGetCurrentCodePointer()) & ~static_cast<uintptr_t>(0xFFF));
 	const void* ptr_page =

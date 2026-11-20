@@ -304,7 +304,13 @@ void VMManager::LoadSettings()
 		: "Fastmem: DISABLED (pcsx2_fastmem) - all accesses take the software memory handlers.");
 
 	if (HasValidVM())
+	{
 		ApplyGameFixes();
+		// HH-37: the AOT form's image was admitted for the settings in force then; with these it
+		// may no longer be (or may be again), and the CPU providers are chosen again if so.
+		if (aot::recheck())
+			s_cpu_implementation_changed = true;
+	}
 }
 
 void VMManager::ApplyGameFixes()
