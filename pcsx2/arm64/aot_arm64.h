@@ -36,6 +36,7 @@ namespace aot
 	{
 		UnitEE = 0,
 		UnitIOP = 1,
+		UnitVU1 = 2,
 		UnitCount,
 	};
 
@@ -44,6 +45,8 @@ namespace aot
 	// `native` of them are what its code covers, the rest what decided where it ends), a mask of
 	// the words whose memory access was kept off fastmem, its code, and the code offsets of its
 	// fastmem sites, their stubs and the index in `words` of the access's instruction (triples).
+	// A unit may give `words` a payload of its own (the image format's comment, aot_arm64.cpp):
+	// microVU1's is its incoming pipeline state and the micro-memory words its compile read.
 	struct Block
 	{
 		u32 unit = 0, pc = 0, flags = 0, native = 0;
@@ -54,6 +57,10 @@ namespace aot
 		std::vector<u32> sites; // site_off, stub_off, word index, ...
 		const u8* code = nullptr; // Load: in the image
 	};
+	// microVU1's records: a block's `words` start with its incoming pipeline state (`native` of
+	// them); the one record at VU1_STUB_PC is its dispatchers and helper stubs, whose `words` are
+	// their entries' code offsets (aVU.cpp, Vu1Stub).
+	constexpr u32 VU1_STATE_WORDS = 24, VU1_STUB_PC = 0xffffffffu;
 
 #ifdef LRPS2_AOT_FORM
 	// From retro_load_game, before the CPU thread reserves the caches: the mode the next VM runs
@@ -81,6 +88,11 @@ namespace aot
 	// Each unit lists its imports once, in a fixed order (aot_arm64.cpp's buildImports).
 	void eeImports(ImportAdder add);
 	void iopImports(ImportAdder add);
+	// aVU.cpp: microVU1's, after the EE's. A region with no pointer and a size is a region whose
+	// start is set at run time (setValueImport), e.g. VU1's data memory.
+	void vu1Imports(ImportAdder add);
+	// The slot of what holds p: a region (static, or one whose start was set), else a value import
+	// whose value is p (off 0).
 	u32 slotOf(const void* p, u32* off);
 	// recR5900_arm64.cpp and recR3000A_arm64.cpp: the guest state each unit's code addresses off a
 	// base (the header's layout_hash covers both) and the text of what its code and this C++
@@ -89,6 +101,9 @@ namespace aot
 	const char* eeAbiText();
 	u64 iopLayoutHash();
 	const char* iopAbiText();
+	// aVU.cpp: the same for microVU1 (its x19/x27 bases, its settings and its stubs' ABI).
+	u64 vu1LayoutHash();
+	const char* vu1AbiText();
 	// An import whose VALUE is set at run time (a pointer the core maps, e.g. the EE's block LUT).
 	void setValueImport(const char* name, void* value);
 
@@ -118,12 +133,16 @@ namespace aot
 	bool redHostAddr();
 	// LRPS2_AOT_RED=iophostaddr: the same for one IOP datum (the IOP's red receipt).
 	bool redIopHostAddr();
+	// LRPS2_AOT_RED=vu1hostaddr: the same for one microVU1 helper (mVU1clearlpStateJIT).
+	bool redVu1HostAddr();
 
 	// Emit: the unit's logged blocks, for its emitter to re-compile, and the unit's corrupt pc (a
 	// red receipt: that block is emitted from a changed word, its true words kept in the meta;
 	// LRPS2_AOT_CORRUPT=pc names an EE block, iop:pc an IOP one; 0 when none of this unit's).
 	const std::vector<Block>& emitRecords(Unit u);
 	u32 emitCorrupt(Unit u);
+	// LRPS2_AOT_CORRUPT_VU1=<pc>: every microVU1 record at that pc is emitted from a changed word.
+	bool emitCorruptVu1(u32* pc);
 	// An emitter's result for one record: its code as this process compiled it.
 	void emitted(const Block& b, const u8* code, u32 len, const std::vector<u32>& sites);
 	void emitFailed(const Block& b, const char* why);
@@ -153,6 +172,8 @@ namespace aot
 	inline void countFault(Unit) {}
 	inline bool redHostAddr() { return false; }
 	inline bool redIopHostAddr() { return false; }
+	inline bool redVu1HostAddr() { return false; }
+	inline bool emitCorruptVu1(u32*) { return false; }
 	inline const std::vector<Block>& emitRecords(Unit) { static const std::vector<Block> none; return none; }
 	inline u32 emitCorrupt(Unit) { return 0; }
 	inline void emitted(const Block&, const u8*, u32, const std::vector<u32>&) {}

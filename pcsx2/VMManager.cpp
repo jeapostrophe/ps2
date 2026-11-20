@@ -274,8 +274,9 @@ void VMManager::LoadSettings()
 	SettingsLoadWrapper slw(*si);
 	EmuConfig.LoadSave(slw);
 	PAD::LoadConfig(*si);
-	// HH-37: the AOT form runs VU1 on the interpreter, with which MTVU deadlocks a continuous
-	// VU1 program (SetMTVUAndAffinityControlDefault's comment): VU1 runs on the EE thread.
+	// HH-37: the AOT form runs VU1 on the EE thread: microVU1's shaped code is compiled for MTVU
+	// off (aot::vu1AbiText), and in Interp VU1 runs on its interpreter, with which MTVU deadlocks
+	// a continuous VU1 program (SetMTVUAndAffinityControlDefault's comment).
 	if (aot::shaped())
 		EmuConfig.Speedhacks.vuThread = false;
 

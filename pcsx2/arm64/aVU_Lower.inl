@@ -199,7 +199,10 @@ static void mVUexactDivCall(microVU& mVU, const a64::VRegister& fs, const a64::V
 	mvuStr32(mVU, &mVU.exactDivBuf[1], gprT1);
 	mvuStrImm32(mVU, &mVU.exactDivBuf[2], op, gprT1);
 	mVUbackupRegs(mVU, true, true);
-	armAsm->Mov(RWARG1, reinterpret_cast<uintptr_t>(&mVU));
+	if (mvuAot(mVU)) // HH-37: &mVU is x27 (the stock form's Mov into w0 truncates it)
+		armAsm->Mov(RXARG1, RVUMVU);
+	else
+		armAsm->Mov(RWARG1, reinterpret_cast<uintptr_t>(&mVU));
 	armEmitCall(reinterpret_cast<const void*>(&aVUexactDivC));
 	mVUrestoreRegs(mVU, true, true);
 	mvuLdr32(mVU, gprT1, &mVU.exactDivBuf[0]);
