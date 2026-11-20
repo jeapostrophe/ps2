@@ -29,6 +29,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <unordered_map>
+#include <string>
 #include <deque>
 #include <vector>
 #include <algorithm>
@@ -45,6 +46,8 @@
 #include "arm64/AsmHelpers.h"
 
 #include "arm64/aR5900Analysis.h"
+#include "arm64/aot_arm64.h"
+#include "arm64/aot_emit_arm64.h"
 #include "VUmicro.h" // _vu0FinishMicro
 // vu0Sync() lives in VU0.cpp with no header declaration (the interpreter ops call
 // it from the same TU); the C.58 COP2 transfers need it by address.
@@ -92,7 +95,9 @@ namespace R5900 { namespace Interpreter { namespace OpcodeImpl {
 
 namespace
 {
-	typedef void (*BlockFn)(void);
+	// A block is entered with the import table in x0: a shaped block's prologue takes it into
+	// x20 (aot_arm64.h); a stock block ignores it.
+	typedef void (*BlockFn)(void** imports);
 
 	constexpr size_t kCodeCacheSize = 32 * 1024 * 1024;
 	constexpr int    kMaxInsns      = 64;
@@ -152,6 +157,10 @@ namespace
 
 	inline bool PageIsManual(u32 pg)
 	{
+		// HH-37: never in the AOT form, whose blocks are a function of their words and so may not
+		// differ by a page's clear history; its code pages stay protected.
+		if (aot::shaped())
+			return false;
 		return pg < s_page_clears.size() && s_page_clears[pg] >= kManualClears;
 	}
 	// Any page the block's source spans having gone manual makes the block manual:
@@ -192,6 +201,40 @@ namespace
 	// helper calls preserve it (AAPCS64 callee-saved), and the EE block cache
 	// owns x21..x27.
 	const Register vmapbase = x28;
+
+	// ---- HH-37: the AOT form (aot_arm64.cpp says what it is) ----
+	// A shaped block's prologue takes the import table from its argument (x0) into x20, and loads
+	// x19 and x28 from it; EmitCall, EmitAddr and AbsMem reach everything else through it
+	// (aot_emit_arm64.h). It chains only through the LUT, whose base is a value import, past a
+	// prologue kChainEntryOffsetAot long. The JR target that the stock form keeps in x20 across
+	// the delay slot lives in the frame's free slot, [sp, #88].
+	const Register importsReg = x20;
+	constexpr u32 kJrSlot = 88;
+	// Sub + 5*Stp + Str (as stock), then mov x20, x0; ldr x19, [x20, #GPR]; ldr x28, [x20,
+	// #fastmem/vmap base]; ldr x28, [x28].
+	constexpr u32 kChainEntryOffsetAot = (1 + 5 + 1 + 1 + 1 + 2) * 4;
+	inline u32 ChainEntryOffset() { return aot::shaped() ? kChainEntryOffsetAot : kChainEntryOffset; }
+	u128 s_lqc2_sink; // LQC2 with ft == 0: the read happens, the value doesn't land
+
+	inline void EmitCall(MacroAssembler& m, uint64_t fn)
+	{
+#ifdef LRPS2_AOT_FORM
+		if (aot::shaped())
+			return aot::emitBranch(m, importsReg, x16, reinterpret_cast<const void*>(fn), true);
+#endif
+		m.Mov(x16, fn);
+		m.Blr(x16);
+	}
+	inline void EmitAddr(MacroAssembler& m, const Register& r, uint64_t p)
+	{
+#ifdef LRPS2_AOT_FORM
+		if (aot::shaped())
+			return aot::emitAddr(m, importsReg, r, reinterpret_cast<const void*>(p));
+#endif
+		m.Mov(r, p);
+	}
+	// The LUT base, a value import (set when the reserve maps it)
+	constexpr const char* kLutImport = "ee.lut";
 
 	inline u32  Norm(u32 a)  { return a & 0x1fffffff; }
 	inline bool InRam(u32 np) { return np < kRamBytes; }
@@ -266,7 +309,7 @@ namespace
 	// already exists, the patch is one store plus cache maintenance. (Stores
 	// into write-protected RAM pages don't come here at all: the fault handler
 	// takes its SMC branch first, exactly as it does for the old inline stores.)
-	struct FmSite { uintptr_t code; uintptr_t stub; u32 pc; };
+	struct FmSite { uintptr_t code; uintptr_t stub; u32 pc; u32 block; }; // pc: the access's; block: its block's (HH-37)
 	static std::vector<FmSite> s_fm_sites;    // sorted by code address
 	static std::vector<u32>    s_fm_faulting; // sorted guest pcs: never fastmem again
 
@@ -296,6 +339,10 @@ namespace
 	// Guest pc of the op being emitted (compilation is EE-thread-only, like s_rc).
 	u32 s_emit_pc = 0;
 
+	// HH-37: what a block was compiled from (aot::CodeReader): every guest word CompileBlock reads
+	aot::CodeReader s_reader;
+	inline u32 ReadCode(u32 a) { return s_reader.read(a, aot::shaped(), [](u32 x) { return memRead32(x); }); }
+
 	// Latched once: x28 holds the fastmem base in this mode, the vmap base
 	// otherwise, and every block's prologue must agree with every other block's
 	// (they inherit x28 from each other across chain hops).
@@ -308,8 +355,11 @@ namespace
 	}
 	inline bool InlineVmapEnabled() { return InlineMemEnabled() && !FastmemMode(); }
 
+	bool EmitMaskedOff(u32 guest_pc); // HH-37 Emit: the record's no-fastmem mask
 	inline bool FastmemOk(u32 guest_pc)
 	{
+		if (aot::mode() == aot::Emit)
+			return FastmemMode() && !EmitMaskedOff(guest_pc);
 		return FastmemMode() &&
 		       !std::binary_search(s_fm_faulting.begin(), s_fm_faulting.end(), guest_pc);
 	}
@@ -345,8 +395,7 @@ namespace
 			p.stub_off = m.GetBuffer()->GetCursorOffset();
 			if (p.kind == 1)
 				m.Add(x1, x19, p.rt * 16); // x1 = &GPR[rt] (x19 = guest-reg base)
-			m.Mov(x16, p.fn);
-			m.Blr(x16);
+			EmitCall(m, p.fn);
 			m.B(p.resume);
 		}
 	}
@@ -484,8 +533,7 @@ namespace
 		{
 			m.Bind(p.label);
 			p.state.FlushDirtyColdPath(m, gpr);
-			m.Mov(x16, reinterpret_cast<uint64_t>(&eeCancelInstruction_arm64));
-			m.Blr(x16); // fastjmps out of the block; never returns
+			EmitCall(m, reinterpret_cast<uint64_t>(&eeCancelInstruction_arm64)); // fastjmps out of the block; never returns
 		}
 	}
 
@@ -1248,12 +1296,12 @@ namespace
 
 		if (rs == 0x00) // MFC1 rt, fs : GPR[rt] = sign_extend_32_to_64(fpr[fs].UL)
 		{
-			if (rt) { m.Mov(x1, fbase); m.Ldr(w0, MemOperand(x1, fs * 4)); m.Sxtw(x0, w0); StoreGpr(m, x0, gpr, rt); }
+			if (rt) { EmitAddr(m, x1, fbase); m.Ldr(w0, MemOperand(x1, fs * 4)); m.Sxtw(x0, w0); StoreGpr(m, x0, gpr, rt); }
 			return;
 		}
 		if (rs == 0x04) // MTC1 rt, fs : fpr[fs].UL = GPR[rt].UL[0]
 		{
-			m.Mov(x1, fbase); LoadGpr(m, x0, gpr, rt); m.Str(w0, MemOperand(x1, fs * 4));
+			EmitAddr(m, x1, fbase); LoadGpr(m, x0, gpr, rt); m.Str(w0, MemOperand(x1, fs * 4));
 			return;
 		}
 		// C.65: the control-register moves. fs is a compile-time constant, so
@@ -1273,7 +1321,7 @@ namespace
 		{
 			if (rt)
 			{
-				m.Mov(x1, fbase);
+				EmitAddr(m, x1, fbase);
 				if (fs & 0x10)
 				{
 					m.Ldr(w0, MemOperand(x1, 252));
@@ -1292,18 +1340,18 @@ namespace
 		}
 		if (rs == 0x06) // CTC1 rt, fs : only FCR31 is writable
 		{
-			if (fs == 31) { m.Mov(x1, fbase); LoadGpr(m, x0, gpr, rt); m.Str(w0, MemOperand(x1, 252)); }
+			if (fs == 31) { EmitAddr(m, x1, fbase); LoadGpr(m, x0, gpr, rt); m.Str(w0, MemOperand(x1, 252)); }
 			return;
 		}
 		if (rs == 0x14) // W format: CVT.S.W only
 		{
-			m.Mov(x1, fbase);
+			EmitAddr(m, x1, fbase);
 			EmitCvtS(m, x1, fd, fs);
 			return;
 		}
 		// rs == 0x10 single-precision ops
 		const u32 ft = (insn >> 16) & 31;
-		m.Mov(x1, fbase);
+		EmitAddr(m, x1, fbase);
 		if (funct == 0x00 || funct == 0x01 || funct == 0x02) // ADD.S/SUB.S/MUL.S
 		{
 			if (funct <= 1)
@@ -2292,8 +2340,7 @@ namespace
 		s_rc.FlushDirty(m, gpr);
 		m.Mov(w0, insn);
 		m.Str(w0, RegsField(&cpuRegs.code));
-		m.Mov(x16, reinterpret_cast<uint64_t>(fn));
-		m.Blr(x16);
+		EmitCall(m, reinterpret_cast<uint64_t>(fn));
 		// ...and it may also write any guest GPR directly (MFC0 rt, QFSRV rd):
 		// drop the whole cache afterwards.
 		s_rc.Reset();
@@ -2308,6 +2355,10 @@ namespace
 	// encode or the page offset is not size-aligned.
 	MemOperand AbsMem(MacroAssembler& m, const Register& scratch, const void* addr, unsigned size)
 	{
+#ifdef LRPS2_AOT_FORM
+		if (aot::shaped())
+			return aot::absMem(m, importsReg, scratch, addr, size);
+#endif
 		const uintptr_t cur = reinterpret_cast<uintptr_t>(s_block_exec) + m.GetBuffer()->GetCursorOffset();
 		const s64 page_disp = (static_cast<s64>(reinterpret_cast<uintptr_t>(addr) & ~uintptr_t(0xFFF)) -
 		                       static_cast<s64>(cur & ~uintptr_t(0xFFF))) >> 12;
@@ -2599,7 +2650,7 @@ namespace {
 				});
 				DeferFastmemStub(m, fn, 0, 0);
 			}
-			else { m.Mov(x16, fn); m.Blr(x16); }
+			else { EmitCall(m, fn); }
 			if (!u.is64)
 				m.Sxtw(x0, w0); // LWL/LWR pairs sign-extend, exactly like LW
 			StoreGpr(m, x0, gpr, u.rt);
@@ -2617,7 +2668,7 @@ namespace {
 				});
 				DeferFastmemStub(m, fn, 0, 0);
 			}
-			else { m.Mov(x16, fn); m.Blr(x16); }
+			else { EmitCall(m, fn); }
 		}
 	}
 
@@ -2708,8 +2759,7 @@ namespace {
 			Label vu0_idle;
 			m.Ldr(w0, AbsMem(m, x10, &vuRegs[0].VI[REG_VPU_STAT].UL, 4)); // C.78: adrp fold
 			m.Tbz(w0, 0, &vu0_idle); // VPU_STAT bit0 = VU0 running
-			m.Mov(x16, reinterpret_cast<uint64_t>(&_vu0FinishMicro));
-			m.Blr(x16);
+			EmitCall(m, reinterpret_cast<uint64_t>(&_vu0FinishMicro));
 			m.Bind(&vu0_idle);
 		}
 		cpuRegs.code = insn; // emit-time input: the emitters' _Fs_/_Ft_/... macros read it
@@ -2789,13 +2839,11 @@ namespace {
 
 		const bool is_read = (rs == 0x01 || rs == 0x02); // QMFC2 / CFC2
 
-		m.Mov(x16, reinterpret_cast<uint64_t>(&vu0Sync));
-		m.Blr(x16);
+		EmitCall(m, reinterpret_cast<uint64_t>(&vu0Sync));
 		if (interlock)
 		{
-			m.Mov(x16, is_read ? reinterpret_cast<uint64_t>(&_vu0FinishMicro)
-			                   : reinterpret_cast<uint64_t>(&_vu0WaitMicro));
-			m.Blr(x16);
+			EmitCall(m, is_read ? reinterpret_cast<uint64_t>(&_vu0FinishMicro)
+			                    : reinterpret_cast<uint64_t>(&_vu0WaitMicro));
 		}
 
 		switch (rs)
@@ -3068,10 +3116,10 @@ namespace {
 					}
 					m.B(&done);
 					m.Bind(&slow);
-					m.Mov(x16, fn); m.Blr(x16);
+					EmitCall(m, fn);
 					m.Bind(&done);
 				}
-				else { m.Mov(x16, fn); m.Blr(x16); } // result in x0 (u32 returns are zero-extended in x0)
+				else { EmitCall(m, fn); } // result in x0 (u32 returns are zero-extended in x0)
 				if (rt)
 				{
 					switch (op)
@@ -3099,7 +3147,7 @@ namespace {
 				                  : (op == 0x26) ? reinterpret_cast<uint64_t>(&eeLWR_arm64)
 				                  : (op == 0x1a) ? reinterpret_cast<uint64_t>(&eeLDL_arm64)
 				                  :                reinterpret_cast<uint64_t>(&eeLDR_arm64);
-				m.Mov(x16, fn); m.Blr(x16);
+				EmitCall(m, fn);
 				s_rc.Invalidate(rt); // ...and then writes it directly
 				return true;
 			}
@@ -3114,7 +3162,7 @@ namespace {
 				                  : (op == 0x2e) ? reinterpret_cast<uint64_t>(&eeSWR_arm64)
 				                  : (op == 0x2c) ? reinterpret_cast<uint64_t>(&eeSDL_arm64)
 				                  :                reinterpret_cast<uint64_t>(&eeSDR_arm64);
-				m.Mov(x16, fn); m.Blr(x16);
+				EmitCall(m, fn);
 				return true;
 			}
 			// Stores (SB/SH/SW/SD).
@@ -3165,10 +3213,10 @@ namespace {
 					}
 					m.B(&done);
 					m.Bind(&slow);
-					m.Mov(x16, fn); m.Blr(x16);
+					EmitCall(m, fn);
 					m.Bind(&done);
 				}
-				else { m.Mov(x16, fn); m.Blr(x16); }
+				else { EmitCall(m, fn); }
 				return true;
 			}
 			// PREF (0x33): the interpreter's PREF() body is empty (like SYNC),
@@ -3207,7 +3255,7 @@ namespace {
 						m.Bind(&slow);
 					}
 					m.Add(x1, gpr, rt * 16);
-					m.Mov(x16, reinterpret_cast<uint64_t>(&eeRead128_arm64)); m.Blr(x16);
+					EmitCall(m, reinterpret_cast<uint64_t>(&eeRead128_arm64));
 					m.Bind(&done);
 				}
 				s_rc.Invalidate(rt); // 128-bit write bypasses StoreGpr (both paths)
@@ -3238,7 +3286,7 @@ namespace {
 						m.Bind(&slow);
 					}
 					m.Add(x1, gpr, rt * 16);
-					m.Mov(x16, reinterpret_cast<uint64_t>(&eeWrite128_arm64)); m.Blr(x16);
+					EmitCall(m, reinterpret_cast<uint64_t>(&eeWrite128_arm64));
 					m.Bind(&done);
 				}
 				return true;
@@ -3350,7 +3398,7 @@ namespace {
 				if (rs == 0x08) return false; // BC2F/T(L) -> EmitBranch
 				// C.30-2: SPECIAL1/2 ALU ops emit natively via the microVU0
 				// single-op emitters.
-				if (rs >= 0x10 && EmitCop2Macro(m, gpr, insn))
+				if (rs >= 0x10 && !aot::shaped() && EmitCop2Macro(m, gpr, insn)) // AOT: VU0 is interpreted
 					return true;
 				// C.58: the COP2 transfers (QMFC2/CFC2/QMTC2/CTC2) are register
 				// moves once the VU0 syncs are out of the way -- no reason to pay
@@ -3440,8 +3488,8 @@ namespace {
 					EmitFastmemAccess(m, [&] { m.ldr(w0, MemOperand(vmapbase, w0, UXTW)); });
 					DeferFastmemStub(m, reinterpret_cast<uint64_t>(&eeRead32_arm64), 0, 0);
 				}
-				else { m.Mov(x16, reinterpret_cast<uint64_t>(&eeRead32_arm64)); m.Blr(x16); }
-				m.Mov(x1, reinterpret_cast<uint64_t>(&fpuRegs)); m.Str(w0, MemOperand(x1, rt * 4));
+				else { EmitCall(m, reinterpret_cast<uint64_t>(&eeRead32_arm64)); }
+				EmitAddr(m, x1, reinterpret_cast<uint64_t>(&fpuRegs)); m.Str(w0, MemOperand(x1, rt * 4));
 				m.Bind(&skip);
 				return true;
 			}
@@ -3451,13 +3499,13 @@ namespace {
 				{ const Register a = SrcGpr(m, gpr, rs, x0); m.Add(w0, a.W(), simm); }
 				Label skip;
 				m.Tst(w0, 3); m.B(&skip, ne);
-				m.Mov(x1, reinterpret_cast<uint64_t>(&fpuRegs)); m.Ldr(w1, MemOperand(x1, rt * 4));
+				EmitAddr(m, x1, reinterpret_cast<uint64_t>(&fpuRegs)); m.Ldr(w1, MemOperand(x1, rt * 4));
 				if (FastmemOk(s_emit_pc)) // C.56
 				{
 					EmitFastmemAccess(m, [&] { m.str(w1, MemOperand(vmapbase, w0, UXTW)); });
 					DeferFastmemStub(m, reinterpret_cast<uint64_t>(&eeWrite32_arm64), 0, 0);
 				}
-				else { m.Mov(x16, reinterpret_cast<uint64_t>(&eeWrite32_arm64)); m.Blr(x16); }
+				else { EmitCall(m, reinterpret_cast<uint64_t>(&eeWrite32_arm64)); }
 				m.Bind(&skip);
 				return true;
 			}
@@ -3481,20 +3529,19 @@ namespace {
 			// side effects -- it just throws the value away.
 			case 0x36: // LQC2
 			{
-				static u128 s_lqc2_sink; // ft == 0: the read happens, the value doesn't land
-				m.Mov(x16, reinterpret_cast<uint64_t>(&vu0Sync)); m.Blr(x16);
+				EmitCall(m, reinterpret_cast<uint64_t>(&vu0Sync));
 				{ const Register a = SrcGpr(m, gpr, rs, x0); m.Add(w0, a.W(), simm); }
-				m.Mov(x1, rt ? reinterpret_cast<uint64_t>(&vuRegs[0].VF[rt])
-				             : reinterpret_cast<uint64_t>(&s_lqc2_sink));
-				m.Mov(x16, reinterpret_cast<uint64_t>(&eeRead128_arm64)); m.Blr(x16);
+				EmitAddr(m, x1, rt ? reinterpret_cast<uint64_t>(&vuRegs[0].VF[rt])
+				                   : reinterpret_cast<uint64_t>(&s_lqc2_sink));
+				EmitCall(m, reinterpret_cast<uint64_t>(&eeRead128_arm64));
 				return true;
 			}
 			case 0x3e: // SQC2
 			{
-				m.Mov(x16, reinterpret_cast<uint64_t>(&vu0Sync)); m.Blr(x16);
+				EmitCall(m, reinterpret_cast<uint64_t>(&vu0Sync));
 				{ const Register a = SrcGpr(m, gpr, rs, x0); m.Add(w0, a.W(), simm); }
-				m.Mov(x1, reinterpret_cast<uint64_t>(&vuRegs[0].VF[rt])); // VF[0] is the (0,0,0,1) constant
-				m.Mov(x16, reinterpret_cast<uint64_t>(&eeWrite128_arm64)); m.Blr(x16);
+				EmitAddr(m, x1, reinterpret_cast<uint64_t>(&vuRegs[0].VF[rt])); // VF[0] is the (0,0,0,1) constant
+				EmitCall(m, reinterpret_cast<uint64_t>(&eeWrite128_arm64));
 				return true;
 			}
 			default: return false;
@@ -3530,11 +3577,14 @@ namespace {
 		m.Ldr(w1, RegsField(&cpuRegs.pc));      // pc (may have been redirected by the event test)
 		m.Tst(w1, 0x1e000000);                  // outside the 32 MB RAM window?
 		m.B(s_blk_ret, ne);                     // -> return to the dispatcher
-		m.Mov(x0, reinterpret_cast<uint64_t>(s_lut)); // the LUT base itself, materialized
+		if (aot::shaped())
+			aot::emitValue(m, importsReg, x0, kLutImport);
+		else
+			m.Mov(x0, reinterpret_cast<uint64_t>(s_lut)); // the LUT base itself, materialized
 		m.Ubfx(w2, w1, 2, 23);                  // idx = (pc & 0x01ffffff) >> 2
 		m.Ldr(x3, MemOperand(x0, w2, UXTW, 3)); // fn = s_lut[idx]
 		m.Cbz(x3, s_blk_ret);                   // uncompiled -> return
-		m.Add(x3, x3, kChainEntryOffset);       // skip the successor's prologue
+		m.Add(x3, x3, ChainEntryOffset());      // skip the successor's prologue
 		m.Br(x3);                               // tail-jump to next block's body
 	}
 
@@ -3580,7 +3630,7 @@ namespace {
 		// A target outside RAM has no LUT slot -> fall back to the generic tail.
 		if (!s_lut || !InRam(np))
 		{
-			if (evt) { m.Mov(x16, evt); m.Blr(x16); }
+			if (evt) { EmitCall(m, evt); }
 			EmitChainEpilogue(m);
 			return;
 		}
@@ -3593,10 +3643,19 @@ namespace {
 			s_exit_pending.push_back({slow, evt});
 		}
 		// Not due (or no test at all): pc == target_pc, guaranteed.
-		m.Mov(x3, reinterpret_cast<uint64_t>(&s_lut[np >> 2])); // the LUT slot itself
-		m.Ldr(x3, MemOperand(x3));
-		m.Cbz(x3, s_blk_ret);             // uncompiled -> return to the dispatcher
-		m.Add(x3, x3, kChainEntryOffset); // skip the successor's prologue
+		if (aot::shaped())
+		{
+			aot::emitValue(m, importsReg, x3, kLutImport);
+			m.Mov(x4, (np >> 2) * 8);
+			m.Ldr(x3, MemOperand(x3, x4));
+		}
+		else
+		{
+			m.Mov(x3, reinterpret_cast<uint64_t>(&s_lut[np >> 2])); // the LUT slot itself
+			m.Ldr(x3, MemOperand(x3));
+		}
+		m.Cbz(x3, s_blk_ret);               // uncompiled -> return to the dispatcher
+		m.Add(x3, x3, ChainEntryOffset());  // skip the successor's prologue
 		m.Br(x3);
 	}
 	// Deferred: the event-due tails, then the block's single return path.
@@ -3605,8 +3664,7 @@ namespace {
 		for (ExitPending& e : s_exit_pending)
 		{
 			m.Bind(e.slow);
-			m.Mov(x16, e.evt);
-			m.Blr(x16);           // may redirect pc (exception/interrupt)
+			EmitCall(m, e.evt);           // may redirect pc (exception/interrupt)
 			EmitChainEpilogue(m); // ... so chain off the pc it left behind
 		}
 		// C.60: the manual block's source changed under it. It has just been
@@ -3716,7 +3774,10 @@ namespace {
 	void EmitTailCycles(MacroAssembler& m, int cyc, bool with_update)
 	{
 		const uint64_t upd = reinterpret_cast<uint64_t>(&eeUpdateCycles_arm64);
-		m.Mov(x10, reinterpret_cast<uint64_t>(&cpuBlockCycles)); // once, for both halves
+		if (aot::red(aot::UnitEE))
+			m.Mov(x10, reinterpret_cast<uint64_t>(&cpuBlockCycles)); // the red receipt (aot::red)
+		else
+			EmitAddr(m, x10, reinterpret_cast<uint64_t>(&cpuBlockCycles)); // once, for both halves
 		m.Ldr(w1, RegsField(&cpuRegs.CP0.n.Config));
 		m.Mov(w2, cyc); m.Mov(w3, cyc * 2);
 		m.Tst(w1, 1u << 18);
@@ -3727,12 +3788,12 @@ namespace {
 		if (!with_update)
 		{
 			m.Str(w0, MemOperand(x10));
-			if (with_update) { m.Mov(x16, upd); m.Blr(x16); }
+			if (with_update) { EmitCall(m, upd); }
 			return;
 		}
 		// Default cycle rate: cycle += max(1, cpuBlockCycles >> 3); bc &= 7.
 		Label slow, done;
-		m.Mov(x11, reinterpret_cast<uint64_t>(&EmuConfig.Speedhacks.EECycleRate));
+		EmitAddr(m, x11, reinterpret_cast<uint64_t>(&EmuConfig.Speedhacks.EECycleRate));
 		m.Ldrsb(w1, MemOperand(x11));
 		m.Cbnz(w1, &slow);
 		m.Lsr(w2, w0, 3);
@@ -3749,8 +3810,7 @@ namespace {
 		m.B(&done);
 		m.Bind(&slow);
 		m.Str(w0, MemOperand(x10)); // the helper reads cpuBlockCycles from memory
-		m.Mov(x16, upd);
-		m.Blr(x16);
+		EmitCall(m, upd);
 		m.Bind(&done);
 	}
 
@@ -3850,7 +3910,7 @@ namespace {
 		}
 		else return false;
 
-		const u32 ds = memRead32(bpc + 4);
+		const u32 ds = ReadCode(bpc + 4);
 		// C.64: a LIKELY branch executes its delay slot only when taken. The slots
 		// that were refusing translation here are BREAK -- GT3 is full of asserts
 		// shaped `beql <bad>, <expected>, panic; break` -- so the slot never runs,
@@ -3882,8 +3942,7 @@ namespace {
 			Label skip;
 			EmitCycleDueCompare(m);
 			m.B(&skip, mi);     // not due yet
-			m.Mov(x16, evt);
-			m.Blr(x16);
+			EmitCall(m, evt);
 			m.Bind(&skip);
 		};
 
@@ -3917,14 +3976,17 @@ namespace {
 		// Kernel return addresses (0x8xxxxxxx) otherwise get 0xffffffff upper
 		// halves that the interpreter path never produces.
 		if (link > 0) { m.Mov(w0, bpc + 8); StoreGpr(m, x0, gpr, (u32)link); }
-		if (is_jr) LoadGpr(m, x20, gpr, rs);
+		if (is_jr && aot::shaped()) { LoadGpr(m, x0, gpr, rs); m.Str(w0, MemOperand(sp, kJrSlot)); }
+		else if (is_jr) LoadGpr(m, x20, gpr, rs);
 
 		if (uncond)
 		{
 			s_emit_pc = bpc + 4; // delay slot
 			Cop2RunInvalidate(); s_emit_budget = 1; // C.66
 			EmitSimple(m, gpr, ds);
-			if (is_jr) StorePC(m, w20); else StorePCImm(m, tconst);
+			if (is_jr && aot::shaped()) { m.Ldr(w0, MemOperand(sp, kJrSlot)); StorePC(m, w0); }
+			else if (is_jr) StorePC(m, w20);
+			else StorePCImm(m, tconst);
 			s_rc.FlushDirty(m, gpr); // block exit: the next block reads GPR memory
 			EmitTailCycles(m, cyc_taken, true); // C.55 (bookkeeping + update, fused)
 			if (idle_skip) EmitIdleSkip();
@@ -3936,20 +3998,19 @@ namespace {
 		if (bc0)
 		{
 			// CPCOND0 is a plain int() reading dmacRegs; call it directly.
-			m.Mov(x16, reinterpret_cast<uint64_t>(&R5900::Interpreter::OpcodeImpl::COP0::CPCOND0));
-			m.Blr(x16);
+			EmitCall(m, reinterpret_cast<uint64_t>(&R5900::Interpreter::OpcodeImpl::COP0::CPCOND0));
 			m.Cmp(w0, 0); // eq -> CPCOND0()==0 (BC0F taken), ne -> ==1 (BC0T taken)
 		}
 		else if (bc1)
 		{
 			// FCR31 lives at fpuRegs.fprc[31] (byte offset 252).
-			m.Mov(x10, reinterpret_cast<uint64_t>(&fpuRegs));
+			EmitAddr(m, x10, reinterpret_cast<uint64_t>(&fpuRegs));
 			m.Ldr(w0, MemOperand(x10, 252));
 			m.Tst(w0, 0x00800000); // eq -> C clear (BC1F taken), ne -> C set (BC1T taken)
 		}
 		else if (bc2)
 		{
-			m.Mov(x10, reinterpret_cast<uint64_t>(&vuRegs[0].VI[REG_VPU_STAT].UL));
+			EmitAddr(m, x10, reinterpret_cast<uint64_t>(&vuRegs[0].VI[REG_VPU_STAT].UL));
 			m.Ldr(w0, MemOperand(x10));
 			m.Tst(w0, 0x100); // eq -> VU0 idle (BC2F taken), ne -> busy (BC2T taken)
 		}
@@ -3979,8 +4040,7 @@ namespace {
 			StorePCImm(m, bpc);
 			EmitCycleBookkeeping(m, cyc_leading);
 			s_rc.FlushDirty(m, gpr);
-			m.Mov(x16, reinterpret_cast<uint64_t>(&eeRunBasicBlock_arm64));
-			m.Blr(x16);
+			EmitCall(m, reinterpret_cast<uint64_t>(&eeRunBasicBlock_arm64));
 			s_rc.Reset();
 			EmitChainEpilogue(m); // continue from wherever the interpreter left pc
 		}
@@ -4103,17 +4163,885 @@ namespace {
 	}
 
 
-	BlockFn CompileBlock(u32 pc)
+	// ---- HH-37: the C twin of CompileBlock (Interp's miss path) ----
+	// A block the image lacks runs here instead of as code. TwinDecode reads live memory exactly
+	// as CompileBlock reads it and ends the block where CompileBlock would; TwinRun then does what
+	// the code CompileBlock would have emitted does: each op as its emitter computes it (the
+	// Twin* functions below are transcriptions of the Emit* ones, helper for helper), pc held at
+	// the block's start until the exit stores it, the op cycles summed once and accounted where
+	// the emitted tails account them, and the event tests where those emit them, gated as they
+	// are. TwinSelfTest (LRPS2_TWIN_SELFTEST) holds each to the JIT's code, block by block.
+	inline u64 TwR64(u32 i) { return i ? cpuRegs.GPR.r[i].UD[0] : 0; } // SrcGpr/LoadGpr: r0 is 0
+	inline u32 TwR32(u32 i) { return (u32)TwR64(i); }
+	inline GPR_reg& TwG(u32 i) { return cpuRegs.GPR.r[i]; }
+
+	// The host FP ops the emitters use, as those instructions (no compiler contraction or
+	// reassociation can reach them).
+	inline float TwF(u32 w) { float f; memcpy(&f, &w, 4); return f; }
+	inline u32 TwW(float f) { u32 w; memcpy(&w, &f, 4); return w; }
+	inline u32 TwFadd(u32 a, u32 b) { float r; const float x = TwF(a), y = TwF(b); __asm__ volatile("fadd %s0, %s1, %s2" : "=w"(r) : "w"(x), "w"(y)); return TwW(r); }
+	inline u32 TwFmul(u32 a, u32 b) { float r; const float x = TwF(a), y = TwF(b); __asm__ volatile("fmul %s0, %s1, %s2" : "=w"(r) : "w"(x), "w"(y)); return TwW(r); }
+	inline u32 TwFdiv(u32 a, u32 b) { float r; const float x = TwF(a), y = TwF(b); __asm__ volatile("fdiv %s0, %s1, %s2" : "=w"(r) : "w"(x), "w"(y)); return TwW(r); }
+	inline u32 TwFsqrt(u32 a) { float r; const float x = TwF(a); __asm__ volatile("fsqrt %s0, %s1" : "=w"(r) : "w"(x)); return TwW(r); }
+	inline u64 TwDaddsub(u64 a, u64 b, bool sub)
+	{
+		double r, x, y;
+		memcpy(&x, &a, 8); memcpy(&y, &b, 8);
+		if (sub) __asm__ volatile("fsub %d0, %d1, %d2" : "=w"(r) : "w"(x), "w"(y));
+		else     __asm__ volatile("fadd %d0, %d1, %d2" : "=w"(r) : "w"(x), "w"(y));
+		u64 w; memcpy(&w, &r, 8); return w;
+	}
+	inline u32 TwScvtf(u32 a) { float r; const s32 x = (s32)a; __asm__ volatile("scvtf %s0, %w1" : "=w"(r) : "r"(x)); return TwW(r); }
+	inline u32 TwFcvtzs(u32 a) { s32 r; const float x = TwF(a); __asm__ volatile("fcvtzs %w0, %s1" : "=r"(r) : "w"(x)); return (u32)r; }
+
+	inline u32& TwFcr31() { return fpuRegs.fprc[31]; }
+	inline u32& TwFpr(u32 i) { return fpuRegs.fpr[i].UL; }
+	// EmitFpuClampBits
+	inline u32 TwClamp(u32 w)
+	{
+		const u32 e = w & 0x7f800000;
+		if (!e) return w & 0x80000000;
+		if (e != 0x7f800000) return w;
+		return (w & 0x80000000) | 0x7f7fffff;
+	}
+	// EmitFpuOverflowUnderflow
+	inline u32 TwOvUn(u32 wd)
+	{
+		if ((wd & 0x7fffffff) == 0x7f800000)
+		{
+			TwFcr31() |= 0x8000 | 0x10;
+			return (wd & 0x80000000) | 0x7f7fffff;
+		}
+		TwFcr31() &= ~0x8000u;
+		if (!(wd & 0x7f800000) && (wd & 0x7fffff))
+		{
+			TwFcr31() |= 0x4000 | 0x8;
+			return wd & 0x80000000;
+		}
+		TwFcr31() &= ~0x4000u;
+		return wd;
+	}
+	// EmitFpuClampOutValueOnly
+	inline u32 TwClampOut(u32 wd)
+	{
+		if ((wd & 0x7fffffff) == 0x7f800000) return (wd & 0x80000000) | 0x7f7fffff;
+		if (!(wd & 0x7f800000) && (wd & 0x7fffff)) return wd & 0x80000000;
+		return wd;
+	}
+	// EmitFpuAddSubExactCore: a, b raw; returns what it stores
+	u32 TwAddSubExact(u32 a, u32 b, bool sub)
+	{
+		const s32 d = (s32)((a >> 23) & 0xff) - (s32)((b >> 23) & 0xff);
+		if (d >= 25) b &= 0x80000000;
+		else if (d >= 1) b &= 0xffffffffu << (d - 1);
+		else if (d == 0) {}
+		else if (d < -24) a &= 0x80000000;
+		else a &= 0xffffffffu << (-d - 1);
+		const auto toD = [](u32 v) -> u64 {
+			const u32 e = (v >> 23) & 0xff;
+			if (!e) return (u64)(v >> 31) << 63;
+			return ((u64)(e + 896) << 52) | ((u64)(v & 0x7fffff) << 29) | ((u64)(v >> 31) << 63);
+		};
+		const u64 r = TwDaddsub(toD(a), toD(b), sub);
+		const u32 sign = (u32)(r >> 63) << 31;
+		if (!(r & 0x7fffffffffffffffull))
+		{
+			TwFcr31() &= ~0xC000u;
+			return sign;
+		}
+		const s32 e = (s32)((u32)(r >> 52) & 0x7ff) - 896;
+		if (e > 255) { TwFcr31() |= 0x8000 | 0x10; return sign | 0x7fffffff; }
+		if (e < 1)   { TwFcr31() |= 0x4000 | 0x8; return sign; }
+		TwFcr31() &= ~0xC000u;
+		return sign | ((u32)(r >> 29) & 0x7fffff) | ((u32)e << 23);
+	}
+
+	// EmitCop1Reg
+	void TwinCop1(u32 insn)
+	{
+		const u32 rs = (insn >> 21) & 31, rt = (insn >> 16) & 31, fs = (insn >> 11) & 31, fd = (insn >> 6) & 31;
+		const u32 funct = insn & 0x3f;
+		if (rs == 0x00) { if (rt) TwG(rt).SD[0] = (s32)TwFpr(fs); return; }                  // MFC1
+		if (rs == 0x04) { TwFpr(fs) = TwR32(rt); return; }                                    // MTC1
+		if (rs == 0x02)                                                                       // CFC1
+		{
+			if (rt)
+				TwG(rt).SD[0] = (fs & 0x10) ? (s32)((TwFcr31() & 0x0083c078) | 0x01000001) : (s32)fpuRegs.fprc[0];
+			return;
+		}
+		if (rs == 0x06) { if (fs == 31) TwFcr31() = TwR32(rt); return; }                      // CTC1
+		if (rs == 0x14) { TwFpr(fd) = TwScvtf(TwFpr(fs)); return; }                           // CVT.S.W
+		const u32 ft = rt;
+		u32& acc = fpuRegs.ACC.UL;
+		switch (funct)
+		{
+			case 0x00: case 0x01: TwFpr(fd) = TwAddSubExact(TwFpr(fs), TwFpr(ft), funct == 1); return; // ADD.S/SUB.S
+			case 0x18: case 0x19: acc = TwAddSubExact(TwFpr(fs), TwFpr(ft), funct == 0x19); return;     // ADDA.S/SUBA.S
+			case 0x02: case 0x1a:                                                                        // MUL.S/MULA.S
+			{
+				const u32 r = TwOvUn(TwFmul(TwClamp(TwFpr(fs)), TwClamp(TwFpr(ft))));
+				if (funct == 0x02) TwFpr(fd) = r; else acc = r;
+				return;
+			}
+			case 0x03: // DIV.S
+			{
+				const u32 w5 = TwFpr(ft);
+				if (!(w5 & 0x7f800000))
+				{
+					const u32 w6 = TwFpr(fs);
+					TwFcr31() |= (w6 & 0x7f800000) ? (0x10000u | 0x20) : (0x20000u | 0x40);
+					TwFpr(fd) = ((w5 ^ w6) & 0x80000000) | 0x7f7fffff;
+					return;
+				}
+				TwFpr(fd) = TwClampOut(TwFdiv(TwClamp(TwFpr(fs)), TwClamp(w5)));
+				return;
+			}
+			case 0x04: // SQRT.S (source Ft)
+			{
+				TwFcr31() &= ~0x30000u;
+				const u32 w0 = TwFpr(ft);
+				if (!(w0 & 0x7f800000)) { TwFpr(fd) = w0 & 0x80000000; return; }
+				if (w0 & 0x80000000)
+				{
+					TwFcr31() |= 0x20000 | 0x40;
+					TwFpr(fd) = TwFsqrt(TwClamp(w0) & 0x7fffffff);
+					return;
+				}
+				TwFpr(fd) = TwFsqrt(TwClamp(w0));
+				return;
+			}
+			case 0x16: // RSQRT.S
+			{
+				TwFcr31() &= ~0x30000u;
+				const u32 w5 = TwFpr(ft);
+				if (!(w5 & 0x7f800000))
+				{
+					TwFcr31() |= 0x10000 | 0x20;
+					TwFpr(fd) = (w5 & 0x80000000) | 0x7f7fffff;
+					return;
+				}
+				u32 s1;
+				if (w5 & 0x80000000)
+				{
+					TwFcr31() |= 0x20000 | 0x40;
+					s1 = TwClamp(TwFsqrt(TwClamp(w5) & 0x7fffffff));
+				}
+				else
+					s1 = TwFsqrt(TwClamp(w5));
+				TwFpr(fd) = TwClampOut(TwFdiv(TwClamp(TwFpr(fs)), s1));
+				return;
+			}
+			case 0x1c: case 0x1d: case 0x1e: case 0x1f: // MADD.S/MSUB.S/MADDA.S/MSUBA.S
+			{
+				const u32 prod = TwClamp(TwFmul(TwClamp(TwFpr(fs)), TwClamp(TwFpr(ft))));
+				const u32 r = TwAddSubExact(acc, prod, funct == 0x1d || funct == 0x1f);
+				if (funct <= 0x1d) TwFpr(fd) = r; else acc = r;
+				return;
+			}
+			case 0x24: // CVT.W.S
+			{
+				const u32 w0 = TwFpr(fs);
+				if ((w0 & 0x7f800000) > 0x4E800000u)
+					TwFpr(fd) = (w0 & 0x80000000) ? 0x80000000u : 0x7fffffffu;
+				else
+					TwFpr(fd) = TwFcvtzs(w0);
+				return;
+			}
+			case 0x28: case 0x29: // MAX.S/MIN.S
+			{
+				const u32 a = TwFpr(fs), b = TwFpr(ft);
+				const u32 mx = (s32)a > (s32)b ? a : b, mn = (s32)a < (s32)b ? a : b;
+				const bool both_neg = (a & b) & 0x80000000;
+				TwFpr(fd) = (funct == 0x28) ? (both_neg ? mn : mx) : (both_neg ? mx : mn);
+				TwFcr31() &= ~0xC000u;
+				return;
+			}
+			case 0x30: TwFcr31() &= ~0x00800000u; return; // C.F
+			case 0x32: case 0x34: case 0x36: // C.EQ/C.LT/C.LE
+			{
+				u32 a = TwFpr(fs), b = TwFpr(ft);
+				if (!(a & 0x7f800000)) a = 0;
+				if (!(b & 0x7f800000)) b = 0;
+				a ^= (u32)((s32)a >> 31) >> 1;
+				b ^= (u32)((s32)b >> 31) >> 1;
+				const bool c = funct == 0x32 ? (s32)a == (s32)b : funct == 0x34 ? (s32)a < (s32)b : (s32)a <= (s32)b;
+				TwFcr31() = (TwFcr31() & ~0x00800000u) | ((u32)c << 23);
+				return;
+			}
+		}
+		const u32 w0 = TwFpr(fs);
+		if (funct == 0x06) { TwFpr(fd) = w0; return; }      // MOV.S
+		TwFpr(fd) = (funct == 0x05) ? (w0 & 0x7fffffff) : (w0 ^ 0x80000000); // ABS.S / NEG.S
+		TwFcr31() &= ~0xC000u;
+	}
+
+	// EmitMulDiv; k: HI/LO's 64-bit half, 0 (pipeline 0) or 1 (the MMI pipeline-1 forms)
+	void TwinMulDiv(u32 funct, u32 rs, u32 rt, u32 rd, u32 k)
+	{
+		switch (funct)
+		{
+			case 0x10: if (rd) TwG(rd).UD[0] = cpuRegs.HI.UD[k]; return; // MFHI
+			case 0x12: if (rd) TwG(rd).UD[0] = cpuRegs.LO.UD[k]; return; // MFLO
+			case 0x11: cpuRegs.HI.UD[k] = TwR64(rs); return;              // MTHI
+			case 0x13: cpuRegs.LO.UD[k] = TwR64(rs); return;              // MTLO
+			case 0x18: case 0x19: // MULT/MULTU
+			{
+				const u32 a = TwR32(rs), b = TwR32(rt);
+				const u64 res = funct == 0x18 ? (u64)((s64)(s32)a * (s64)(s32)b) : (u64)a * (u64)b;
+				const s64 lo = (s32)(u32)res, hi = (s32)(u32)(res >> 32);
+				cpuRegs.LO.SD[k] = lo;
+				cpuRegs.HI.SD[k] = hi;
+				if (rd) TwG(rd).SD[0] = lo;
+				return;
+			}
+			case 0x1a: // DIV
+			{
+				const s32 a = (s32)TwR32(rs), b = (s32)TwR32(rt);
+				s64 lo, hi;
+				if (!b) { lo = a < 0 ? 1 : -1; hi = a; }
+				else if (a == (s32)0x80000000 && b == -1) { lo = (s32)0x80000000; hi = 0; }
+				else { lo = a / b; hi = a % b; }
+				cpuRegs.LO.SD[k] = lo;
+				cpuRegs.HI.SD[k] = hi;
+				return;
+			}
+			case 0x1b: // DIVU
+			{
+				const u32 a = TwR32(rs), b = TwR32(rt);
+				s64 lo, hi;
+				if (!b) { lo = -1; hi = (s32)a; }
+				else { lo = (s32)(a / b); hi = (s32)(a % b); }
+				cpuRegs.LO.SD[k] = lo;
+				cpuRegs.HI.SD[k] = hi;
+				return;
+			}
+		}
+	}
+	// EmitMadd
+	void TwinMadd(bool is_unsigned, u32 rs, u32 rt, u32 rd, u32 k)
+	{
+		const u64 acc = (u64)cpuRegs.LO.UL[2 * k] | ((u64)cpuRegs.HI.UL[2 * k] << 32);
+		const u32 a = TwR32(rs), b = TwR32(rt);
+		const u64 p = is_unsigned ? (u64)a * (u64)b : (u64)((s64)(s32)a * (s64)(s32)b);
+		const u64 t = acc + p;
+		const s64 lo = (s32)(u32)t, hi = (s32)(u32)(t >> 32);
+		cpuRegs.LO.SD[k] = lo;
+		cpuRegs.HI.SD[k] = hi;
+		if (rd) TwG(rd).SD[0] = lo;
+	}
+
+	// EmitMmiDiv. Not the interpreter's: the emitter takes MMI3 sub 0x1d for PDIVBW, which the
+	// interpreter's table has at MMI2 sub 0x1d (its MMI3 0x1d is MMI_Unknown).
+	void TwinMmiDiv(u32 insn)
+	{
+		const int act = MmiDivAction(insn);
+		const u32 rs = (insn >> 21) & 31, rt = (insn >> 16) & 31;
+		const bool bw = act == MD_PDIVBW, uw = act == MD_PDIVUW;
+		const u32 bdiv = bw ? (u32)(s32)TwG(rt).SS[0] : 0; // read once, before any lane
+		for (int i = 0; i < (bw ? 4 : 2); i++)
+		{
+			const int word = bw ? i : i * 2;
+			const u32 a = TwG(rs).UL[word];
+			const u32 b = bw ? bdiv : TwG(rt).UL[word];
+			u32 q, r;
+			if (uw) { q = b ? a / b : 0xffffffffu; r = b ? a - q * b : a; }
+			else if (!b) { q = (s32)a < 0 ? 1 : 0xffffffffu; r = a; }
+			else if (a == 0x80000000u && b == 0xffffffffu) { q = 0x80000000u; r = 0; }
+			else { q = (u32)((s32)a / (s32)b); r = a - q * b; }
+			if (bw) { cpuRegs.LO.UL[i] = q; cpuRegs.HI.UL[i] = r; }
+			else { cpuRegs.LO.SD[i] = (s32)q; cpuRegs.HI.SD[i] = (s32)r; }
+		}
+	}
+
+	// An op the emitter hands to its interpreter implementation (EmitInterpOpCall): cpuRegs.code
+	// is staged and left so.
+	inline void TwinInterpCall(u32 insn, void (*fn)()) { cpuRegs.code = insn; fn(); }
+	// An op whose emitter is the interpreter's arithmetic, run by that implementation; the
+	// emitted code leaves cpuRegs.code alone, so this does too. TwinSelfTest holds each such op
+	// to its emitter.
+	inline void TwinAsInterp(u32 insn)
+	{
+		const u32 code = cpuRegs.code;
+		cpuRegs.code = insn;
+		R5900::GetInstruction(insn).interpret();
+		cpuRegs.code = code;
+	}
+
+	// EmitCop2Transfer (the caller has checked Cop2XferSupported)
+	void TwinCop2Transfer(u32 insn)
+	{
+		const u32 rs = (insn >> 21) & 31, rt = (insn >> 16) & 31, fs = (insn >> 11) & 31;
+		const bool is_read = (rs == 0x01 || rs == 0x02);
+		vu0Sync();
+		if (insn & 1)
+		{
+			if (is_read) _vu0FinishMicro(); else _vu0WaitMicro();
+		}
+		switch (rs)
+		{
+			case 0x01: if (rt) TwG(rt).UQ = vuRegs[0].VF[fs].UQ; return;    // QMFC2
+			case 0x05: if (fs) vuRegs[0].VF[fs].UQ = TwG(rt).UQ; return;    // QMTC2 (memory, r0 included)
+			case 0x02: // CFC2
+			{
+				if (!rt) return;
+				const u32 v = vuRegs[0].VI[fs].UL;
+				if (fs == REG_R) TwG(rt).UL[0] = v & 0x7fffff;
+				else TwG(rt).SD[0] = (s32)v;
+				return;
+			}
+			case 0x06: // CTC2
+			{
+				if (!fs || fs == REG_MAC_FLAG || fs == REG_TPC || fs == REG_VPU_STAT) return;
+				const u32 v = TwR32(rt);
+				vuRegs[0].VI[fs].UL = (fs == REG_R) ? ((v & 0x7fffff) | 0x3f800000) : v;
+				return;
+			}
+		}
+	}
+
+	// The misalign cancel (EmitMisalignGuard's stub): pc still the block's, its cycles not yet
+	// accounted, every GPR write so far in memory -- as the stub leaves them.
+	inline void TwMisalign(u32 addr, u32 amask)
+	{
+		if (addr & amask)
+			eeCancelInstruction_arm64(); // never returns
+	}
+
+	// EmitSimple (IsTranslatable(insn): its verdict on whether EmitSimple emits insn)
+	void TwinSimple(u32 insn)
+	{
+		const u32 op = insn >> 26;
+		const u32 rs = (insn >> 21) & 31, rt = (insn >> 16) & 31, rd = (insn >> 11) & 31, sa = (insn >> 6) & 31;
+		const u32 funct = insn & 0x3f;
+		const s32 simm = (int16_t)(insn & 0xffff);
+		const u32 zimm = insn & 0xffff;
+		switch (op)
+		{
+			case 0x00:
+			{
+				const u64 a = TwR64(rs), b = TwR64(rt);
+				u64 d;
+				switch (funct)
+				{
+					case 0x00: d = (u64)(s64)(s32)((u32)b << sa); break;                 // SLL
+					case 0x02: d = (u64)(s64)(s32)((u32)b >> sa); break;                 // SRL
+					case 0x03: d = (u64)(s64)((s32)(u32)b >> sa); break;                 // SRA
+					case 0x04: d = (u64)(s64)(s32)((u32)b << (a & 31)); break;           // SLLV
+					case 0x06: d = (u64)(s64)(s32)((u32)b >> (a & 31)); break;           // SRLV
+					case 0x07: d = (u64)(s64)((s32)(u32)b >> (a & 31)); break;           // SRAV
+					case 0x20: case 0x21: d = (u64)(s64)(s32)((u32)a + (u32)b); break;   // ADD/ADDU
+					case 0x22: case 0x23: d = (u64)(s64)(s32)((u32)a - (u32)b); break;   // SUB/SUBU
+					case 0x24: d = a & b; break;
+					case 0x25: d = a | b; break;
+					case 0x26: d = a ^ b; break;
+					case 0x27: d = ~(a | b); break;
+					case 0x2a: d = (s64)a < (s64)b; break;                               // SLT
+					case 0x2b: d = a < b; break;                                         // SLTU
+					case 0x2c: case 0x2d: d = a + b; break;                              // DADD/DADDU
+					case 0x2e: case 0x2f: d = a - b; break;                              // DSUB/DSUBU
+					case 0x14: d = b << (a & 63); break;                                 // DSLLV
+					case 0x16: d = b >> (a & 63); break;                                 // DSRLV
+					case 0x17: d = (u64)((s64)b >> (a & 63)); break;                     // DSRAV
+					case 0x38: d = b << sa; break;
+					case 0x3a: d = b >> sa; break;
+					case 0x3b: d = (u64)((s64)b >> sa); break;
+					case 0x3c: d = b << (sa + 32); break;
+					case 0x3e: d = b >> (sa + 32); break;
+					case 0x3f: d = (u64)((s64)b >> (sa + 32)); break;
+					case 0x10: case 0x11: case 0x12: case 0x13: case 0x18: case 0x19: case 0x1a: case 0x1b:
+						TwinMulDiv(funct, rs, rt, rd, 0);
+						return;
+					case 0x0f: return; // SYNC
+					case 0x28: if (rd) TwG(rd).UD[0] = cpuRegs.sa; return;              // MFSA
+					case 0x29: cpuRegs.sa = (u32)a & 0xf; return;                       // MTSA
+					case 0x0a: case 0x0b:                                                // MOVZ/MOVN
+						if (rd && ((b == 0) == (funct == 0x0a)))
+							TwG(rd).UD[0] = a;
+						return;
+					default: return;
+				}
+				if (rd)
+					TwG(rd).UD[0] = d;
+				return;
+			}
+			case 0x08: case 0x09: if (rt) TwG(rt).SD[0] = (s32)(TwR32(rs) + (u32)simm); return; // ADDI/ADDIU
+			case 0x18: case 0x19: if (rt) TwG(rt).UD[0] = TwR64(rs) + (u64)(s64)simm; return;   // DADDI/DADDIU
+			case 0x0a: if (rt) TwG(rt).UD[0] = (s64)TwR64(rs) < (s64)simm; return;               // SLTI
+			case 0x0b: if (rt) TwG(rt).UD[0] = TwR64(rs) < (u64)(s64)simm; return;               // SLTIU
+			case 0x0c: if (rt) TwG(rt).UD[0] = TwR64(rs) & zimm; return;                         // ANDI
+			case 0x0d: if (rt) TwG(rt).UD[0] = TwR64(rs) | zimm; return;                         // ORI
+			case 0x0e: if (rt) TwG(rt).UD[0] = TwR64(rs) ^ zimm; return;                         // XORI
+			case 0x0f: if (rt) TwG(rt).SD[0] = (s32)(zimm << 16); return;                        // LUI
+			case 0x01:
+				if (rt == 0x18) cpuRegs.sa = (TwR32(rs) & 0xF) ^ (zimm & 0xF);                    // MTSAB
+				else cpuRegs.sa = ((TwR32(rs) & 0x7) ^ (zimm & 0x7)) << 1;                         // MTSAH
+				return;
+			case 0x20: case 0x24: case 0x21: case 0x25: case 0x23: case 0x27: case 0x37:
+			{
+				const u32 addr = TwR32(rs) + (u32)simm;
+				TwMisalign(addr, op == 0x37 ? 7 : (op == 0x23 || op == 0x27) ? 3 : (op == 0x21 || op == 0x25) ? 1 : 0);
+				u64 v;
+				switch (op)
+				{
+					case 0x20: v = (u64)(s64)(int8_t)eeRead8_arm64(addr); break;
+					case 0x24: v = eeRead8_arm64(addr); break;
+					case 0x21: v = (u64)(s64)(int16_t)eeRead16_arm64(addr); break;
+					case 0x25: v = eeRead16_arm64(addr); break;
+					case 0x23: v = (u64)(s64)(s32)eeRead32_arm64(addr); break;
+					case 0x27: v = eeRead32_arm64(addr); break;
+					default:   v = eeRead64_arm64(addr); break;
+				}
+				if (rt)
+					TwG(rt).UD[0] = v;
+				return;
+			}
+			case 0x22: eeLWL_arm64(TwR32(rs) + (u32)simm, rt); return;
+			case 0x26: eeLWR_arm64(TwR32(rs) + (u32)simm, rt); return;
+			case 0x1a: eeLDL_arm64(TwR32(rs) + (u32)simm, rt); return;
+			case 0x1b: eeLDR_arm64(TwR32(rs) + (u32)simm, rt); return;
+			case 0x2a: eeSWL_arm64(TwR32(rs) + (u32)simm, rt); return;
+			case 0x2e: eeSWR_arm64(TwR32(rs) + (u32)simm, rt); return;
+			case 0x2c: eeSDL_arm64(TwR32(rs) + (u32)simm, rt); return;
+			case 0x2d: eeSDR_arm64(TwR32(rs) + (u32)simm, rt); return;
+			case 0x28: case 0x29: case 0x2b: case 0x3f:
+			{
+				const u32 addr = TwR32(rs) + (u32)simm;
+				TwMisalign(addr, op == 0x3f ? 7 : op == 0x2b ? 3 : op == 0x29 ? 1 : 0);
+				const u64 v = TwR64(rt);
+				switch (op)
+				{
+					case 0x28: eeWrite8_arm64(addr, (u32)v); break;
+					case 0x29: eeWrite16_arm64(addr, (u32)v); break;
+					case 0x2b: eeWrite32_arm64(addr, (u32)v); break;
+					default:   eeWrite64_arm64(addr, v); break;
+				}
+				return;
+			}
+			case 0x33: return; // PREF
+			case 0x1e: eeRead128_arm64((TwR32(rs) + (u32)simm) & 0xfffffff0, &TwG(rt).UQ); return;  // LQ (rt != 0)
+			case 0x1f: eeWrite128_arm64((TwR32(rs) + (u32)simm) & 0xfffffff0, &TwG(rt).UQ); return; // SQ
+			case 0x11: TwinCop1(insn); return;
+			case 0x1c:
+				switch (funct)
+				{
+					case 0x10: case 0x11: case 0x12: case 0x13: case 0x18: case 0x19: case 0x1a: case 0x1b:
+						TwinMulDiv(funct, rs, rt, rd, 1);
+						return;
+					case 0x00: case 0x01: TwinMadd(funct == 0x01, rs, rt, rd, 0); return;
+					case 0x20: case 0x21: TwinMadd(funct == 0x21, rs, rt, rd, 1); return;
+					case 0x04: // PLZCW
+						if (rd)
+						{
+							const u64 a = TwR64(rs);
+							TwG(rd).UD[0] = (u64)(u32)__builtin_clrsb((int)(u32)a) | ((u64)(u32)__builtin_clrsb((int)(u32)(a >> 32)) << 32);
+						}
+						return;
+				}
+				if (IsPcpyh(insn))
+				{
+					if (rd)
+					{
+						const u64 lo = TwG(rt).US[0], hi = TwG(rt).US[4];
+						TwG(rd).UD[0] = lo * 0x0001000100010001ull;
+						TwG(rd).UD[1] = hi * 0x0001000100010001ull;
+					}
+					return;
+				}
+				if (IsQfsrv(insn))
+				{
+					TwinInterpCall(insn, &R5900::Interpreter::OpcodeImpl::MMI::QFSRV);
+					return;
+				}
+				if (MmiDivAction(insn)) { TwinMmiDiv(insn); return; }
+				TwinAsInterp(insn); // EmitMmi/HiLo/Perm/Mul/Macc/Hmacc: the interpreter's arithmetic
+				return;
+			case 0x12: // COP2, rs != BC2. AOT: the macro ops are interpreted.
+				if (Cop2XferSupported(insn)) { TwinCop2Transfer(insn); return; }
+				TwinInterpCall(insn, &R5900::Interpreter::OpcodeImpl::COP2);
+				return;
+			case 0x2f: TwinInterpCall(insn, &R5900::Interpreter::OpcodeImpl::CACHE); return;
+			case 0x10:
+				if (rs == 0x00)
+				{
+					if (!rt && rd != 9) return;
+					if (rd == 9 || rd == 25) { TwinInterpCall(insn, &R5900::Interpreter::OpcodeImpl::COP0::MFC0); return; }
+					if (rd == 24) return;
+					TwG(rt).SD[0] = (s32)(cpuRegs.CP0.r[rd] & (rd == 12 ? 0xf0c79c1fu : 0xffffffffu));
+					return;
+				}
+				if (rs == 0x04) { TwinInterpCall(insn, &R5900::Interpreter::OpcodeImpl::COP0::MTC0); return; }
+				TwinInterpCall(insn, funct == 0x38 ? &R5900::Interpreter::OpcodeImpl::COP0::EI : &R5900::Interpreter::OpcodeImpl::COP0::DI);
+				return;
+			case 0x31: // LWC1: a misaligned address is skipped
+			{
+				const u32 addr = TwR32(rs) + (u32)simm;
+				if (!(addr & 3)) TwFpr(rt) = eeRead32_arm64(addr);
+				return;
+			}
+			case 0x39: // SWC1
+			{
+				const u32 addr = TwR32(rs) + (u32)simm;
+				if (!(addr & 3)) eeWrite32_arm64(addr, TwFpr(rt));
+				return;
+			}
+			case 0x36: vu0Sync(); eeRead128_arm64(TwR32(rs) + (u32)simm, rt ? &vuRegs[0].VF[rt].UQ : &s_lqc2_sink); return; // LQC2
+			case 0x3e: vu0Sync(); eeWrite128_arm64(TwR32(rs) + (u32)simm, &vuRegs[0].VF[rt].UQ); return;            // SQC2
+		}
+	}
+
+	// EmitUnalignedPair
+	void TwinPair(u32 a, u32 b)
+	{
+		UPair u;
+		UnalignedPair(a, b, &u);
+		const u32 addr = TwR32(u.rs) + (u32)u.off;
+		if (u.load)
+			TwG(u.rt).UD[0] = u.is64 ? eeReadU64_arm64(addr) : (u64)(s64)(s32)eeReadU32_arm64(addr);
+		else if (u.is64)
+			eeWriteU64_arm64(addr, TwR64(u.rt));
+		else
+			eeWriteU32_arm64(addr, TwR32(u.rt));
+	}
+
+	// EmitBranch's decisions for one branch
+	enum : u8 { TC_EQ, TC_NE, TC_LE, TC_GT, TC_LT, TC_GE };
+	struct TwinBranch
+	{
+		u32 bpc = 0, insn = 0, ds = 0, tconst = 0, rs = 0, rt = 0;
+		int link = -1, cyc_leading = 0, cyc_taken = 0, cyc_nt = 0;
+		u8 cond = TC_EQ;
+		bool uncond = false, is_jr = false, two = false, one = false, likely = false;
+		bool bc0 = false, bc1 = false, bc2 = false, ds_interp = false, idle_skip = false, nt_evt = false;
+	};
+	bool TwinBranchDecode(u32 bpc, u32 insn, int cyc_leading, TwinBranch& b)
+	{
+		b = TwinBranch{};
+		const u32 op = insn >> 26, rs = (insn >> 21) & 31, rt = (insn >> 16) & 31, funct = insn & 0x3f;
+		const s32 simm = (int16_t)(insn & 0xffff);
+		const u32 jtarget = ((bpc + 4) & 0xf0000000) | ((insn & 0x3ffffff) << 2);
+		const u32 t = bpc + 4 + simm * 4;
+		b.bpc = bpc; b.insn = insn; b.rs = rs; b.rt = rt; b.cyc_leading = cyc_leading;
+		if      (op == 0x00 && funct == 0x08) { b.uncond = true; b.is_jr = true; }
+		else if (op == 0x00 && funct == 0x09) { b.uncond = true; b.is_jr = true; b.link = (int)((insn >> 11) & 31); }
+		else if (op == 0x02) { b.uncond = true; b.tconst = jtarget; }
+		else if (op == 0x03) { b.uncond = true; b.link = 31; b.tconst = jtarget;
+			if (jtarget == 0x3563b8 || jtarget == 0x35d628 || jtarget == 0x35c118) return false; }
+		else if (op == 0x04) { b.two = true; b.cond = TC_EQ; b.tconst = t; }
+		else if (op == 0x05) { b.two = true; b.cond = TC_NE; b.tconst = t; }
+		else if (op == 0x06) { b.one = true; b.cond = TC_LE; b.tconst = t; }
+		else if (op == 0x07) { b.one = true; b.cond = TC_GT; b.tconst = t; }
+		else if (op == 0x14) { b.two = true; b.cond = TC_EQ; b.tconst = t; b.likely = true; }
+		else if (op == 0x15) { b.two = true; b.cond = TC_NE; b.tconst = t; b.likely = true; }
+		else if (op == 0x16) { b.one = true; b.cond = TC_LE; b.tconst = t; b.likely = true; }
+		else if (op == 0x17) { b.one = true; b.cond = TC_GT; b.tconst = t; b.likely = true; }
+		else if (op == 0x01)
+		{
+			if      (rt == 0x00) { b.one = true; b.cond = TC_LT; b.tconst = t; }
+			else if (rt == 0x01) { b.one = true; b.cond = TC_GE; b.tconst = t; }
+			else if (rt == 0x02) { b.one = true; b.cond = TC_LT; b.tconst = t; b.likely = true; }
+			else if (rt == 0x03) { b.one = true; b.cond = TC_GE; b.tconst = t; b.likely = true; }
+			else if (rt == 0x10) { b.one = true; b.cond = TC_LT; b.tconst = t; b.link = 31; }
+			else if (rt == 0x11) { b.one = true; b.cond = TC_GE; b.tconst = t; b.link = 31; }
+			else return false;
+		}
+		else if ((op == 0x10 || op == 0x11 || op == 0x12) && rs == 0x08)
+		{
+			if (rt > 3) return false;
+			b.bc0 = op == 0x10; b.bc1 = op == 0x11; b.bc2 = op == 0x12;
+			b.cond = (rt & 1) ? TC_NE : TC_EQ;
+			b.tconst = t;
+			b.likely = (rt & 2) != 0;
+		}
+		else return false;
+
+		b.ds = memRead32(bpc + 4);
+		b.ds_interp = !IsTranslatable(b.ds);
+		if (b.ds_interp && !(b.likely && (b.two || b.one) && !b.bc0 && !b.bc1 && !b.bc2 && b.link < 0))
+			return false;
+		b.cyc_taken = cyc_leading + OpCycles(insn) + OpCycles(b.ds);
+		b.cyc_nt = cyc_leading + OpCycles(insn);
+		b.idle_skip = EmuConfig.Speedhacks.WaitLoop && !b.is_jr && ((b.tconst & 0x1fffffff) == 0x00081fc0);
+		b.nt_evt = (op == 0x04 || op == 0x05 || (b.likely && !b.bc0 && !b.bc1 && !b.bc2));
+		return true;
+	}
+
+	enum : u8 { TE_TAIL, TE_CAP, TE_BRANCH, TE_ERET };
+	struct Twin
+	{
+		struct Step { u32 a, b; bool pair; };
+		std::vector<Step> steps; // the leading run, in order
+		u32 p = 0;               // where it ended: CAP's exit, TAIL's first untranslated word
+		int n = 0, cyc = 0;      // its op count (a pair is two) and raw cycle sum
+		u8 end = TE_TAIL;
+		u32 eret = 0;
+		TwinBranch br;
+		u32 ne = 0;              // Norm(one past what the block's code would cover)
+		bool live = true;
+		std::vector<u32> src;    // the words [Norm(pc), ne), for a revive (Revive's src)
+	};
+
+	// CompileBlock's extent, read as it reads it
+	void TwinDecode(u32 pc, Twin& t)
+	{
+		int n = 0, cyc = 0;
+		u32 p = pc;
+		bool done = false, branch_end = false;
+		while (n < kMaxInsns)
+		{
+			const u32 insn = memRead32(p);
+			if (n + 2 <= kMaxInsns)
+			{
+				UPair up;
+				const u32 next = memRead32(p + 4);
+				if (UnalignedPair(insn, next, &up))
+				{
+					t.steps.push_back({insn, next, true});
+					cyc += OpCycles(insn) + OpCycles(next);
+					p += 8; n += 2;
+					continue;
+				}
+			}
+			if (IsTranslatable(insn))
+			{
+				t.steps.push_back({insn, 0, false});
+				cyc += OpCycles(insn); p += 4; n++;
+				continue;
+			}
+			if (TwinBranchDecode(p, insn, cyc, t.br)) { t.end = TE_BRANCH; done = branch_end = true; break; }
+			if ((insn >> 26) == 0x10 && ((insn >> 21) & 31) == 0x10 && (insn & 0x3f) == 0x18)
+			{
+				t.eret = insn; t.end = TE_ERET; p += 4; n++; done = true; break;
+			}
+			break;
+		}
+		if (!done)
+			t.end = (n == kMaxInsns) ? TE_CAP : TE_TAIL;
+		t.p = p; t.n = n; t.cyc = cyc;
+		t.ne = Norm(branch_end ? p + 8 : p);
+		const u32 ns = Norm(pc);
+		if (t.ne > ns)
+		{
+			t.src.resize((t.ne - ns) >> 2);
+			for (u32 q = 0; q < (u32)t.src.size(); q++)
+				t.src[q] = memRead32(pc + q * 4);
+		}
+	}
+
+	u32 s_twin_red = 0; // LRPS2_TWIN_RED=N: N raw cycles too many on every twin block (the red receipt)
+	int s_twin_selftest = 0; // LRPS2_TWIN_SELFTEST=N: TwinSelfTest's block count
+	// EmitCycleBookkeeping: cpuBlockCycles += cyc * (2 - Config[18]), Config read at the tail
+	inline void TwBook(int cyc)
+	{
+		const u32 c = (u32)cyc;
+		cpuBlockCycles += (cpuRegs.CP0.n.Config & (1u << 18)) ? c : c * 2;
+	}
+	// EmitTailCycles(with_update): the inline default-rate update is intUpdateCPUCycles' rate-0 arm
+	inline void TwTail(int cyc) { TwBook(cyc); eeUpdateCycles_arm64(); }
+	inline bool TwDue() { return (s64)(cpuRegs.cycle - cpuRegs.nextEventCycle) >= 0; }
+	// EmitKnownExit: a target outside RAM has no LUT slot, and its event test is not gated
+	inline void TwKnownExit(u32 target, bool evt)
+	{
+		if (evt && (!InRam(Norm(target)) || TwDue()))
+			eeEventTest_arm64();
+	}
+	inline void TwIdleSkip()
+	{
+		if (!TwDue())
+			cpuRegs.cycle = cpuRegs.nextEventCycle;
+	}
+
+	void TwinBranchRun(const TwinBranch& b)
+	{
+		if (b.link > 0)
+			TwG(b.link).UD[0] = (u32)(b.bpc + 8);
+		const u32 jr = b.is_jr ? TwR32(b.rs) : 0; // read after the link, as the code does
+		if (b.uncond)
+		{
+			TwinSimple(b.ds);
+			cpuRegs.pc = b.is_jr ? jr : b.tconst;
+			TwTail(b.cyc_taken);
+			if (b.idle_skip) TwIdleSkip();
+			if (b.is_jr) { if (TwDue()) eeEventTest_arm64(); }
+			else TwKnownExit(b.tconst, true);
+			return;
+		}
+		bool taken;
+		if (b.bc0) taken = (R5900::Interpreter::OpcodeImpl::COP0::CPCOND0() == 0) == (b.cond == TC_EQ);
+		else if (b.bc1) taken = ((fpuRegs.fprc[31] & 0x00800000) == 0) == (b.cond == TC_EQ);
+		else if (b.bc2) taken = ((vuRegs[0].VI[REG_VPU_STAT].UL & 0x100) == 0) == (b.cond == TC_EQ);
+		else
+		{
+			const s64 a = (s64)TwR64(b.rs), c = (b.two && b.rt) ? (s64)TwR64(b.rt) : 0;
+			switch (b.cond)
+			{
+				case TC_EQ: taken = a == c; break;
+				case TC_NE: taken = a != c; break;
+				case TC_LE: taken = a <= c; break;
+				case TC_GT: taken = a > c; break;
+				case TC_LT: taken = a < c; break;
+				default:    taken = a >= c; break;
+			}
+		}
+		if (taken)
+		{
+			if (b.ds_interp)
+			{
+				cpuRegs.pc = b.bpc;
+				TwBook(b.cyc_leading);
+				eeRunBasicBlock_arm64();
+				return;
+			}
+			TwinSimple(b.ds);
+			cpuRegs.pc = b.tconst;
+			TwTail(b.cyc_taken);
+			if (b.idle_skip) TwIdleSkip();
+			TwKnownExit(b.tconst, true);
+			return;
+		}
+		TwBook(b.cyc_nt);
+		const u32 nt = b.bpc + (b.likely ? 8 : 4);
+		cpuRegs.pc = nt;
+		TwKnownExit(nt, b.nt_evt);
+	}
+
+	// EmitEret
+	void TwinEret(int cyc)
+	{
+		const u32 st = cpuRegs.CP0.n.Status.val;
+		const bool erl = (st & 4) != 0;
+		cpuRegs.pc = erl ? cpuRegs.CP0.n.ErrorEPC : cpuRegs.CP0.n.EPC;
+		cpuRegs.CP0.n.Status.val = erl ? (st & ~4u) : (st & ~2u);
+		const u64 c = cpuRegs.cycle;
+		if ((s32)((u32)cpuRegs.nextEventCycle - (u32)c) > 4)
+			cpuRegs.nextEventCycle = c + 4;
+		TwBook(cyc);
+	}
+
+	void TwinRun(const Twin& t)
+	{
+		if (s_twin_red)
+			cpuBlockCycles += s_twin_red;
+		for (const Twin::Step& s : t.steps)
+		{
+			if (s.pair) TwinPair(s.a, s.b);
+			else TwinSimple(s.a);
+		}
+		switch (t.end)
+		{
+			case TE_CAP:
+				cpuRegs.pc = t.p;
+				TwBook(t.cyc);
+				return;
+			case TE_TAIL:
+				if (t.n > 0)
+				{
+					cpuRegs.pc += 4 * t.n;
+					TwBook(t.cyc);
+				}
+				eeRunBasicBlock_arm64();
+				return;
+			case TE_ERET:
+				TwinEret(t.cyc + OpCycles(t.eret));
+				return;
+			default:
+				TwinBranchRun(t.br);
+				return;
+		}
+	}
+
+	// Interp's twins, by pc like s_blocks; never in the LUT (a chain jumps into what the LUT
+	// holds), so every entry is the dispatcher's, through InstallBlock.
+	std::unordered_map<u32, Twin> s_twins;
+	const Twin* s_twin_cur = nullptr;
+	u64 s_twin_runs = 0, s_twin_decodes = 0, s_twin_revives = 0;
+	void TwinBlock(void**) { s_twin_runs++; TwinRun(*s_twin_cur); }
+	void TwinReport()
+	{
+		fprintf(stderr, "lrps2 AOT interp: EE twin %llu blocks decoded, %llu revived, %llu runs\n",
+			(unsigned long long)s_twin_decodes, (unsigned long long)s_twin_revives, (unsigned long long)s_twin_runs);
+	}
+	// The twin of pc's block if it holds (live, or its words as they were: Revive's rule), else
+	// none, its record gone.
+	BlockFn TwinCached(u32 pc)
+	{
+		auto it = s_twins.find(pc);
+		if (it == s_twins.end())
+			return nullptr;
+		Twin& t = it->second;
+		if (!t.live && InRam(Norm(pc)))
+		{
+			bool same = true;
+			for (u32 q = 0; same && q < (u32)t.src.size(); q++)
+				same = memRead32(pc + q * 4) == t.src[q];
+			if (same)
+			{
+				t.live = true;
+				s_twin_revives++;
+				RegisterPages(pc, Norm(pc), t.ne);
+			}
+		}
+		if (!t.live)
+		{
+			s_twins.erase(it);
+			return nullptr;
+		}
+		s_twin_cur = &t;
+		return &TwinBlock;
+	}
+	BlockFn TwinNew(u32 pc)
+	{
+		static const bool reported = (atexit(TwinReport), true);
+		(void)reported;
+		Twin& t = s_twins[pc];
+		t = Twin{};
+		TwinDecode(pc, t);
+		s_twin_decodes++;
+		RegisterPages(pc, Norm(pc), t.ne);
+		s_twin_cur = &t;
+		return &TwinBlock;
+	}
+
+	aot::Block s_aot_block; // HH-37: the last compiled block's key and code (CompileBlock)
+
+	// HH-37 Emit: whether the record being re-compiled kept guest_pc's access off fastmem
+	bool EmitMaskedOff(u32 guest_pc)
+	{
+		const u32 i = (guest_pc - s_reader.rec->pc) >> 2;
+		return i < aot::GUEST_WORDS_MAX && ((s_reader.rec->mask[i >> 5] >> (i & 31)) & 1);
+	}
+
+	// The no-fastmem mask of a block at pc of n key words, as the faults so far make it (HH-37)
+	inline void FaultMask(u32 mask[3], u32 pc, size_t n)
+	{
+		aot::faultMask(mask, pc, FastmemMode() ? n : 0, [](u32 a) { return !FastmemOk(a); });
+	}
+
+	// The code cache's wrap: everything compiled goes, as the cache rewinds. HH-37: Load installs
+	// an image's block where the JIT would compile it and counts its code bytes alike
+	// (InstallBlock), so it wraps where its Shape run did; Interp does not (a miss runs on the twin,
+	// which adds no code), so there the wraps fall elsewhere. Interp's twins go with the pages
+	// that record them.
+	void WrapIfFull()
 	{
 		if (s_code_pos + 8192 > kCodeCacheSize)
 		{
 			s_blocks.clear();
+			s_twins.clear();
 			s_page.clear();
 			LutClearAll();
 			s_code_pos = 0;
 			s_fm_sites.clear(); // C.50: the code they point at gets overwritten
 			s_fm_pending.clear();
 		}
+	}
+
+	BlockFn CompileBlock(u32 pc)
+	{
+		s_reader.start(pc);
+		if (s_reader.rec)
+			s_code_pos = 0; // HH-37 Emit: each record alone, at the start of a plain buffer
+		else
+			WrapIfFull();
 
 		u8* start = s_code + s_code_pos;
 		// C.60: decided before emission (the entry check is part of the code we are
@@ -4142,7 +5070,7 @@ namespace {
 		// Written through the write alias, run at `start`: `start` is what is
 		// flushed, recorded in s_fm_sites and published as the BlockFn.
 		s_block_exec = start;
-		MacroAssembler masm(armJitRW(start), kCodeCacheSize - s_code_pos, PositionDependentCode);
+		MacroAssembler masm(s_reader.rec ? start : armJitRW(start), kCodeCacheSize - s_code_pos, PositionDependentCode);
 		// The aVU macro emitters (C.30-2) hold RSCRATCHADDR (x17) and q31 across
 		// vixl macro expansions -- keep the assembler from synthesizing into them
 		// (mirrors armStartBlock in AsmHelpers.cpp).
@@ -4162,6 +5090,21 @@ namespace {
 		masm.Stp(x24, x25, MemOperand(sp, 48));
 		masm.Stp(x26, x27, MemOperand(sp, 64));
 		masm.Str(x28, MemOperand(sp, 80));
+		if (aot::shaped())
+		{
+			// HH-37: x20 = the import table (the block's argument); x19 and x28 from it.
+			u32 goff, voff;
+			const u32 gslot = aot::slotOf(&cpuRegs.GPR.r[0], &goff) * 8;
+			const u32 vslot = aot::slotOf(FastmemMode() ? (const void*)&vtlbdata.fastmem_base : (const void*)&vtlbdata.vmap, &voff) * 8;
+			AOT_CHECK(goff == 0 && voff == 0, "the EE prologue's bases are not their imports' starts");
+			vixl::ExactAssemblyScope scope(&masm, 4 * kInstructionSize);
+			masm.mov(importsReg, x0);
+			masm.ldr(gpr, MemOperand(importsReg, gslot));
+			masm.ldr(vmapbase, MemOperand(importsReg, vslot));
+			masm.ldr(vmapbase, MemOperand(vmapbase));
+		}
+		else
+		{
 		{
 			// Exactly 4 instructions so kChainEntryOffset stays constant
 			// (VIXL's Mov would shrink the sequence for compressible values).
@@ -4190,6 +5133,11 @@ namespace {
 			masm.movk(vmapbase, (vv >> 48) & 0xffff, 48);
 			masm.ldr(vmapbase, MemOperand(vmapbase));
 		}
+		}
+		// a chain enters past the prologue (ChainEntryOffset), so its length is the shaped form's invariant
+		if (aot::shaped())
+			AOT_CHECK(masm.GetSizeOfCodeGenerated() == ChainEntryOffset(), "the EE prologue is %zu bytes, a chain enters at %u",
+				masm.GetSizeOfCodeGenerated(), ChainEntryOffset());
 
 		// C.60: a block on a manual page is not protected by anything -- check its
 		// source before running it. This sits at kChainEntryOffset (the prologue
@@ -4201,8 +5149,7 @@ namespace {
 			s_stale_pc = pc;
 			masm.Mov(x0, reinterpret_cast<uint64_t>(rec_ptr)); // C.61: no lookup
 			masm.Mov(w1, pc);
-			masm.Mov(x16, reinterpret_cast<uint64_t>(&eeBlockValidate_arm64));
-			masm.Blr(x16);
+			EmitCall(masm, reinterpret_cast<uint64_t>(&eeBlockValidate_arm64));
 			s_exit_labels.emplace_back();
 			s_stale = &s_exit_labels.back();
 			masm.Cbz(w0, s_stale); // source changed -> discarded, back to dispatcher
@@ -4218,7 +5165,7 @@ namespace {
 		while (n < kMaxInsns)
 		{
 			s_emit_budget = (int)(kMaxInsns - n); // C.66: a COP2 run may not outlive the block
-			const u32 insn = memRead32(p);
+			const u32 insn = ReadCode(p);
 			s_emit_pc = p; // C.50: guest pc of the op being emitted (fastmem site bookkeeping)
 			// C.67: fuse the canonical unaligned pair into one host access. Both
 			// ops are consumed; the pair never straddles the block cap, and the
@@ -4226,10 +5173,10 @@ namespace {
 			if (n + 2 <= kMaxInsns)
 			{
 				UPair up;
-				if (UnalignedPair(insn, memRead32(p + 4), &up))
+				if (UnalignedPair(insn, ReadCode(p + 4), &up))
 				{
 					EmitUnalignedPair(masm, gpr, up);
-					cyc += OpCycles(insn) + OpCycles(memRead32(p + 4));
+					cyc += OpCycles(insn) + OpCycles(ReadCode(p + 4));
 					p += 8; n += 2;
 					continue;
 				}
@@ -4272,8 +5219,7 @@ namespace {
 			// dirty cache before the call, and treat everything as unknown after
 			// (the block ends right away, but keep the invariant explicit).
 			s_rc.FlushDirty(masm, gpr);
-			masm.Mov(x16, reinterpret_cast<uint64_t>(&eeRunBasicBlock_arm64));
-			masm.Blr(x16);
+			EmitCall(masm, reinterpret_cast<uint64_t>(&eeRunBasicBlock_arm64));
 			s_rc.Reset();
 			EmitChainEpilogue(masm);
 		}
@@ -4284,7 +5230,39 @@ namespace {
 		masm.FinalizeCode();
 
 		const size_t sz = masm.GetSizeOfCodeGenerated();
-		HostSys::FlushInstructionCache(start, static_cast<u32>(sz));
+		if (!s_reader.rec)
+			HostSys::FlushInstructionCache(start, static_cast<u32>(sz));
+		if (aot::shaped())
+		{
+			// HH-37: the block's key and code, for Shape's log or Emit's comparison
+			aot::Block& b = s_aot_block;
+			b = aot::Block{};
+			b.unit = aot::UnitEE;
+			b.pc = pc;
+			b.words = s_reader.words;
+			b.native = (Norm(branch_end ? p + 8 : p) - Norm(pc)) >> 2;
+			AOT_CHECK(b.native <= b.words.size(), "the EE block at %08x covers %u words and read %zu", pc, b.native, b.words.size());
+			FaultMask(b.mask, pc, b.words.size());
+			b.codeLen = static_cast<u32>(sz);
+			for (const FmPending& fp : s_fm_pending)
+			{
+				b.sites.push_back(static_cast<u32>(fp.site_off));
+				b.sites.push_back(static_cast<u32>(fp.stub_off));
+				b.sites.push_back((fp.pc - pc) >> 2);
+			}
+			if (s_reader.rec)
+			{
+				s_fm_pending.clear();
+				s_fm_labels.clear();
+				s_ma_pending.clear();
+				s_ma_labels.clear();
+				s_exit_pending.clear();
+				s_exit_labels.clear();
+				s_blk_ret = nullptr;
+				return reinterpret_cast<BlockFn>(start);
+			}
+			aot::logBlock(b, start);
+		}
 
 		// C.50: buffer offsets -> absolute addresses. Blocks are emitted at
 		// increasing s_code_pos and offsets grow within a block, so appending
@@ -4292,7 +5270,7 @@ namespace {
 		// that ordering is a code-cache wrap, which clears the list.
 		for (const FmPending& fp : s_fm_pending)
 			s_fm_sites.push_back({reinterpret_cast<uintptr_t>(start) + fp.site_off,
-			                      reinterpret_cast<uintptr_t>(start) + fp.stub_off, fp.pc});
+			                      reinterpret_cast<uintptr_t>(start) + fp.stub_off, fp.pc, pc});
 		s_fm_pending.clear();
 		s_fm_labels.clear(); // the labels are resolved; the block is finalized
 		s_ma_pending.clear();
@@ -4373,8 +5351,82 @@ namespace {
 		return 0;
 	}
 
+	// HH-37 Load and Interp: the image's block for pc whose words guest memory holds now, put
+	// where CompileBlock would have put the JIT's (its record, the LUT, its pages, its code bytes
+	// counted toward the wrap). Of the variants with those words, the one compiled with the
+	// fastmem mask the faults so far give this block, else one whose mask covers it (it keeps
+	// every access known to fault off fastmem, and the others compute the same either way); none
+	// is a miss, since a variant that has a known-faulting access on fastmem faults on every run
+	// (Load stops, Interp runs the twin). Interp: a twin pc already has (TwinCached) comes first.
+	// An image refused once the settings changed (aot::recheck) runs nothing more: until the CPU
+	// providers are chosen again, the twin runs in its place.
+	BlockFn InstallBlock(u32 pc)
+	{
+		const bool image = aot::fromImage(aot::UnitEE);
+		if (aot::mode() == aot::Interp || !image)
+			if (BlockFn f = TwinCached(pc))
+				return f;
+		if (!image)
+			return TwinNew(pc);
+		const aot::Block* pick = nullptr;
+		if (const std::vector<const aot::Block*>* v = aot::imageBlocks(aot::UnitEE, pc))
+			for (const aot::Block* b : *v)
+			{
+				bool same = true;
+				for (u32 q = 0; same && q < (u32)b->words.size(); q++)
+					same = memRead32(pc + q * 4) == b->words[q];
+				if (!same)
+					continue;
+				u32 want[3];
+				FaultMask(want, pc, b->words.size());
+				if (!memcmp(want, b->mask, sizeof want))
+				{
+					pick = b;
+					break;
+				}
+				if (!pick && (b->mask[0] & want[0]) == want[0] && (b->mask[1] & want[1]) == want[1] && (b->mask[2] & want[2]) == want[2])
+					pick = b;
+			}
+		if (!pick)
+		{
+			aot::miss(aot::UnitEE, pc);
+			return TwinNew(pc);
+		}
+		WrapIfFull();
+		s_code_pos += (pick->codeLen + 15) & ~u32(15);
+		BlockFn fn = reinterpret_cast<BlockFn>(const_cast<u8*>(pick->code));
+		const u32 ns = Norm(pc), ne = ns + pick->native * 4;
+		BlockRec rec{fn, ne, true, false, {}};
+		rec.src.assign(pick->words.begin(), pick->words.begin() + pick->native);
+		s_blocks[pc] = std::move(rec);
+		if (InRam(ns)) s_lut[ns >> 2] = fn;
+		RegisterPages(pc, ns, ne);
+		aot::countInstall(aot::UnitEE);
+		return fn;
+	}
+	inline BlockFn NewBlock(u32 pc) { return aot::imageOnly() ? InstallBlock(pc) : CompileBlock(pc); }
+
+	// HH-37: blocks a fastmem fault left running a slow stub, to be compiled (or installed) again
+	// with the faulting access off fastmem. Written by the fault handler on the EE thread, read
+	// here on the same thread between blocks.
+	constexpr u32 kFmDropMax = 64;
+	u32 s_fm_drop[kFmDropMax];
+	u32 s_fm_drop_n = 0;
+	void DropFaultedBlocks()
+	{
+		for (u32 i = 0; i < s_fm_drop_n && i < kFmDropMax; i++)
+		{
+			const u32 np = Norm(s_fm_drop[i]);
+			if (InRam(np)) s_lut[np >> 2] = nullptr;
+			s_blocks.erase(s_fm_drop[i]);
+		}
+		s_fm_drop_n = 0;
+	}
+
 	inline BlockFn BlockForPC(u32 pc)
 	{
+		if (s_fm_drop_n) [[unlikely]]
+			DropFaultedBlocks();
 		const u32 np = Norm(pc);
 		if (InRam(np))
 		{
@@ -4388,17 +5440,29 @@ namespace {
 					return g;
 				s_blocks.erase(it); // source changed -> compile fresh
 			}
-			return CompileBlock(pc);
+			return NewBlock(pc);
 		}
 		auto it = s_blocks.find(pc);
-		return (it != s_blocks.end() && it->second.live) ? it->second.fn : CompileBlock(pc);
+		return (it != s_blocks.end() && it->second.live) ? it->second.fn : NewBlock(pc);
 	}
 }
 
 void eeJitReserve_arm64(void)
 {
-	s_ok = armVixlSelfTest();
-	if (s_ok && !s_code)
+	// HH-37: an image mode maps no code (its blocks are the image's), and Emit compiles into
+	// its plain buffer, which it never runs.
+	static_assert(kCodeCacheSize <= aot::EMIT_BUFFER_BYTES, "Emit compiles a block anywhere the cache could hold it");
+	if (aot::imageOnly())
+		s_ok = true;
+	else if (aot::mode() == aot::Emit)
+	{
+		s_ok = true;
+		if (!s_code)
+			s_code = aot::emitBuffer();
+	}
+	else
+		s_ok = armVixlSelfTest();
+	if (s_ok && !s_code && !aot::imageOnly())
 	{
 		s_code = armJitMap(kCodeCacheSize, "EE");
 	}
@@ -4409,7 +5473,14 @@ void eeJitReserve_arm64(void)
 		if (s_lut == MAP_FAILED) s_lut = nullptr;
 	}
 	s_page_clears.assign(kRamBytes >> kPageShift, 0); // C.60
-	s_ok = s_ok && s_code && s_lut;
+#ifdef AOT_TOOLING
+	// HH-37, the Mac's tooling: the twin's red receipt (TwinRun) and its self-test, on the stock JIT
+	s_twin_red = getenv("LRPS2_TWIN_RED") ? (u32)atoi(getenv("LRPS2_TWIN_RED")) : 0;
+	s_twin_selftest = aot::mode() == aot::Off && getenv("LRPS2_TWIN_SELFTEST") ? atoi(getenv("LRPS2_TWIN_SELFTEST")) : 0;
+#endif
+	s_ok = s_ok && (s_code || aot::imageOnly()) && s_lut;
+	if (aot::shaped() && s_lut)
+		aot::setValueImport(kLutImport, s_lut);
 	Console.WriteLn("arm64 EE rec (C.7): %s.", s_ok ? "native ALU+mem+branch+FPU-mov+MMI+muldiv JIT (block-linking)" : "FAILED -> interpreter fallback");
 }
 
@@ -4424,6 +5495,7 @@ bool eeJitAvailable_arm64(void)
 void eeJitReset_arm64(void)
 {
 	s_blocks.clear();
+	s_twins.clear();
 	s_page.clear();
 	LutClearAll();
 	s_code_pos = 0;
@@ -4465,7 +5537,7 @@ void eeJitClear_arm64(u32 addr, u32 size)
 	// surviving block would go stale silently. Blocks are marked dead (records
 	// and native code kept); the next dispatch revalidates the source snapshot
 	// and revives the block without recompiling when the code bytes survived.
-	if (s_blocks.empty())
+	if (s_blocks.empty() && s_twins.empty())
 		return;
 	const u32 a0 = Norm(addr);
 	const u32 a1 = Norm(addr + (size ? size : 1) * 4 - 1);
@@ -4481,6 +5553,9 @@ void eeJitClear_arm64(u32 addr, u32 size)
 			auto bit = s_blocks.find(spc);
 			if (bit != s_blocks.end())
 				bit->second.live = false;
+			auto tit = s_twins.find(spc); // HH-37: Interp's twins die with their pages too
+			if (tit != s_twins.end())
+				tit->second.live = false;
 			const u32 np = Norm(spc);
 			if (InRam(np)) s_lut[np >> 2] = nullptr;
 		}
@@ -4491,7 +5566,9 @@ void eeJitClear_arm64(u32 addr, u32 size)
 void eeJitShutdown_arm64(void)
 {
 	s_blocks.clear();
+	s_twins.clear();
 	s_page.clear();
+	if (aot::mode() == aot::Emit) s_code = nullptr; // HH-37: Emit's buffer is aot's
 	if (s_code) { armJitUnmap(s_code, kCodeCacheSize, "EE"); s_code = nullptr; }
 	if (s_lut) { munmap(s_lut, (size_t)kRamWords * sizeof(BlockFn)); s_lut = nullptr; }
 	s_code_pos = 0;
@@ -4521,8 +5598,44 @@ void eeJitShutdown_arm64(void)
 // bytes of code cache (through its write alias; the sites are execute
 // addresses, the faulting pc's). Returns false for any fault we don't own, which
 // lets the handler fall through to its default (abort) path.
-extern "C" bool eeFastmemFault_arm64(uintptr_t code_address)
+extern "C" bool eeFastmemFault_arm64(uintptr_t code_address, uintptr_t* resume_pc)
 {
+	// HH-37: the AOT form never writes code. The fault resumes at the access's stub (the
+	// handler's caller sets the thread's pc to *resume_pc), the guest pc goes on the blacklist,
+	// and the block is dropped to be compiled (or, from an image, installed) again with that
+	// access off fastmem. An image's sites are the image's.
+	if (aot::shaped())
+	{
+		const std::vector<aot::Site>& img = aot::imageSites();
+		uintptr_t stub = 0;
+		u32 pc = 0, block = 0;
+		if (aot::imageOnly())
+		{
+			auto it = std::lower_bound(img.begin(), img.end(), code_address, [](const aot::Site& s, uintptr_t a) { return s.code < a; });
+			if (it == img.end() || it->code != code_address)
+				return false;
+			stub = it->stub;
+			pc = it->pc;
+			block = it->block;
+		}
+		else
+		{
+			auto it = std::lower_bound(s_fm_sites.begin(), s_fm_sites.end(), code_address, [](const FmSite& s, uintptr_t a) { return s.code < a; });
+			if (it == s_fm_sites.end() || it->code != code_address)
+				return false;
+			stub = it->stub;
+			pc = it->pc;
+			block = it->block;
+		}
+		*resume_pc = stub;
+		aot::countFault(aot::UnitEE);
+		const auto bit = std::lower_bound(s_fm_faulting.begin(), s_fm_faulting.end(), pc);
+		if (bit == s_fm_faulting.end() || *bit != pc)
+			s_fm_faulting.insert(bit, pc);
+		if (s_fm_drop_n < kFmDropMax)
+			s_fm_drop[s_fm_drop_n++] = block;
+		return true;
+	}
 	size_t lo = 0, hi = s_fm_sites.size();
 	while (lo < hi)
 	{
@@ -4552,8 +5665,391 @@ extern "C" bool eeFastmemFault_arm64(uintptr_t code_address)
 }
 
 
-extern "C" void eeJitRunBlock_arm64(void)
+#ifdef AOT_TOOLING
+namespace
 {
 
-	BlockForPC(cpuRegs.pc)();
+	// ---- HH-37: LRPS2_TWIN_SELFTEST=N (the stock JIT): the twin against the JIT, block by block ----
+	// N random blocks, each written into EE RAM, compiled by CompileBlock and run, and run again
+	// from the same state by its twin; every guest register file, cpuBlockCycles, the cycle
+	// counters and a 64 KB data window must come out the same. The blocks are shaped so that
+	// neither run can leave through anything a test cannot undo (no event test is due, no
+	// interpreter tail meets a branch, no access misaligns): an op or a fused pair, then ERET;
+	// runs of ops, ending in ERET, at the 64-op cap, or in an interpreter tail (TLBP, ERET); a
+	// branch with its delay slot. The macro COP2 ops are left out: the stock JIT emits them and
+	// the AOT form, whose twin this is, interprets them. The process exits when it is done.
+	constexpr u32 kTwCode = 0x01e00000, kTwData = 0x01f00000, kTwDataLen = 0x10000;
+	u64 s_tw_rng = 0x9e3779b97f4a7c15ull;
+	inline u64 TwRnd() { s_tw_rng ^= s_tw_rng << 13; s_tw_rng ^= s_tw_rng >> 7; s_tw_rng ^= s_tw_rng << 17; return s_tw_rng; }
+	inline u32 TwRndBelow(u32 n) { return (u32)(TwRnd() % n); }
+	u32 TwEdge32()
+	{
+		static const u32 e[] = {0, 1, 0xffffffff, 0x7fffffff, 0x80000000, 0x8000, 0x7fff, 0xffff, 0x10000, 0xffff8000, 31, 32, 63};
+		switch (TwRndBelow(4))
+		{
+			case 0: return e[TwRndBelow(sizeof e / sizeof e[0])];
+			case 1: return TwRndBelow(64);
+			default: return (u32)TwRnd();
+		}
+	}
+	u32 TwEdgeF()
+	{
+		static const u32 e[] = {0, 0x80000000, 0x00000001, 0x807fffff, 0x3f800000, 0xbf800000, 0x7f800000, 0xff800000,
+			0x7fffffff, 0xffffffff, 0x7f7fffff, 0xff7fffff, 0x00800000, 0x80800000, 0x4e800000, 0xcf000000, 0x7fc00000};
+		switch (TwRndBelow(4))
+		{
+			case 0: return e[TwRndBelow(sizeof e / sizeof e[0])];
+			case 1: return (u32)TwRnd();
+			default: return (TwRnd() & 0x807fffff) | ((0x7c + TwRndBelow(9)) << 23); // exponents near each other
+		}
+	}
+	// A register field: mostly a few registers, so ops depend on each other and on r0
+	inline u32 TwReg() { return TwRndBelow(4) ? TwRndBelow(6) : TwRndBelow(32); }
+
+	// A random op EmitSimple emits, or 0 for none. mem: memory ops allowed (their base register
+	// is set up by the caller); ds: a delay slot (no COP2 or VU0 traffic).
+	u32 TwRandomOp(bool mem, bool ds)
+	{
+		for (int tries = 0; tries < 1000; tries++)
+		{
+			u32 w = (u32)TwRnd();
+			w = (w & ~(0x1fu << 21)) | (TwReg() << 21);
+			w = (w & ~(0x1fu << 16)) | (TwReg() << 16);
+			w = (w & ~(0x1fu << 11)) | (TwReg() << 11);
+			u32 op;
+			switch (TwRndBelow(12))
+			{
+				case 0: case 1: case 2: op = 0x00; break;
+				case 3: { static const u32 o[] = {0x08, 0x09, 0x18, 0x19, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x01}; op = o[TwRndBelow(11)]; break; }
+				case 4: case 5: op = 0x1c; break;
+				case 6: case 7:
+				{
+					op = 0x11;
+					static const u32 r[] = {0x00, 0x02, 0x04, 0x06, 0x10, 0x10, 0x10, 0x10, 0x14};
+					w = (w & ~(0x1fu << 21)) | (r[TwRndBelow(9)] << 21);
+					break;
+				}
+				case 8: op = 0x12; w = (w & ~(0x1fu << 21)) | ((TwRndBelow(2) ? 0x01 + TwRndBelow(2) : 0x05 + TwRndBelow(2)) << 21); break;
+				case 9: op = 0x10; w &= ~(0x1fu << 21); break; // MFC0
+				default:
+				{
+					static const u32 o[] = {0x20, 0x24, 0x21, 0x25, 0x23, 0x27, 0x37, 0x22, 0x26, 0x1a, 0x1b, 0x2a, 0x2e, 0x2c, 0x2d,
+						0x28, 0x29, 0x2b, 0x3f, 0x1e, 0x1f, 0x31, 0x39, 0x36, 0x3e, 0x33};
+					op = o[TwRndBelow(sizeof o / sizeof o[0])];
+					break;
+				}
+			}
+			w = (w & 0x03ffffffu) | (op << 26);
+			if (!IsTranslatable(w))
+				continue;
+			const bool is_mem = (op >= 0x1a && op <= 0x1b) || (op >= 0x1e && op <= 0x3f && op != 0x2f && op != 0x33);
+			if (is_mem && (!mem || ((w >> 21) & 31) == 0))
+				continue;
+			if (ds && (op == 0x12 || op == 0x36 || op == 0x3e))
+				continue;
+			if (op == 0x12 && !Cop2XferSupported(w))
+				continue; // CTC2 to FBRST/CMSAR1: a VU reset or a VU1 kick
+			if (op == 0x10 && (((w >> 11) & 31) == 9 || ((w >> 11) & 31) == 25))
+				continue; // Count/PERF: an interpreter call either way, and they move with the cycle
+			return w;
+		}
+		return 0;
+	}
+	// Point a memory op's base at the data window, aligned as its access must be.
+	void TwAimBase(u32 w)
+	{
+		const u32 op = w >> 26, rs = (w >> 21) & 31;
+		const bool is_mem = (op >= 0x1a && op <= 0x1b) || (op >= 0x1e && op <= 0x3f && op != 0x2f && op != 0x33);
+		if (!is_mem || !rs)
+			return;
+		const u32 amask = (op == 0x37 || op == 0x3f) ? 7 : (op == 0x23 || op == 0x27 || op == 0x2b) ? 3 :
+		                  (op == 0x21 || op == 0x25 || op == 0x29) ? 1 : (op == 0x36 || op == 0x3e) ? 15 : 0;
+		const u32 addr = (kTwData + 0x100 + TwRndBelow(kTwDataLen - 0x200)) & ~amask;
+		cpuRegs.GPR.r[rs].UD[0] = (u64)(s64)(s32)(addr - (u32)(s32)(int16_t)(w & 0xffff));
+	}
+	void TwRandomState()
+	{
+		for (u32 i = 1; i < 32; i++)
+			for (u32 j = 0; j < 4; j++)
+				cpuRegs.GPR.r[i].UL[j] = TwEdge32();
+		for (u32 j = 0; j < 4; j++) { cpuRegs.HI.UL[j] = TwEdge32(); cpuRegs.LO.UL[j] = TwEdge32(); }
+		cpuRegs.sa = TwRndBelow(16);
+		for (u32 i = 0; i < 32; i++) fpuRegs.fpr[i].UL = TwEdgeF();
+		fpuRegs.ACC.UL = TwEdgeF();
+		fpuRegs.fprc[31] = (u32)TwRnd();
+		for (u32 i = 1; i < 32; i++)
+			for (u32 j = 0; j < 4; j++)
+				vuRegs[0].VF[i].UL[j] = TwEdgeF();
+		for (u32 i = 1; i < 16; i++) vuRegs[0].VI[i].UL = TwEdge32() & 0xffff;
+		static const u32 vi[] = {16, 17, 18, 20, 21, 22, 27};
+		for (u32 i : vi) vuRegs[0].VI[i].UL = TwEdge32();
+		vuRegs[0].VI[REG_VPU_STAT].UL = TwRndBelow(2) ? 0x100 : 0;
+		cpuRegs.CP0.n.Status.val = (cpuRegs.CP0.n.Status.val & ~6u) | (TwRndBelow(4) << 1);
+		cpuRegs.CP0.n.Config = (cpuRegs.CP0.n.Config & ~(1u << 18)) | (TwRndBelow(2) << 18);
+		cpuRegs.CP0.n.EPC = kTwCode + 0x8000 + TwRndBelow(64) * 4;
+		cpuRegs.CP0.n.ErrorEPC = 0xbfc00000 + TwRndBelow(64) * 4;
+		static const u32 cp0[] = {0, 2, 3, 4, 5, 6, 8, 10, 13, 15, 17, 26, 27, 28, 29, 30};
+		for (u32 i : cp0) cpuRegs.CP0.r[i] = TwEdge32();
+		cpuRegs.nextEventCycle = cpuRegs.cycle + (1ull << 40);
+		cpuBlockCycles = TwRndBelow(8);
+		for (u32 q = 0; q < kTwDataLen; q += 4)
+			*(u32*)(eeMem->Main + kTwData + q) = (u32)TwRnd();
+	}
+	struct TwSnap
+	{
+		cpuRegisters c;
+		fpuRegisters f;
+		VURegs v;
+		u32 bc;
+		std::vector<u8> ram;
+		void take() { c = cpuRegs; f = fpuRegs; memcpy(&v, &vuRegs[0], sizeof v); bc = cpuBlockCycles; ram.assign(eeMem->Main + kTwData, eeMem->Main + kTwData + kTwDataLen); }
+		void put() const { cpuRegs = c; fpuRegs = f; memcpy(&vuRegs[0], &v, sizeof v); cpuBlockCycles = bc; memcpy(eeMem->Main + kTwData, ram.data(), kTwDataLen); }
+	};
+	// The first difference between two snapshots, described, or empty
+	std::string TwDiff(const TwSnap& a, const TwSnap& b)
+	{
+		char buf[256];
+		for (u32 i = 0; i < 32; i++)
+			for (u32 j = 0; j < 4; j++)
+				if (a.c.GPR.r[i].UL[j] != b.c.GPR.r[i].UL[j])
+					{ snprintf(buf, sizeof buf, "GPR r%u.UL[%u] twin %08x jit %08x", i, j, a.c.GPR.r[i].UL[j], b.c.GPR.r[i].UL[j]); return buf; }
+		for (u32 j = 0; j < 4; j++)
+		{
+			if (a.c.HI.UL[j] != b.c.HI.UL[j]) { snprintf(buf, sizeof buf, "HI.UL[%u] twin %08x jit %08x", j, a.c.HI.UL[j], b.c.HI.UL[j]); return buf; }
+			if (a.c.LO.UL[j] != b.c.LO.UL[j]) { snprintf(buf, sizeof buf, "LO.UL[%u] twin %08x jit %08x", j, a.c.LO.UL[j], b.c.LO.UL[j]); return buf; }
+		}
+		if (a.c.pc != b.c.pc) { snprintf(buf, sizeof buf, "pc twin %08x jit %08x", a.c.pc, b.c.pc); return buf; }
+		if (a.c.cycle != b.c.cycle) { snprintf(buf, sizeof buf, "cycle twin %llu jit %llu", (unsigned long long)a.c.cycle, (unsigned long long)b.c.cycle); return buf; }
+		if (a.bc != b.bc) { snprintf(buf, sizeof buf, "cpuBlockCycles twin %u jit %u", a.bc, b.bc); return buf; }
+		if (a.c.nextEventCycle != b.c.nextEventCycle) return "nextEventCycle";
+		if (a.c.sa != b.c.sa) { snprintf(buf, sizeof buf, "sa twin %u jit %u", a.c.sa, b.c.sa); return buf; }
+		if (a.c.code != b.c.code) { snprintf(buf, sizeof buf, "code twin %08x jit %08x", a.c.code, b.c.code); return buf; }
+		for (u32 i = 0; i < 32; i++)
+			if (a.c.CP0.r[i] != b.c.CP0.r[i]) { snprintf(buf, sizeof buf, "CP0 r%u twin %08x jit %08x", i, a.c.CP0.r[i], b.c.CP0.r[i]); return buf; }
+		if (memcmp(&a.c, &b.c, sizeof a.c)) return "cpuRegs (elsewhere)";
+		for (u32 i = 0; i < 32; i++)
+			if (a.f.fpr[i].UL != b.f.fpr[i].UL) { snprintf(buf, sizeof buf, "fpr%u twin %08x jit %08x", i, a.f.fpr[i].UL, b.f.fpr[i].UL); return buf; }
+		if (a.f.fprc[31] != b.f.fprc[31]) { snprintf(buf, sizeof buf, "FCR31 twin %08x jit %08x", a.f.fprc[31], b.f.fprc[31]); return buf; }
+		if (a.f.ACC.UL != b.f.ACC.UL) { snprintf(buf, sizeof buf, "ACC twin %08x jit %08x", a.f.ACC.UL, b.f.ACC.UL); return buf; }
+		if (memcmp(&a.f, &b.f, sizeof a.f)) return "fpuRegs (elsewhere)";
+		for (u32 i = 0; i < 32; i++)
+			if (memcmp(&a.v.VF[i], &b.v.VF[i], 16)) { snprintf(buf, sizeof buf, "VF%u", i); return buf; }
+		for (u32 i = 0; i < 32; i++)
+			if (a.v.VI[i].UL != b.v.VI[i].UL) { snprintf(buf, sizeof buf, "VI%u twin %08x jit %08x", i, a.v.VI[i].UL, b.v.VI[i].UL); return buf; }
+		if (memcmp(&a.v, &b.v, sizeof a.v)) return "vuRegs[0] (elsewhere)";
+		for (u32 q = 0; q < kTwDataLen; q++)
+			if (a.ram[q] != b.ram[q]) { snprintf(buf, sizeof buf, "RAM %08x twin %02x jit %02x", kTwData + q, a.ram[q], b.ram[q]); return buf; }
+		return std::string();
+	}
+
+	void TwinSelfTest(int rounds)
+	{
+		eeJitReset_arm64();
+		fprintf(stderr, "lrps2 twin selftest: %d blocks\n", rounds);
+		int ran = 0, failed = 0, skipped = 0;
+		int ends[4] = {};
+		std::unordered_map<std::string, int> fails;
+		std::unordered_map<std::string, int> seen, every;
+		for (int r = 0; r < rounds; r++)
+		{
+			std::vector<u32> words;
+			const u32 kind = TwRndBelow(10);
+			const u32 kEret = 0x42000018, kTlbp = 0x42000008;
+			bool mem = true;
+			if (kind <= 3) // one op or a pair, then ERET
+			{
+				if (kind == 3) // a canonical unaligned pair (fused unless a load's rt is 0 or its base)
+				{
+					static const u32 pl[4][3] = {{0x1a, 0x1b, 7}, {0x22, 0x26, 3}, {0x2c, 0x2d, 7}, {0x2a, 0x2e, 3}};
+					const u32* q = pl[TwRndBelow(4)];
+					const u32 rs = 1 + TwRndBelow(5), rt = TwRndBelow(6), off = TwRndBelow(0x100);
+					words.push_back((q[0] << 26) | (rs << 21) | (rt << 16) | (off + q[2]));
+					words.push_back((q[1] << 26) | (rs << 21) | (rt << 16) | off);
+				}
+				else
+					words.push_back(TwRandomOp(true, false));
+				words.push_back(kEret);
+			}
+			else if (kind <= 5) // a run of ops ending in ERET or in an interpreter tail
+			{
+				const u32 k = 2 + TwRndBelow(8);
+				for (u32 i = 0; i < k; i++) words.push_back(TwRandomOp(false, false));
+				if (kind == 5) words.push_back(kTlbp);
+				words.push_back(kEret);
+				mem = false;
+			}
+			else if (kind == 6) // the cap
+			{
+				for (u32 i = 0; i < kMaxInsns + 3; i++) words.push_back(TwRandomOp(false, false));
+				mem = false;
+			}
+			else // a branch and its slot, a few ops before it
+			{
+				const u32 k = TwRndBelow(3);
+				for (u32 i = 0; i < k; i++) words.push_back(TwRandomOp(false, false));
+				static const u32 bo[] = {0x00, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x14, 0x15, 0x16, 0x17, 0x01, 0x10, 0x11, 0x12};
+				const u32 o = bo[TwRndBelow(sizeof bo / sizeof bo[0])];
+				u32 b = (o << 26) | (TwReg() << 21) | (TwReg() << 16) | (TwRndBelow(0x400) - 0x200 + 0x10000) % 0x10000;
+				if (o == 0x00) b = (TwReg() << 21) | (TwReg() << 11) | (TwRndBelow(2) ? 0x08 : 0x09);
+				if (o == 0x02 || o == 0x03) b = (o << 26) | ((kTwCode + 0x4000 + TwRndBelow(0x1000) * 4) >> 2);
+				if (o == 0x01) { static const u32 rt[] = {0, 1, 2, 3, 0x10, 0x11}; b = (b & ~(0x1fu << 16)) | (rt[TwRndBelow(6)] << 16); }
+				if (o >= 0x10 && o <= 0x12) b = (b & ~(0x3ffu << 16)) | (0x08u << 21) | (TwRndBelow(4) << 16);
+				words.push_back(b);
+				words.push_back(TwRandomOp(false, true));
+				mem = false;
+			}
+			bool bad = false;
+			for (u32 w : words) bad |= (w == 0);
+			if (bad) { skipped++; continue; }
+			// The code, in EE RAM (a store into its page drops the JIT's blocks there)
+			for (u32 i = 0; i < (u32)words.size(); i++)
+				memWrite32(kTwCode + i * 4, words[i]);
+			memWrite32(kTwCode + (u32)words.size() * 4, kEret);
+			Twin t;
+			TwinDecode(kTwCode, t);
+			// Shapes a test cannot undo: an interpreter tail that is not TLBP, ERET; a taken
+			// delay slot left to the interpreter; an exit whose event test is not gated
+			if (t.end == TE_TAIL && !(memRead32(t.p) == kTlbp && memRead32(t.p + 4) == kEret)) { skipped++; continue; }
+			if (t.end == TE_BRANCH)
+			{
+				const TwinBranch& b = t.br;
+				if (b.ds_interp || b.idle_skip || (!b.is_jr && !InRam(Norm(b.tconst)))) { skipped++; continue; }
+			}
+			TwRandomState();
+			if (mem)
+				for (const Twin::Step& s : t.steps) TwAimBase(s.a);
+			cpuRegs.pc = kTwCode;
+			TwSnap before, twin, jit;
+			before.take();
+			TwinRun(t);
+			twin.take();
+			before.put();
+			const BlockFn fn = CompileBlock(kTwCode);
+			s_lut[Norm(kTwCode) >> 2] = nullptr; // a chain never enters a test block, its own included
+			fn(aot::imports());
+			jit.take();
+			before.put();
+			ran++;
+			ends[t.end]++;
+			const std::string name = R5900::GetInstruction(words[0]).Name;
+			seen[name]++;
+			for (u32 w : words) every[R5900::GetInstruction(w).Name + std::string(w >> 26 == 0x1c && MmiDivAction(w) == MD_PDIVBW ? "(MMI3 0x1d)" : "")]++;
+			const std::string d = TwDiff(twin, jit);
+			if (!d.empty())
+			{
+				failed++;
+				if (fails[name]++ < 3)
+				{
+					fprintf(stderr, "lrps2 twin selftest FAIL (%s, end %d, n %d):", d.c_str(), t.end, t.n);
+					for (u32 w : words) fprintf(stderr, " %08x", w);
+					fprintf(stderr, "\n");
+				}
+			}
+		}
+		fprintf(stderr, "lrps2 twin selftest: %d blocks ran (ends: tail %d, cap %d, branch %d, eret %d), %d skipped, %d failed\n",
+			ran, ends[TE_TAIL], ends[TE_CAP], ends[TE_BRANCH], ends[TE_ERET], skipped, failed);
+		for (const auto& f : fails)
+			fprintf(stderr, "lrps2 twin selftest: %s failed %d of %d\n", f.first.c_str(), f.second, seen[f.first]);
+		fprintf(stderr, "lrps2 twin selftest: %zu op names ran:", every.size());
+		for (const auto& e : every) fprintf(stderr, " %s:%d", e.first.c_str(), e.second);
+		fprintf(stderr, "\n");
+		fflush(stderr);
+		_Exit(failed ? 3 : 0);
+	}
 }
+
+#endif
+
+extern "C" void eeJitRunBlock_arm64(void)
+{
+#ifdef AOT_TOOLING
+	if (s_twin_selftest) [[unlikely]]
+		TwinSelfTest(s_twin_selftest);
+#endif
+	BlockForPC(cpuRegs.pc)(aot::imports());
+}
+
+// ---- HH-37: the EE's part of the AOT form (aot_arm64.cpp) ----
+
+u32 eeAotFastmemMode() { return FastmemMode() ? 1 : 0; }
+
+u32 eeAotFlags()
+{
+	return (EmuConfig.Speedhacks.WaitLoop ? aot::EE_FLAG_WAITLOOP : 0) | (CHECK_FPU_SOFT_REC ? aot::EE_FLAG_FPU_SOFT : 0);
+}
+
+#ifdef LRPS2_AOT_FORM
+// Everything a shaped EE block calls or reaches that is not guest state off x19, in slot order.
+// A region is reached at an offset (EmitAddr, AbsMem); a function at its start.
+void aot::eeImports(ImportAdder add)
+{
+#define AOT_FN(f) add(#f, reinterpret_cast<const void*>(&f), 1)
+	AOT_FN(eeRunBasicBlock_arm64);
+	AOT_FN(eeRead8_arm64); AOT_FN(eeRead16_arm64); AOT_FN(eeRead32_arm64); AOT_FN(eeRead64_arm64);
+	AOT_FN(eeWrite8_arm64); AOT_FN(eeWrite16_arm64); AOT_FN(eeWrite32_arm64); AOT_FN(eeWrite64_arm64);
+	AOT_FN(eeRead128_arm64); AOT_FN(eeWrite128_arm64);
+	AOT_FN(eeLWL_arm64); AOT_FN(eeLWR_arm64); AOT_FN(eeLDL_arm64); AOT_FN(eeLDR_arm64);
+	AOT_FN(eeSWL_arm64); AOT_FN(eeSWR_arm64); AOT_FN(eeSDL_arm64); AOT_FN(eeSDR_arm64);
+	AOT_FN(eeReadU32_arm64); AOT_FN(eeReadU64_arm64); AOT_FN(eeWriteU32_arm64); AOT_FN(eeWriteU64_arm64);
+	AOT_FN(eeCancelInstruction_arm64); AOT_FN(eeEventTest_arm64); AOT_FN(eeUpdateCycles_arm64);
+	AOT_FN(vu0Sync); AOT_FN(_vu0FinishMicro); AOT_FN(_vu0WaitMicro);
+	AOT_FN(R5900::Interpreter::OpcodeImpl::CACHE);
+	AOT_FN(R5900::Interpreter::OpcodeImpl::COP2);
+	AOT_FN(R5900::Interpreter::OpcodeImpl::COP0::MFC0);
+	AOT_FN(R5900::Interpreter::OpcodeImpl::COP0::MTC0);
+	AOT_FN(R5900::Interpreter::OpcodeImpl::COP0::CPCOND0);
+	AOT_FN(R5900::Interpreter::OpcodeImpl::COP0::EI);
+	AOT_FN(R5900::Interpreter::OpcodeImpl::COP0::DI);
+	AOT_FN(R5900::Interpreter::OpcodeImpl::MMI::QFSRV);
+#undef AOT_FN
+	add("cpuRegs", &cpuRegs, sizeof(cpuRegs));
+	add("fpuRegs", &fpuRegs, sizeof(fpuRegs));
+	add("vuRegs", &vuRegs[0], sizeof(vuRegs));
+	add("cpuBlockCycles", &cpuBlockCycles, sizeof(cpuBlockCycles));
+	add("EmuConfig.Speedhacks.EECycleRate", &EmuConfig.Speedhacks.EECycleRate, sizeof(EmuConfig.Speedhacks.EECycleRate));
+	add("vtlbdata.fastmem_base", &vtlbdata.fastmem_base, sizeof(vtlbdata.fastmem_base));
+	add("vtlbdata.vmap", &vtlbdata.vmap, sizeof(vtlbdata.vmap));
+	add("s_lqc2_sink", &s_lqc2_sink, sizeof(s_lqc2_sink));
+	add(kLutImport, nullptr, 0);
+}
+
+// Every guest-state member EE code addresses off x19 or off an import's base, by offset and size:
+// a layout that differs refuses the image.
+u64 aot::eeLayoutHash()
+{
+	u64 h = aot::FNV_BASIS;
+	const auto mix = [&h](const char* name, size_t off, size_t size) { h = aot::fnvMember(h, name, off, size); };
+#define AOT_M(s, m) mix(#s "." #m, offsetof(s, m), sizeof(((s*)nullptr)->m))
+	AOT_M(cpuRegisters, GPR); AOT_M(cpuRegisters, HI); AOT_M(cpuRegisters, LO); AOT_M(cpuRegisters, CP0);
+	AOT_M(cpuRegisters, sa); AOT_M(cpuRegisters, pc); AOT_M(cpuRegisters, code); AOT_M(cpuRegisters, cycle);
+	AOT_M(cpuRegisters, nextEventCycle);
+	AOT_M(fpuRegisters, fpr); AOT_M(fpuRegisters, fprc); AOT_M(fpuRegisters, ACC);
+	AOT_M(VURegs, VF); AOT_M(VURegs, VI);
+#undef AOT_M
+	mix("sizeof", sizeof(cpuRegisters), sizeof(fpuRegisters));
+	mix("sizeof VURegs", sizeof(VURegs), sizeof(u128));
+	return h;
+}
+
+const char* aot::eeAbiText()
+{
+	static char text[256];
+	snprintf(text, sizeof text,
+		"ee: x0 imports in; x19 cpuRegs.GPR; x20 imports; x21-x27 GPR cache; x28 fastmem/vmap base; "
+		"frame 96, jr at %u; chain entry %u; max insns %d; lut = RAM words, 8 bytes; manual pages never; "
+		"macro COP2 interpreted",
+		kJrSlot, kChainEntryOffsetAot, kMaxInsns);
+	return text;
+}
+
+#ifdef AOT_TOOLING
+// Emit: each logged EE block re-compiled from its words (aot::emitGuest)
+void eeAotEmit()
+{
+	aot::emitGuest(aot::UnitEE, s_reader, [](u32 pc) -> const aot::Block& {
+		CompileBlock(pc);
+		return s_aot_block;
+	});
+}
+#endif
+#endif

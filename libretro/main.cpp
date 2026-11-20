@@ -27,6 +27,7 @@
 #include "../pcsx2/DEV9/ATA/HddCreate.h"
 #include "../pcsx2/MTVU.h"
 #include "../pcsx2/Counters.h"
+#include "../pcsx2/arm64/aot_arm64.h"
 #include "../pcsx2/Host.h"
 
 #include "../common/Path.h"
@@ -2622,6 +2623,15 @@ bool retro_load_game(const struct retro_game_info* game)
 	SettingsInterface* bsi = Host::Internal::GetBaseSettingsLayer();
 	EmuFolders::LoadConfig(*bsi);
 	EmuFolders::EnsureFoldersExist();
+#ifdef ARCH_ARM64
+	/* HH-37: the AOT mode the caches below are reserved for (the LRPS2_AOT* environment, or the
+	 * image retro-trainer names in its private option rt_aot_image, which runs in interp). */
+	{
+		struct retro_variable aot_var = {"rt_aot_image", nullptr};
+		const bool have = environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &aot_var) && aot_var.value;
+		aot::configure(have ? aot_var.value : nullptr);
+	}
+#endif
 	VMManager::Internal::CPUThreadInitialize();
 	s_cpu_thread_initialized = true;
 	VMManager::LoadSettings();
@@ -2960,8 +2970,29 @@ static void update_av_info(void)
 	environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av_info);
 }
 
+/* retro-trainer's private environment command for what the core did with the AOT image its
+ * rt_aot_image option named (HH-36's, which the mupen64plus_next, flycast and dolphin forks send
+ * the same way): once per decision, on the frontend's thread. */
+#define RT_ENVIRONMENT_AOT_OUTCOME (RETRO_ENVIRONMENT_PRIVATE | 0x3601)
+struct rt_aot_outcome
+{
+	int admitted;
+	const char* detail;
+};
+
 void retro_run(void)
 {
+#ifdef ARCH_ARM64
+	{
+		int aot_admitted;
+		std::string aot_detail;
+		if (aot::takeReport(aot_admitted, aot_detail))
+		{
+			struct rt_aot_outcome outcome = {aot_admitted, aot_detail.c_str()};
+			environ_cb(RT_ENVIRONMENT_AOT_OUTCOME, &outcome);
+		}
+	}
+#endif
 	bool updated = false;
 	if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
 		check_variables(false);

@@ -84,6 +84,14 @@ __fi static u8* armGetAsmPtr()
 	return armAsmPtr;
 }
 
+// HH-37: microVU1's AOT form (aVU.cpp, "microVU1's AOT form"). While armAotRoute is set on this
+// thread, every host address the shared emitters below would encode -- a datum (armMoveAddressToReg,
+// armAbsMemOperand and what uses them), a call, a jump -- is reached through the import table in
+// x28 instead (aot_emit_arm64.h). armAotRedCall: the one call target the red receipt
+// (LRPS2_AOT_RED=vu1hostaddr) materializes as the stock form does.
+extern thread_local bool armAotRoute PCSX2_TLS_INITIAL_EXEC;
+extern const void* armAotRedCall;
+
 void armSetAsmPtr(void* ptr, size_t capacity, ArmConstantPool* pool);
 void armAlignAsmPtr();
 u8* armStartBlock();

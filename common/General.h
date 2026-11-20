@@ -46,9 +46,12 @@ struct PageFaultInfo
 {
 	uptr pc;
 	uptr addr;
+	// Out: where a handled fault resumes, when not at pc (0). The arm64 EE recompiler's AOT form
+	// sends a fastmem access that faulted to its slow stub this way instead of patching the code.
+	uptr resume_pc;
 };
 
-using PageFaultHandler = bool(*)(const PageFaultInfo& info);
+using PageFaultHandler = bool(*)(PageFaultInfo& info);
 
 // --------------------------------------------------------------------------------------
 //  HostSys

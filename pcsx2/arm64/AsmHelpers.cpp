@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: 2026 isztld <https://isztld.com/>
 // SPDX-License-Identifier: GPL-3.0
 
+#include "arm64/aot_arm64.h"
+#include "arm64/aot_emit_arm64.h"
 #include "../../common/Threading.h"
 #include <cstdlib>
 #include <cstring>
@@ -75,6 +77,33 @@ thread_local a64::MacroAssembler* armAsm PCSX2_TLS_INITIAL_EXEC;
 thread_local u8* armAsmPtr PCSX2_TLS_INITIAL_EXEC;
 thread_local size_t armAsmCapacity PCSX2_TLS_INITIAL_EXEC;
 thread_local ArmConstantPool* armConstantPool PCSX2_TLS_INITIAL_EXEC;
+thread_local bool armAotRoute PCSX2_TLS_INITIAL_EXEC;
+const void* armAotRedCall;
+
+// HH-37: the import-table forms (AsmHelpers.h, armAotRoute), off x28 (aot_emit_arm64.h). The
+// route is never set outside the AOT form.
+#ifdef LRPS2_AOT_FORM
+static const a64::Register& kAotImports = a64::x28;
+static void aotMoveAddress(const a64::Register& reg, const void* addr) { aot::emitAddr(*armAsm, kAotImports, reg.X(), addr); }
+static void aotBranchTo(const void* ptr, bool link)
+{
+	if (link && ptr == armAotRedCall)
+	{
+		armAsm->Mov(RXVIXLSCRATCH, reinterpret_cast<uintptr_t>(ptr)); // the red receipt: the stock form
+		armAsm->Blr(RXVIXLSCRATCH);
+		return;
+	}
+	aot::emitBranch(*armAsm, kAotImports, RXVIXLSCRATCH, ptr, link);
+}
+static a64::MemOperand aotAbsMem(const a64::Register& scratch, const void* addr, unsigned size)
+{
+	return aot::absMem(*armAsm, kAotImports, scratch.X(), addr, size);
+}
+#else
+static void aotMoveAddress(const a64::Register&, const void*) { std::abort(); }
+static void aotBranchTo(const void*, bool) { std::abort(); }
+static a64::MemOperand aotAbsMem(const a64::Register&, const void*, unsigned) { std::abort(); }
+#endif
 
 #ifdef INCLUDE_DISASSEMBLER
 static Threading::Mutex armDisasmMutex;
@@ -117,8 +146,10 @@ u8* armStartBlock()
 	pxAssert(!armAsm);
 	// vixl writes the bytes through the write alias; armAsmPtr stays the
 	// execute address, so armGetCurrentCodePointer() -- every displacement,
-	// every published entry point -- is where the code runs.
-	armAsm = new (s_armAsmStorage) vixl::aarch64::MacroAssembler(static_cast<vixl::byte*>(armJitRW(armAsmPtr)), armAsmCapacity);
+	// every published entry point -- is where the code runs. HH-37: AOT Emit
+	// maps no code cache and writes into plain memory, which has no alias.
+	u8* const write = aot::mode() == aot::Emit ? armAsmPtr : armJitRW(armAsmPtr);
+	armAsm = new (s_armAsmStorage) vixl::aarch64::MacroAssembler(static_cast<vixl::byte*>(write), armAsmCapacity);
 	armAsm->GetScratchVRegisterList()->Remove(31);
 	armAsm->GetScratchRegisterList()->Remove(RSCRATCHADDR.GetCode());
 	return armAsmPtr;
@@ -164,6 +195,8 @@ void armDisassembleAndDumpCode(const void* ptr, size_t size)
 
 void armEmitJmp(const void* ptr, bool force_inline)
 {
+	if (armAotRoute)
+		return aotBranchTo(ptr, false);
 	s64 displacement = GetPCDisplacement(armGetCurrentCodePointer(), ptr);
 	bool use_blr = !vixl::IsInt26(displacement);
 	if (use_blr && armConstantPool && !force_inline)
@@ -189,6 +222,8 @@ void armEmitJmp(const void* ptr, bool force_inline)
 
 void armEmitCall(const void* ptr, bool force_inline)
 {
+	if (armAotRoute)
+		return aotBranchTo(ptr, true);
 	s64 displacement = GetPCDisplacement(armGetCurrentCodePointer(), ptr);
 	bool use_blr = !vixl::IsInt26(displacement);
 	if (use_blr && armConstantPool && !force_inline)
@@ -262,6 +297,13 @@ static const char* armJitAddResultName(ArmJitRegions::AddResult r)
 
 u8* armJitMap(size_t size, const char* what)
 {
+	// HH-37: in an AOT mode only the shaped recompilers' caches exist (aot::jitAllowed); every
+	// other recompiler runs its interpreter, as on a host with no executable memory.
+	if (!aot::jitAllowed(what))
+	{
+		Console.WriteLn("arm64 JIT: %s code cache: none in this AOT mode; its interpreter runs.", what);
+		return nullptr;
+	}
 	switch (s_jit_source)
 	{
 		case ArmJitSource::Self:
@@ -366,6 +408,14 @@ void armEmitJmpPtr(void* code_address, const void* target, bool flush_icache)
 
 void armEmitCbnz(const vixl::aarch64::Register& reg, const void* ptr)
 {
+	if (armAotRoute)
+	{
+		a64::Label skip;
+		armAsm->Cbz(reg, &skip);
+		aotBranchTo(ptr, false);
+		armAsm->Bind(&skip);
+		return;
+	}
 	const s64 jump_distance =
 		static_cast<s64>(reinterpret_cast<intptr_t>(ptr) - reinterpret_cast<intptr_t>(armGetCurrentCodePointer()));
 	//pxAssert(Common::IsAligned(jump_distance, 4));
@@ -389,6 +439,14 @@ void armEmitCbnz(const vixl::aarch64::Register& reg, const void* ptr)
 
 void armEmitCondBranch(a64::Condition cond, const void* ptr)
 {
+	if (armAotRoute)
+	{
+		a64::Label skip;
+		armAsm->B(&skip, a64::InvertCondition(cond));
+		aotBranchTo(ptr, false);
+		armAsm->Bind(&skip);
+		return;
+	}
 	const s64 jump_distance =
 		static_cast<s64>(reinterpret_cast<intptr_t>(ptr) - reinterpret_cast<intptr_t>(armGetCurrentCodePointer()));
 	//pxAssert(Common::IsAligned(jump_distance, 4));
@@ -415,6 +473,8 @@ void armMoveAddressToReg(const vixl::aarch64::Register& reg, const void* addr)
 {
 	// psxAsm->Mov(reg, static_cast<u64>(reinterpret_cast<uintptr_t>(addr)));
 	pxAssert(reg.IsX());
+	if (armAotRoute)
+		return aotMoveAddress(reg, addr);
 
 	const void* current_code_ptr_page = reinterpret_cast<const void*>(
 		reinterpret_cast<uintptr_t>(armGetCurrentCodePointer()) & ~static_cast<uintptr_t>(0xFFF));
@@ -455,6 +515,8 @@ void armMoveAddressToReg(const vixl::aarch64::Register& reg, const void* addr)
 // important since `scratch` here is usually x17 from VIXL's own temp pool).
 a64::MemOperand armAbsMemOperand(const a64::Register& scratch, const void* addr, unsigned size)
 {
+	if (armAotRoute)
+		return aotAbsMem(scratch, addr, size);
 	const void* current_code_ptr_page = reinterpret_cast<const void*>(
 		reinterpret_cast<uintptr_t>(armGetCurrentCodePointer()) & ~static_cast<uintptr_t>(0xFFF));
 	const void* ptr_page =

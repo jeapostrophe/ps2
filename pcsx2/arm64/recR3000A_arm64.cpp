@@ -23,6 +23,7 @@
 #include "IopMem.h"
 #include "IopHw.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -33,6 +34,8 @@
 
 #include "aarch64/macro-assembler-aarch64.h"
 #include "arm64/AsmHelpers.h"
+#include "arm64/aot_arm64.h"
+#include "arm64/aot_emit_arm64.h"
 
 
 
@@ -42,7 +45,8 @@ extern "C" void iopRunBasicBlock_arm64(void);
 
 namespace
 {
-	typedef void (*BlockFn)(void);
+	// x0: the import table (aot::imports()), which only a shaped block reads (HH-37)
+	typedef void (*BlockFn)(void**);
 
 	constexpr size_t kCodeCacheSize = 16 * 1024 * 1024;
 	constexpr int    kMaxInsns      = 64;
@@ -74,6 +78,48 @@ namespace
 	constexpr u32 kChainEntryOffset = (1 + 5 + 4) * 4;
 	constexpr u32 kRamWords = kRamBytes >> 2;
 	BlockFn*      s_lut      = nullptr;
+
+	// ---- HH-37: the AOT form (aot_arm64.cpp says what it is) ----
+	// A shaped block's prologue takes the import table from its argument (x0) into x28, which no
+	// other IOP code uses, and x19 from the table; EmitCall and EmitAddr reach everything else
+	// through it (aot_emit_arm64.h), and main RAM's base is a value import. It chains only through
+	// the LUT, whose base is a value import too, past a prologue kChainEntryOffsetAot long, and its frame is 96 bytes, x28 at
+	// [sp, #80].
+	const Register importsReg = x28;
+	// Sub + 5*Stp + Str x28, then mov x28, x0; ldr x19, [x28, #psxRegs]
+	constexpr u32 kChainEntryOffsetAot = (1 + 5 + 1 + 1 + 1) * 4;
+	constexpr u32 kFrameAot = 96;
+	inline u32 ChainEntryOffset() { return aot::shaped() ? kChainEntryOffsetAot : kChainEntryOffset; }
+	inline u32 FrameSize() { return aot::shaped() ? kFrameAot : 80; }
+	constexpr const char* kLutImport = "iop.lut";   // s_lut, set when the reserve maps it
+	constexpr const char* kMainImport = "iop.main"; // iopMem->Main, set at every reset
+
+	inline void EmitCall(MacroAssembler& m, uint64_t fn)
+	{
+#ifdef LRPS2_AOT_FORM
+		if (aot::shaped())
+			return aot::emitBranch(m, importsReg, x16, reinterpret_cast<const void*>(fn), true);
+#endif
+		m.Mov(x16, fn);
+		m.Blr(x16);
+	}
+	inline void EmitAddr(MacroAssembler& m, const Register& r, const void* p)
+	{
+#ifdef LRPS2_AOT_FORM
+		if (aot::shaped())
+			return aot::emitAddr(m, importsReg, r, p);
+#endif
+		m.Mov(r, reinterpret_cast<uint64_t>(p));
+	}
+	// &ICFG, whose bit 3 sets the IOP's clock ratio (materialized as the stock form does under the
+	// IOP's red receipt, aot::red)
+	inline void EmitIcfgAddr(MacroAssembler& m, const Register& r)
+	{
+		if (aot::red(aot::UnitIOP))
+			m.Mov(r, reinterpret_cast<uint64_t>(&psxHu32(HW_ICFG)));
+		else
+			EmitAddr(m, r, &psxHu32(HW_ICFG));
+	}
 	inline bool InRam(u32 np) { return np < kRamBytes; }
 	// The LUT goes to zero with the cache it indexes, on reset and on a wrap. A
 	// clear that silently does nothing is a LUT of pointers into a rewound cache
@@ -98,6 +144,9 @@ namespace
 			s_covered[w >> 3] |= 1u << (w & 7);
 	}
 
+	// HH-37: what a block was compiled from (aot::CodeReader): every guest word CompileBlock reads
+	aot::CodeReader s_reader;
+	inline u32 ReadCode(u32 a) { return s_reader.read(a, aot::shaped(), [](u32 x) { return iopMemRead32(x); }); }
 
 	// ---- C.32: block-local write-back GPR register cache (the C.27 pattern
 	// from the EE rec, sized for the IOP). Guest GPRs are 32-bit, mirrored in
@@ -279,7 +328,8 @@ namespace
 				// stable for the process lifetime, so it embeds as a code
 				// constant. The read happens even for rt==0 (IO side effects
 				// on the slow path), matching the interpreter.
-				const bool fast = iopMem != nullptr;
+				// HH-37: the AOT form always inlines it, its base a value import
+				const bool fast = aot::shaped() || iopMem != nullptr;
 				Label slow, done;
 				if (fast)
 				{
@@ -287,7 +337,10 @@ namespace
 					m.Cmp(w1, 0x00800000);
 					m.B(&slow, hs);
 					m.And(w1, w1, 0x1fffff);             // 2MB mirror fold
-					m.Mov(x2, reinterpret_cast<uint64_t>(iopMem->Main));
+					if (aot::shaped())
+						aot::emitValue(m, importsReg, x2, kMainImport);
+					else
+						m.Mov(x2, reinterpret_cast<uint64_t>(iopMem->Main));
 					switch (op)
 					{
 						case 0x20: m.Ldrsb(w0, MemOperand(x2, x1)); break;
@@ -299,7 +352,7 @@ namespace
 					m.B(&done);
 					m.Bind(&slow);
 				}
-				m.Mov(x16, fn); m.Blr(x16);
+				EmitCall(m, fn);
 				switch (op) // helpers return u8/u16; normalize like the fast path
 				{
 					case 0x20: m.Sxtb(w0, w0); break;
@@ -321,7 +374,7 @@ namespace
 				uint64_t fn = (op == 0x2b) ? reinterpret_cast<uint64_t>(&iopMemWrite32)
 				            : (op == 0x29) ? reinterpret_cast<uint64_t>(&iopMemWrite16)
 				            : reinterpret_cast<uint64_t>(&iopMemWrite8);
-				m.Mov(x16, fn); m.Blr(x16);
+				EmitCall(m, fn);
 				return true;
 			}
 
@@ -336,7 +389,7 @@ namespace
 			{
 				LoadGpr(m, w0, gpr, rs); m.Add(w0, w0, simm);
 				m.And(w0, w0, 0xfffffffc);
-				m.Mov(x16, reinterpret_cast<uint64_t>(&iopMemRead32)); m.Blr(x16);
+				EmitCall(m, reinterpret_cast<uint64_t>(&iopMemRead32));
 				if (!rt) return true;
 				LoadGpr(m, w1, gpr, rs); m.Add(w1, w1, simm);
 				m.And(w1, w1, 3); m.Lsl(w1, w1, 3); // shift
@@ -363,7 +416,7 @@ namespace
 			{
 				LoadGpr(m, w0, gpr, rs); m.Add(w0, w0, simm);
 				m.And(w0, w0, 0xfffffffc);
-				m.Mov(x16, reinterpret_cast<uint64_t>(&iopMemRead32)); m.Blr(x16);
+				EmitCall(m, reinterpret_cast<uint64_t>(&iopMemRead32));
 				LoadGpr(m, w1, gpr, rs); m.Add(w1, w1, simm);
 				m.And(w1, w1, 3); m.Lsl(w1, w1, 3); // shift
 				LoadGpr(m, w2, gpr, rt);
@@ -381,7 +434,7 @@ namespace
 				m.Orr(w1, w0, w2); // value
 				LoadGpr(m, w0, gpr, rs); m.Add(w0, w0, simm);
 				m.And(w0, w0, 0xfffffffc);
-				m.Mov(x16, reinterpret_cast<uint64_t>(&iopMemWrite32)); m.Blr(x16);
+				EmitCall(m, reinterpret_cast<uint64_t>(&iopMemWrite32));
 				return true;
 			}
 
@@ -476,7 +529,7 @@ namespace
 	void EmitCycleBookkeeping(MacroAssembler& m, int count)
 	{
 		m.Ldr(w0, RegsField(&psxRegs.cycle)); m.Add(w0, w0, count); m.Str(w0, RegsField(&psxRegs.cycle));
-		m.Mov(x10, reinterpret_cast<uint64_t>(&psxHu32(HW_ICFG)));
+		EmitIcfgAddr(m, x10);
 		m.Ldr(w1, MemOperand(x10));
 		m.Mov(w2, 9 * count); m.Mov(w3, 8 * count);
 		m.Tst(w1, 8);
@@ -502,12 +555,17 @@ namespace
 		m.Mov(w3, kRamBytes);
 		m.Cmp(w2, w3);
 		m.B(&ret_path, hs);                  // not RAM -> return
-		m.Mov(x0, reinterpret_cast<uint64_t>(&s_lut));
-		m.Ldr(x0, MemOperand(x0));
+		if (aot::shaped())
+			aot::emitValue(m, importsReg, x0, kLutImport);
+		else
+		{
+			m.Mov(x0, reinterpret_cast<uint64_t>(&s_lut));
+			m.Ldr(x0, MemOperand(x0));
+		}
 		m.Lsr(w2, w2, 2);
 		m.Ldr(x3, MemOperand(x0, w2, UXTW, 3));
 		m.Cbz(x3, &ret_path);
-		m.Add(x3, x3, kChainEntryOffset);    // skip the successor's prologue
+		m.Add(x3, x3, ChainEntryOffset());   // skip the successor's prologue
 		m.Br(x3);
 		m.Bind(&ret_path);
 		m.Ldp(x19, x20, MemOperand(sp, 0));
@@ -515,7 +573,9 @@ namespace
 		m.Ldp(x22, x23, MemOperand(sp, 32));
 		m.Ldp(x24, x25, MemOperand(sp, 48));
 		m.Ldp(x26, x27, MemOperand(sp, 64));
-		m.Add(sp, sp, 80);
+		if (aot::shaped())
+			m.Ldr(x28, MemOperand(sp, 80));
+		m.Add(sp, sp, FrameSize());
 		m.Ret();
 	}
 
@@ -555,7 +615,7 @@ namespace
 		}
 		else return false;
 
-		const u32 ds = iopMemRead32(bpc + 4);
+		const u32 ds = ReadCode(bpc + 4);
 		if (!IsTranslatable(ds))
 			return false;
 
@@ -582,8 +642,7 @@ namespace
 			m.Ldr(w1, RegsField(&psxRegs.iopNextEventCycle));
 			m.Subs(w0, w0, w1); // (s32)(cycle - iopNextEventCycle)
 			m.B(&skip, mi);     // not due yet
-			m.Mov(x16, reinterpret_cast<uint64_t>(&iopEventTest));
-			m.Blr(x16);
+			EmitCall(m, reinterpret_cast<uint64_t>(&iopEventTest));
 			m.Bind(&skip);
 		};
 
@@ -600,7 +659,7 @@ namespace
 		if (op == 0x02 && n_leading == 0 && ds == 0 && tconst == bpc)
 		{
 			// k = EE cycles charged per iteration = (ICFG & 8 ? 9 : 8) * 2 insns
-			m.Mov(x10, reinterpret_cast<uint64_t>(&psxHu32(HW_ICFG)));
+			EmitIcfgAddr(m, x10);
 			m.Ldr(w5, MemOperand(x10));
 			m.Mov(w6, 9 * 2); m.Mov(w7, 8 * 2);
 			m.Tst(w5, 8);
@@ -680,7 +739,12 @@ namespace
 		return true;
 	}
 
-	BlockFn CompileBlock(u32 pc)
+	// The code cache's wrap: everything compiled goes, as the cache rewinds. HH-37: Load installs
+	// an image's block where the JIT would compile it and counts its code bytes alike
+	// (InstallBlock), so it wraps where its Shape run did and its LUT and records, mirror aliases
+	// included, stay that run's; Interp does not (a miss runs on the interpreter, which adds no
+	// code), so there the wraps fall elsewhere.
+	void WrapIfFull()
 	{
 		if (s_code_pos + 8192 > kCodeCacheSize)
 		{
@@ -690,24 +754,62 @@ namespace
 			memset(s_covered, 0, sizeof(s_covered));
 			s_code_pos = 0;
 		}
+	}
+
+	// Where CompileBlock registers a block, and InstallBlock an image's: its record, its LUT slot
+	// (at Norm(pc), so every mirror of pc runs it), its pages and its covered words.
+	void RegisterBlock(u32 pc, BlockFn fn, u32 ns, u32 cov)
+	{
+		s_blocks.emplace(pc, BlockRec{fn, cov});
+		if (InRam(ns)) s_lut[ns >> 2] = fn;
+		if (cov > ns)
+		{
+			for (u32 pg = ns >> kPageShift; pg <= (cov - 1) >> kPageShift; pg++)
+				s_page[pg].push_back(pc);
+			if (InRam(cov - 1))
+				CoverRange(ns, cov);
+		}
+	}
+
+	aot::Block s_aot_block; // HH-37: the last compiled block's key and code (CompileBlock)
+
+	BlockFn CompileBlock(u32 pc)
+	{
+		s_reader.start(pc);
+		if (s_reader.rec)
+			s_code_pos = 0; // HH-37 Emit: each record alone, at the start of a plain buffer
+		else
+			WrapIfFull();
 
 		u8* start = s_code + s_code_pos;
 		ArmCodeWriteScope cws; // every byte from here to the icache flush is a code write
 		// Written through the write alias, run at `start` (flushed and
 		// published as the BlockFn). Nothing emitted here computes an address
 		// from the buffer's own start.
-		MacroAssembler masm(armJitRW(start), kCodeCacheSize - s_code_pos, PositionDependentCode);
+		MacroAssembler masm(s_reader.rec ? start : armJitRW(start), kCodeCacheSize - s_code_pos, PositionDependentCode);
 		s_irc.Reset(); // fresh per-block register-cache state (C.32)
 
 		const Register gpr = x19;
 		// Uniform 80-byte frame across all blocks (tail-chaining: any block's
 		// epilogue must match any successor's prologue). x22..x27 = C.32 cache.
-		masm.Sub(sp, sp, 80);
+		// HH-37: 96 in the AOT form, with x28 (the import table) at 80.
+		masm.Sub(sp, sp, FrameSize());
 		masm.Stp(x19, x20, MemOperand(sp, 0));
 		masm.Stp(x21, x30, MemOperand(sp, 16));
 		masm.Stp(x22, x23, MemOperand(sp, 32));
 		masm.Stp(x24, x25, MemOperand(sp, 48));
 		masm.Stp(x26, x27, MemOperand(sp, 64));
+		if (aot::shaped())
+		{
+			masm.Str(x28, MemOperand(sp, 80));
+			u32 goff;
+			const u32 gslot = aot::slotOf(&psxRegs.GPR.r[0], &goff);
+			AOT_CHECK(goff == 0, "the IOP prologue's base is not its import's start");
+			vixl::ExactAssemblyScope scope(&masm, 2 * kInstructionSize);
+			masm.mov(importsReg, x0);
+			masm.ldr(gpr, MemOperand(importsReg, gslot * 8));
+		}
+		else
 		{
 			// Exactly 4 instructions so kChainEntryOffset stays constant.
 			const uint64_t gv = reinterpret_cast<uint64_t>(&psxRegs.GPR.r[0]);
@@ -717,13 +819,17 @@ namespace
 			masm.movk(gpr, (gv >> 32) & 0xffff, 32);
 			masm.movk(gpr, (gv >> 48) & 0xffff, 48);
 		}
+		// a chain enters past the prologue (ChainEntryOffset), so its length is the shaped form's invariant
+		if (aot::shaped())
+			AOT_CHECK(masm.GetSizeOfCodeGenerated() == ChainEntryOffset(), "the IOP prologue is %zu bytes, a chain enters at %u",
+				masm.GetSizeOfCodeGenerated(), ChainEntryOffset());
 
 		u32 p = pc;
 		int n = 0;
 		bool done = false, branch_end = false;
 		while (n < kMaxInsns)
 		{
-			const u32 insn = iopMemRead32(p);
+			const u32 insn = ReadCode(p);
 			if (EmitSimple(masm, gpr, insn)) { p += 4; n++; continue; }
 			if (EmitBranch(masm, gpr, p, insn, n)) { done = branch_end = true; break; } // emits bookkeeping + pc + epilogue
 			break; // unsupported -> interpreter handles the rest of the block
@@ -754,16 +860,15 @@ namespace
 			}
 			// The interpreter tail reads AND writes guest GPR memory.
 			s_irc.FlushDirty(masm, gpr);
-			masm.Mov(x16, reinterpret_cast<uint64_t>(&iopRunBasicBlock_arm64));
-			masm.Blr(x16);
+			EmitCall(masm, reinterpret_cast<uint64_t>(&iopRunBasicBlock_arm64));
 			s_irc.Reset();
 			EmitEpilogue(masm);
 		}
 
 		masm.FinalizeCode();
 		const size_t sz = masm.GetSizeOfCodeGenerated();
-		HostSys::FlushInstructionCache(start, static_cast<u32>(sz));
-		s_code_pos += (sz + 15) & ~size_t(15);
+		if (!s_reader.rec)
+			HostSys::FlushInstructionCache(start, static_cast<u32>(sz));
 
 		BlockFn fn = reinterpret_cast<BlockFn>(start);
 		// Native code covers the leading run; a translated branch also bakes the
@@ -778,17 +883,67 @@ namespace
 		// re-handing `lw ra` to the interpreter forever.)
 		const u32 cov = (!done && InRam(ne)) ? ne + 4 : ne;
 
-		s_blocks.emplace(pc, BlockRec{fn, cov});
-		if (InRam(ns)) s_lut[ns >> 2] = fn;
-		if (cov > ns)
+		if (aot::shaped())
 		{
-			for (u32 pg = ns >> kPageShift; pg <= (cov - 1) >> kPageShift; pg++)
-				s_page[pg].push_back(pc);
-			if (InRam(cov - 1))
-				CoverRange(ns, cov);
+			// HH-37: the block's key and code, for Shape's log or Emit's comparison. An
+			// interpreter-tail block is the one that read a word past its native ones (the breaker),
+			// which is how InstallBlock knows it covers one more.
+			aot::Block& b = s_aot_block;
+			b = aot::Block{};
+			b.unit = aot::UnitIOP;
+			b.pc = pc;
+			b.words = s_reader.words;
+			b.native = (ne - ns) >> 2;
+			b.codeLen = static_cast<u32>(sz);
+			AOT_CHECK(b.native <= b.words.size() && (b.words.size() > b.native) == !done,
+				"the IOP block at %08x read %zu words for %u native ones (%s)", pc, b.words.size(), b.native,
+				done ? "no interpreter tail" : "an interpreter tail");
+			if (s_reader.rec)
+				return fn;
+			aot::logBlock(b, start);
 		}
+
+		s_code_pos += (sz + 15) & ~size_t(15);
+		RegisterBlock(pc, fn, ns, cov);
 		return fn;
 	}
+
+	// HH-37 Load and Interp: the image's block for pc whose words guest memory holds now,
+	// registered where CompileBlock registers the JIT's, its code bytes counted toward the wrap
+	// (WrapIfFull). Its extent is the record's: native words of code, and the breaker word too when
+	// it read past them (an interpreter tail, C.70). A miss (Interp) runs the basic block on the
+	// interpreter, whose timing is the interpreter's: the IOP has no C twin.
+	void InterpMissBlock(void**) { iopRunBasicBlock_arm64(); }
+	BlockFn InstallBlock(u32 pc)
+	{
+		const aot::Block* pick = nullptr;
+		if (const std::vector<const aot::Block*>* v = aot::imageBlocks(aot::UnitIOP, pc))
+			for (const aot::Block* b : *v)
+			{
+				bool same = true;
+				for (u32 q = 0; same && q < (u32)b->words.size(); q++)
+					same = iopMemRead32(pc + q * 4) == b->words[q];
+				if (same)
+				{
+					pick = b;
+					break;
+				}
+			}
+		if (!pick)
+		{
+			aot::miss(aot::UnitIOP, pc); // Load stops here
+			return &InterpMissBlock;
+		}
+		WrapIfFull();
+		s_code_pos += (pick->codeLen + 15) & ~u32(15);
+		BlockFn fn = reinterpret_cast<BlockFn>(const_cast<u8*>(pick->code));
+		const u32 ns = Norm(pc), ne = ns + pick->native * 4;
+		const u32 cov = (pick->words.size() > pick->native && InRam(ne)) ? ne + 4 : ne;
+		RegisterBlock(pc, fn, ns, cov);
+		aot::countInstall(aot::UnitIOP);
+		return fn;
+	}
+	inline BlockFn NewBlock(u32 pc) { return aot::imageOnly() ? InstallBlock(pc) : CompileBlock(pc); }
 
 	inline BlockFn BlockForPC(u32 pc)
 	{
@@ -796,17 +951,29 @@ namespace
 		if (InRam(np))
 		{
 			BlockFn f = s_lut[np >> 2];
-			return f ? f : CompileBlock(pc);
+			return f ? f : NewBlock(pc);
 		}
 		auto it = s_blocks.find(pc);
-		return it != s_blocks.end() ? it->second.fn : CompileBlock(pc);
+		return it != s_blocks.end() ? it->second.fn : NewBlock(pc);
 	}
 }
 
 static void recReserve(void)
 {
-	s_ok = armVixlSelfTest();
-	if (s_ok && !s_code)
+	// HH-37: an image mode maps no code (its blocks are the image's; recResetIOP says whether one
+	// was admitted), and Emit compiles into plain memory, which it never runs.
+	static_assert(kCodeCacheSize <= aot::EMIT_BUFFER_BYTES, "Emit compiles a block anywhere the cache could hold it");
+	if (aot::imageOnly())
+		s_ok = true;
+	else if (aot::mode() == aot::Emit)
+	{
+		s_ok = true;
+		if (!s_code)
+			s_code = aot::emitBuffer();
+	}
+	else
+		s_ok = armVixlSelfTest();
+	if (s_ok && !s_code && !aot::imageOnly())
 	{
 		s_code = armJitMap(kCodeCacheSize, "IOP");
 	}
@@ -816,12 +983,20 @@ static void recReserve(void)
 		                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 		if (s_lut == MAP_FAILED) s_lut = nullptr;
 	}
-	s_ok = s_ok && s_code && s_lut;
+	s_ok = s_ok && (s_code || aot::imageOnly()) && s_lut;
+	if (aot::shaped() && s_lut)
+		aot::setValueImport(kLutImport, s_lut);
 	Console.WriteLn("arm64 IOP rec (C.2b-4): %s.", s_ok ? "native ALU+mem+branch JIT active" : "FAILED -> interpreter fallback");
 }
 
 static void recResetIOP(void)
 {
+	// HH-37: after the VM's admission (UpdateCPUImplementations runs first): an image mode runs
+	// its blocks only when the image was admitted, the interpreter otherwise.
+	if (aot::imageOnly())
+		s_ok = s_lut != nullptr && aot::fromImage(aot::UnitIOP);
+	if (aot::shaped() && iopMem != nullptr)
+		aot::setValueImport(kMainImport, iopMem->Main);
 	s_blocks.clear();
 	s_page.clear();
 	LutClearAll();
@@ -900,7 +1075,7 @@ static s32 recExecuteBlock(s32 eeCycles)
 	psxRegs.iopBreak   = 0;
 	psxRegs.iopCycleEE = eeCycles;
 	while (psxRegs.iopCycleEE > 0)
-		BlockForPC(psxRegs.pc)();
+		BlockForPC(psxRegs.pc)(aot::imports());
 	return psxRegs.iopBreak + psxRegs.iopCycleEE;
 }
 
@@ -909,6 +1084,7 @@ static void recShutdown(void)
 	s_blocks.clear();
 	s_page.clear();
 	memset(s_covered, 0, sizeof(s_covered));
+	if (aot::mode() == aot::Emit) s_code = nullptr; // HH-37: Emit's buffer is aot's
 	if (s_code) { armJitUnmap(s_code, kCodeCacheSize, "IOP"); s_code = nullptr; }
 	s_code_pos = 0;
 	s_ok = false;
@@ -929,3 +1105,58 @@ R3000Acpu psxRec = {
 	recShutdown,
 };
 
+
+// ---- HH-37: the IOP's part of the AOT form (aot_arm64.cpp) ----
+#ifdef LRPS2_AOT_FORM
+// Everything a shaped IOP block calls or reaches that is not psxRegs off x19, in slot order (after
+// the EE's). A region is reached at an offset (EmitAddr); a function at its start.
+void aot::iopImports(ImportAdder add)
+{
+#define AOT_FN(f) add(#f, reinterpret_cast<const void*>(&f), 1)
+	AOT_FN(iopMemRead8); AOT_FN(iopMemRead16); AOT_FN(iopMemRead32);
+	AOT_FN(iopMemWrite8); AOT_FN(iopMemWrite16); AOT_FN(iopMemWrite32);
+	AOT_FN(iopEventTest); AOT_FN(iopRunBasicBlock_arm64);
+#undef AOT_FN
+	add("psxRegs", &psxRegs, sizeof(psxRegs));
+	add("iopHw", iopHw, sizeof(iopHw));
+	add(kLutImport, nullptr, 0);
+	add(kMainImport, nullptr, 0);
+}
+
+// Every guest-state member IOP code addresses off x19 or off an import's base, by offset and size:
+// a layout that differs refuses the image.
+u64 aot::iopLayoutHash()
+{
+	u64 h = aot::FNV_BASIS;
+	const auto mix = [&h](const char* name, size_t off, size_t size) { h = aot::fnvMember(h, name, off, size); };
+#define AOT_M(s, m) mix(#s "." #m, offsetof(s, m), sizeof(((s*)nullptr)->m))
+	AOT_M(psxRegisters, GPR); AOT_M(psxRegisters, CP0); AOT_M(psxRegisters, pc); AOT_M(psxRegisters, cycle);
+	AOT_M(psxRegisters, iopNextEventCycle); AOT_M(psxRegisters, iopCycleEE);
+#undef AOT_M
+	mix("sizeof psxRegisters", sizeof(psxRegisters), sizeof(GPRRegs));
+	mix("iopHw ICFG", HW_ICFG & 0xffff, sizeof(iopHw));
+	return h;
+}
+
+const char* aot::iopAbiText()
+{
+	static char text[256];
+	snprintf(text, sizeof text,
+		"iop: x0 imports in; x19 psxRegs.GPR; x20/x21 branch operands; x22-x27 GPR cache; x28 imports; "
+		"frame %u; chain entry %u; max insns %d; lut = Norm(pc) RAM words of %u bytes, 8 bytes; "
+		"main RAM inline below 8 MB, folded to 2 MB",
+		kFrameAot, kChainEntryOffsetAot, kMaxInsns, kRamBytes);
+	return text;
+}
+
+#ifdef AOT_TOOLING
+// Emit: each logged IOP block re-compiled from its words (aot::emitGuest)
+void iopAotEmit()
+{
+	aot::emitGuest(aot::UnitIOP, s_reader, [](u32 pc) -> const aot::Block& {
+		CompileBlock(pc);
+		return s_aot_block;
+	});
+}
+#endif
+#endif

@@ -536,10 +536,11 @@ __ri void _nVifUnpackLoop(const u8* data)
 			// table handles the
 			// same no-mode case (upkNum bit 4 selects the doMask variant and
 			// writeXYZW applies the per-cycle mask via vif.cl internally).
+			// The third argument is the base an AOT-shaped kernel reaches nVifMask off (HH-37).
 			uint cl3 = pcsx2_min_i(vif.cl, 3);
 			nVifCall f = fnbase[cl3];
 			if (f)
-				f(dest, data);
+				reinterpret_cast<u32 (*)(void*, const void*, const void*)>(f)(dest, data, nVifMask);
 			else
 				ft(dest, data);
 #else

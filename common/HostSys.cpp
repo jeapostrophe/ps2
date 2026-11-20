@@ -180,7 +180,7 @@ long __stdcall SysPageFaultExceptionFilter(EXCEPTION_POINTERS* eps)
 			void* const exception_pc = nullptr;
 #endif
 
-			const PageFaultInfo pfi{(uptr)exception_pc, (uptr)eps->ExceptionRecord->ExceptionInformation[1]};
+			PageFaultInfo pfi{(uptr)exception_pc, (uptr)eps->ExceptionRecord->ExceptionInformation[1], 0};
 			const PageFaultHandler callback =
 				(PageFaultHandler)retro_atomic_load_acquire_ptr(&s_exception_handler_callback_atomic);
 			handled = callback ? callback(pfi) : false;
@@ -270,13 +270,21 @@ static void SysPageFaultSignalFilter(int signal, siginfo_t* siginfo, void* ctx)
 	void* const exception_pc = nullptr;
 #endif
 
-	const PageFaultInfo pfi{(uptr)exception_pc, (uptr)siginfo->si_addr & ~__pagemask};
+	PageFaultInfo pfi{(uptr)exception_pc, (uptr)siginfo->si_addr & ~__pagemask, 0};
 
 	const PageFaultHandler callback =
 		(PageFaultHandler)retro_atomic_load_acquire_ptr(&s_exception_handler_callback_atomic);
 	const bool handled = callback ? callback(pfi) : false;
 
 	retro_atomic_store_release_int(&s_fault_slot_inhandler[slot], 0);
+
+#if defined(__aarch64__) && defined(__APPLE__)
+	if (handled && pfi.resume_pc)
+		static_cast<ucontext_t*>(ctx)->uc_mcontext->__ss.__pc = pfi.resume_pc;
+#elif defined(__aarch64__)
+	if (handled && pfi.resume_pc)
+		static_cast<ucontext_t*>(ctx)->uc_mcontext.pc = pfi.resume_pc;
+#endif
 
 	/* Resumes execution right where we left off 
 	 * (re-executes instruction that caused the SIGSEGV). */

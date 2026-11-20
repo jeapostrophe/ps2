@@ -309,7 +309,10 @@ void mVUtestCycles(microVU& mVU, microFlagCycles& mFC)
 	a64::Label skip;
 	armAsm->B(&skip, a64::pl); // jump if result >= 0 (x86 xForwardJNS32)
 
-	armMoveAddressToReg(RXARG1, &mVUpBlock->pState);
+	if (mvuAot(mVU)) // HH-37: the block's own state, a literal in it
+		armAsm->Adr(RXARG1, vu1AotLit(mVUpBlock->pState));
+	else
+		armMoveAddressToReg(RXARG1, &mVUpBlock->pState);
 	armEmitCall(mVU.copyPLState);
 
 	if (EmuConfig.Gamefixes.VUSyncHack || EmuConfig.Gamefixes.FullVU0SyncHack)
@@ -379,9 +382,12 @@ static void mvuPreloadRegisters(microVU& mVU, u32 endCount)
 		return (free_regs >= REQUIRED_FREE_XMMS || free_gprs >= REQUIRED_FREE_GPRS);
 	};
 
+	// (incPC2: the walk reads the IR alone, never an instruction word -- mVU.code is restored
+	// below -- so the words past a block are no input of its compile; HH-37's key is the words
+	// a compile reads)
 	for (u32 x = 0; x < endCount && canPreload(); x++)
 	{
-		incPC(1);
+		incPC2(1);
 
 		const microOp* info = &mVUinfo;
 		if (info->doXGKICK)
@@ -647,7 +653,9 @@ void* mVUcompile(microVU& mVU, u32 startPC, uptr pState)
 				if (EmuConfig.Gamefixes.VUSyncHack || EmuConfig.Gamefixes.FullVU0SyncHack)
 					mvuStrImm64(mVU, &mVU.regs().nextBlockCycles, 0, gprT1);
 				mVUendProgram(mVU, &mFC, 0);
-				normBranchCompile(mVU, xPC);
+				// (HH-37: the AOT form compiles the program's resumption when it resumes)
+				if (!mvuAot(mVU))
+					normBranchCompile(mVU, xPC);
 				incPC(-2);
 				goto perf_and_return;
 			}
