@@ -168,6 +168,9 @@ extern u8 cdvdRead(u8 key);
 extern void cdvdWrite(u8 key, u8 rt);
 
 extern void cdvdReloadElfInfo(std::string elfoverride = std::string());
+// The disc's serial and boot path, read from its SYSTEM.CNF with no other effect (the AOT form
+// names its game by them before the boot reads them; false when the disc has neither).
+extern bool cdvdPeekDiscIdentity(std::string& serial, std::string& boot);
 extern s32 cdvdCtrlTrayOpen(void);
 extern s32 cdvdCtrlTrayClose(void);
 int GetPS2ElfName( std::string& name );

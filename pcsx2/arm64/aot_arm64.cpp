@@ -33,7 +33,6 @@
 #ifdef LRPS2_AOT_FORM
 
 #include "CDVD/CDVD.h"
-#include "Elfheader.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -313,19 +312,25 @@ namespace aot
 		return false;
 	}
 
-	// The game: the disc's serial and its boot ELF's CRC, both known from VMManager::Initialize's
-	// ApplyBootParameters on, which runs before UpdateCPUImplementations admits an image.
+	// The game: the disc's serial and boot path from its SYSTEM.CNF (cdvdPeekDiscIdentity, which
+	// reads them with no other effect: the boot itself reads them later), taken once per VM, at
+	// admission. A revision with the serial of another is told apart by the words every block is
+	// installed under, not here.
+	static std::string contentText;
 	static bool contentDigest(u8 out[16])
 	{
-		if (!DiscSerial[0] && !ElfCRC)
+		if (contentText.empty())
 			return false;
-		char text[96];
-		const int n = snprintf(text, sizeof text, "%s|%08x", DiscSerial, ElfCRC);
-		const u64 a = fnv(FNV_BASIS, text, (size_t)n);
-		const u64 b = fnv(0x6c62272e07bb0142ULL, text, (size_t)n);
+		const u64 a = fnv(FNV_BASIS, contentText.data(), contentText.size());
+		const u64 b = fnv(0x6c62272e07bb0142ULL, contentText.data(), contentText.size());
 		memcpy(out, &a, 8);
 		memcpy(out + 8, &b, 8);
 		return true;
+	}
+	static void readContent()
+	{
+		std::string serial, boot;
+		contentText = cdvdPeekDiscIdentity(serial, boot) ? serial + "|" + boot : std::string();
 	}
 
 	enum { HEADER_NO_UUID = 1, HEADER_NO_DIGEST = 2 };
@@ -453,14 +458,16 @@ namespace aot
 	static FILE* logFile;
 	static std::string logPath;
 
-	// The log's first line: this build's header fields a block's code depends on, which Emit
-	// refuses a log without (a log from another build, or other settings)
-	static void logBuildLine(FILE* f)
+	// The log's first line: this build's and game's header fields, which Emit refuses a log
+	// without (a log from another build, other settings or another game)
+	static std::string buildLine()
 	{
 		ImageHeader h;
 		makeHeader(h, 0, 0, nullptr);
-		fprintf(f, "R %016llx %016llx %016llx %u %x\n", (unsigned long long)h.imports_hash,
-			(unsigned long long)h.layout_hash, (unsigned long long)h.abi_hash, h.fastmem, h.ee_flags);
+		char line[200];
+		snprintf(line, sizeof line, "R %016llx %016llx %016llx %u %x %s\n", (unsigned long long)h.imports_hash,
+			(unsigned long long)h.layout_hash, (unsigned long long)h.abi_hash, h.fastmem, h.ee_flags, formatUuid(h.rom_md5).c_str());
+		return line;
 	}
 #endif
 
@@ -477,7 +484,7 @@ namespace aot
 			logFile = fopen(cfg.log.c_str(), "w");
 			AOT_CHECK(logFile != nullptr, "cannot write %s", cfg.log.c_str());
 			logPath = cfg.log;
-			logBuildLine(logFile);
+			fputs(buildLine().c_str(), logFile);
 		}
 		fprintf(logFile, "B %u %08x %x %u %zu %u %016llx %x %x %x %zu", b.unit, b.pc, b.flags, b.native, b.words.size(),
 			b.codeLen, (unsigned long long)fnv(FNV_BASIS, code, b.codeLen), b.mask[0], b.mask[1], b.mask[2], b.sites.size() / 3);
@@ -700,14 +707,10 @@ namespace aot
 		{
 			if (line[0] == 'R')
 			{
-				ImageHeader h;
-				makeHeader(h, 0, 0, nullptr);
-				char mine[160];
-				snprintf(mine, sizeof mine, "R %016llx %016llx %016llx %u %x\n", (unsigned long long)h.imports_hash,
-					(unsigned long long)h.layout_hash, (unsigned long long)h.abi_hash, h.fastmem, h.ee_flags);
-				if (strcmp(line, mine))
+				const std::string mine = buildLine();
+				if (mine != line)
 				{
-					fprintf(stderr, "lrps2 AOT emit: the log's build line is %sthis build's is %s", line, mine);
+					fprintf(stderr, "lrps2 AOT emit: the log's build line is %sthis build's is %s", line, mine.c_str());
 					fclose(f);
 					_Exit(4);
 				}
@@ -780,8 +783,8 @@ namespace aot
 		ImageHeader h;
 		AOT_CHECK(!makeHeader(h, emitBlocks, (u32)emitCode.size(), cfg.hasCoreUuid ? cfg.coreUuid : nullptr),
 			"this core has no LC_UUID or the game no serial, so the image could name neither");
-		fprintf(stderr, "lrps2 AOT emit: an image for core %s and the game %s (%s %08x), emitted by core %s\n",
-			formatUuid(h.core_uuid).c_str(), formatUuid(h.rom_md5).c_str(), DiscSerial, ElfCRC, formatUuid(h.emit_uuid).c_str());
+		fprintf(stderr, "lrps2 AOT emit: an image for core %s and the game %s (%s), emitted by core %s\n",
+			formatUuid(h.core_uuid).c_str(), formatUuid(h.rom_md5).c_str(), contentText.c_str(), formatUuid(h.emit_uuid).c_str());
 		f = fopen(codePath.c_str(), "wb");
 		AOT_CHECK(f != nullptr && fwrite(emitCode.data(), 1, emitCode.size(), f) == emitCode.size(), "cannot write %s", codePath.c_str());
 		fclose(f);
@@ -821,6 +824,7 @@ namespace aot
 			return true;
 		if (admission != Unknown)
 			return admission == Admitted;
+		readContent();
 #ifdef AOT_TOOLING
 		if (cfg.mode == Emit)
 			emitAll();
