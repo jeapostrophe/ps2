@@ -4485,6 +4485,29 @@ namespace {
 		if (rd) TwG(rd).SD[0] = lo;
 	}
 
+	// EmitMmiDiv. Not the interpreter's: the emitter takes MMI3 sub 0x1d for PDIVBW, which the
+	// interpreter's table has at MMI2 sub 0x1d (its MMI3 0x1d is MMI_Unknown).
+	void TwinMmiDiv(u32 insn)
+	{
+		const int act = MmiDivAction(insn);
+		const u32 rs = (insn >> 21) & 31, rt = (insn >> 16) & 31;
+		const bool bw = act == MD_PDIVBW, uw = act == MD_PDIVUW;
+		const u32 bdiv = bw ? (u32)(s32)TwG(rt).SS[0] : 0; // read once, before any lane
+		for (int i = 0; i < (bw ? 4 : 2); i++)
+		{
+			const int word = bw ? i : i * 2;
+			const u32 a = TwG(rs).UL[word];
+			const u32 b = bw ? bdiv : TwG(rt).UL[word];
+			u32 q, r;
+			if (uw) { q = b ? a / b : 0xffffffffu; r = b ? a - q * b : a; }
+			else if (!b) { q = (s32)a < 0 ? 1 : 0xffffffffu; r = a; }
+			else if (a == 0x80000000u && b == 0xffffffffu) { q = 0x80000000u; r = 0; }
+			else { q = (u32)((s32)a / (s32)b); r = a - q * b; }
+			if (bw) { cpuRegs.LO.UL[i] = q; cpuRegs.HI.UL[i] = r; }
+			else { cpuRegs.LO.SD[i] = (s32)q; cpuRegs.HI.SD[i] = (s32)r; }
+		}
+	}
+
 	// An op the emitter hands to its interpreter implementation (EmitInterpOpCall): cpuRegs.code
 	// is staged and left so.
 	inline void TwinInterpCall(u32 insn, void (*fn)()) { cpuRegs.code = insn; fn(); }
@@ -4728,7 +4751,8 @@ namespace {
 					TwinInterpCall(insn, &R5900::Interpreter::OpcodeImpl::MMI::QFSRV);
 					return;
 				}
-				TwinAsInterp(insn); // EmitMmi/HiLo/Div/Perm/Mul/Macc/Hmacc: the interpreter's arithmetic
+				if (MmiDivAction(insn)) { TwinMmiDiv(insn); return; }
+				TwinAsInterp(insn); // EmitMmi/HiLo/Perm/Mul/Macc/Hmacc: the interpreter's arithmetic
 				return;
 			case 0x12: // COP2, rs != BC2. AOT: the macro ops are interpreted.
 				if (Cop2XferSupported(insn)) { TwinCop2Transfer(insn); return; }
@@ -5889,13 +5913,15 @@ namespace
 		int ran = 0, failed = 0, skipped = 0;
 		int ends[4] = {};
 		std::unordered_map<std::string, int> fails;
-		std::unordered_map<std::string, int> seen;
+		std::unordered_map<std::string, int> seen, every, accepted;
 		// TwinSimpleOk is EmitSimple's verdict; IsTranslatable is the delay slot's. They must agree.
 		for (int i = 0; i < 2000000; i++)
 		{
 			const u32 w = (u32)TwRnd();
 			const u32 op = w >> 26;
 			if (op == 0x12 && ((w >> 21) & 31) == 0x08) continue; // BC2: neither, by design
+			if (TwinSimpleOk(w))
+				accepted[R5900::GetInstruction(w).Name]++;
 			if (TwinSimpleOk(w) != IsTranslatable(w))
 			{
 				fprintf(stderr, "lrps2 twin selftest: %08x TwinSimpleOk %d IsTranslatable %d\n", w, TwinSimpleOk(w), IsTranslatable(w));
@@ -5985,6 +6011,7 @@ namespace
 			ends[t.end]++;
 			const std::string name = R5900::GetInstruction(words[0]).Name;
 			seen[name]++;
+			for (u32 w : words) every[R5900::GetInstruction(w).Name + std::string(w >> 26 == 0x1c && MmiDivAction(w) == MD_PDIVBW ? "(MMI3 0x1d)" : "")]++;
 			const std::string d = TwDiff(twin, jit);
 			if (!d.empty())
 			{
@@ -6001,7 +6028,11 @@ namespace
 			ran, ends[TE_TAIL], ends[TE_CAP], ends[TE_BRANCH], ends[TE_ERET], skipped, failed);
 		for (const auto& f : fails)
 			fprintf(stderr, "lrps2 twin selftest: %s failed %d of %d\n", f.first.c_str(), f.second, seen[f.first]);
-		fprintf(stderr, "lrps2 twin selftest: %zu first-op names covered\n", seen.size());
+		fprintf(stderr, "lrps2 twin selftest: %zu op names ran:", every.size());
+		for (const auto& e : every) fprintf(stderr, " %s:%d", e.first.c_str(), e.second);
+		fprintf(stderr, "\nlrps2 twin selftest: emitted op names that never ran:");
+		for (const auto& a : accepted) if (!every.count(a.first)) fprintf(stderr, " %s", a.first.c_str());
+		fprintf(stderr, "\n");
 		fflush(stderr);
 		_Exit(failed ? 3 : 0);
 	}
