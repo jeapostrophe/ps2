@@ -1908,11 +1908,11 @@ static void vu1AotEmitLits()
 	{
 		while (armAsm->GetCursorOffset() & 15)
 		{
-			a64::ExactAssemblyScope scope(armAsm, 4);
+			vixl::ExactAssemblyScope scope(armAsm, 4);
 			armAsm->dc32(0);
 		}
 		armAsm->Bind(&l.label);
-		a64::ExactAssemblyScope scope(armAsm, sizeof(microRegInfo));
+		vixl::ExactAssemblyScope scope(armAsm, sizeof(microRegInfo));
 		for (u32 w : l.st.full32)
 			armAsm->dc32(w);
 	}
@@ -2283,6 +2283,9 @@ void aot::vu1Imports(ImportAdder add)
 	add("sse4_maxvals", sse4_maxvals, sizeof(sse4_maxvals));
 	add("mVU_MIN_MAX_1", mVU_MIN_MAX_1, sizeof(mVU_MIN_MAX_1));
 	add("mVU_MIN_MAX_2", mVU_MIN_MAX_2, sizeof(mVU_MIN_MAX_2));
+	add("mVU_ADD_SS", mVU_ADD_SS, sizeof(mVU_ADD_SS));
+	add("mVU_clipLoHalf", mVU_clipLoHalf, sizeof(mVU_clipLoHalf));
+	add("mVU_clipWeights", mVU_clipWeights, sizeof(mVU_clipWeights));
 	add("vu1.Mem", nullptr, 0x4000);
 	add("vu1.Micro", nullptr, 0x4000);
 	add("vu1.links", nullptr, 0);
