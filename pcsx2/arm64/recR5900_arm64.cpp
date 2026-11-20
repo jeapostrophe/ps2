@@ -4430,7 +4430,7 @@ namespace {
 		TwFcr31() &= ~0xC000u;
 	}
 
-	// EmitMulDiv; off: 0 (pipeline 0) or 1 (the MMI pipeline-1 forms, HI1/LO1)
+	// EmitMulDiv; k: HI/LO's 64-bit half, 0 (pipeline 0) or 1 (the MMI pipeline-1 forms)
 	void TwinMulDiv(u32 funct, u32 rs, u32 rt, u32 rd, u32 k)
 	{
 		switch (funct)
@@ -5435,6 +5435,8 @@ namespace {
 	// where CompileBlock would have put the JIT's (its record, the LUT, its pages), preferring
 	// the variant compiled with the fastmem mask the faults so far give this block (any variant
 	// with the same words computes the same thing; the mask only says which accesses fault).
+	// Interp: a twin pc already has (TwinCached) comes first, and a block the image lacks
+	// becomes one (TwinNew).
 	BlockFn InstallBlock(u32 pc)
 	{
 		if (aot::mode() == aot::Interp)
