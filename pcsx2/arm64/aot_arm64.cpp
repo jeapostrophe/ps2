@@ -589,7 +589,7 @@ namespace aot
 		p = meta + sizeof h / 4;
 		if (h.nblocks > (size_t)(metaEnd - p) / BlockWords)
 		{
-			why = "meta: " + std::to_string(h.nblocks) + " blocks cannot fit";
+			why = "meta: " + std::to_string(h.nblocks) + " blocks cannot fit in " + std::to_string(metaEnd - p) + " words";
 			goto refuse;
 		}
 		imageBlockList.reserve(h.nblocks);
