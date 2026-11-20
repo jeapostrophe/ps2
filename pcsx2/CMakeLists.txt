@@ -819,7 +819,7 @@ if(NOT _M_X86)
 	# pcsx2_jithash_dump stub that libretro/main.cpp calls unconditionally
 	# from retro_deinit. Dropping it from this list is an aarch64 link error.
 	set(pcsx2x86Sources x86/CpuState.cpp x86/JitHash.cpp arm64/recR3000A_arm64.cpp arm64/recR5900_arm64.cpp arm64/aVU.cpp
-		arm64/AsmHelpers.cpp arm64/Vif_UnpackNEON.cpp arm64/Vif_Dynarec_arm64.cpp)
+		arm64/AsmHelpers.cpp arm64/Vif_UnpackNEON.cpp arm64/Vif_Dynarec_arm64.cpp arm64/aot_arm64.cpp)
 	set(pcsx2x86Headers)
 	# VIXL is the AArch64 code emitter, the foundation for the arm64 recompiler
 	# (Phase C). Wire it through the flags interface (like parallel-gs/glad above)

@@ -17,6 +17,7 @@
 #include <retro_atomic.h>
 #include <features/features_cpu.h>
 #include "VMManager.h"
+#include "arm64/aot_arm64.h"
 
 #include <sstream>
 
@@ -273,6 +274,10 @@ void VMManager::LoadSettings()
 	SettingsLoadWrapper slw(*si);
 	EmuConfig.LoadSave(slw);
 	PAD::LoadConfig(*si);
+	// HH-37: the AOT form runs VU1 on the interpreter, with which MTVU deadlocks a continuous
+	// VU1 program (SetMTVUAndAffinityControlDefault's comment): VU1 runs on the EE thread.
+	if (aot::shaped())
+		EmuConfig.Speedhacks.vuThread = false;
 
 	// Remove any user-specified hacks in the config (we don't want stale/conflicting values when it's globally disabled).
 	EmuConfig.GS.MaskUserHacks();
@@ -954,7 +959,10 @@ void VMManager::UpdateCPUImplementations()
 	// so the EE rec needs that cache too -- and microVU0 reset, which
 	// ClearCPUExecutionCaches sees to. The IOP rec falls back by itself
 	// (recExecuteBlock -> psxInt).
-	const bool ee_rec = CHECK_EEREC && eeJitAvailable_arm64() && mVUavailable(0);
+	// HH-37: the AOT form never emits macro COP2 through microVU0 (it interprets it), so needs no
+	// microVU0 cache; an image it was refused leaves the EE on its interpreter.
+	const bool aot_ok = aot::admit();
+	const bool ee_rec = CHECK_EEREC && eeJitAvailable_arm64() && (aot::shaped() ? aot_ok : mVUavailable(0));
 	if (CHECK_EEREC && !ee_rec)
 		Console.WriteLn("arm64 EE rec: no code memory this load -- the EE interpreter runs.");
 	Cpu    = ee_rec ? &recCpu : &intCpu;
@@ -1017,7 +1025,7 @@ void VMManager::Internal::ClearCPUExecutionCaches()
 	// mVUreset emits (the exact-multiply stub), so microVU0 is reset whenever
 	// the EE rec runs and VU0's micro programs do not: VU0's recompiler
 	// disabled, or VU0 on soft float (upstream tested only the first).
-	if (Cpu == &recCpu && CpuVU0 != &vucpu_rec_vu0)
+	if (Cpu == &recCpu && CpuVU0 != &vucpu_rec_vu0 && !aot::shaped())
 		vucpu_rec_vu0.Reset();
 
 	CpuVU0->Reset();

@@ -49,7 +49,7 @@
 
 alignas(64) vtlb_map_t vtlbdata;
 
-static bool vtlb_PageFaultHandler(const PageFaultInfo& info);
+static bool vtlb_PageFaultHandler(PageFaultInfo& info);
 
 static vtlbHandler vtlbHandlerCount = 0;
 
@@ -1030,10 +1030,10 @@ void vtlb_AddLoadStoreInfo(uptr code_address, u32 code_size, u32 guest_pc, u32 g
 }
 
 #ifdef ARCH_ARM64
-extern "C" bool eeFastmemFault_arm64(uintptr_t code_address); // arm64 EE rec (C.50)
+extern "C" bool eeFastmemFault_arm64(uintptr_t code_address, uintptr_t* resume_pc); // arm64 EE rec (C.50)
 #endif
 
-static bool vtlb_BackpatchLoadStore(uptr code_address, uptr fault_address)
+static bool vtlb_BackpatchLoadStore(uptr code_address, uptr fault_address, uptr* resume_pc)
 {
 	uptr fastmem_start = (uptr)vtlbdata.fastmem_base;
 	uptr fastmem_end = fastmem_start + 0xFFFFFFFFu;
@@ -1048,7 +1048,7 @@ static bool vtlb_BackpatchLoadStore(uptr code_address, uptr fault_address)
 	// stub next to every fastmem access, so backpatching is a single instruction
 	// rewrite over there -- none of the info block below is needed.
 	{
-		bool handled = eeFastmemFault_arm64(code_address);
+		bool handled = eeFastmemFault_arm64(code_address, resume_pc);
 		fastmem_unlock();
 		return handled;
 	}
@@ -1595,7 +1595,7 @@ void mmap_UnprotectRamRange(u32 paddr, u32 size)
 	}
 }
 
-static bool vtlb_PageFaultHandler(const PageFaultInfo& info)
+static bool vtlb_PageFaultHandler(PageFaultInfo& info)
 {
 	u32 vaddr;
 	if (CHECK_FASTMEM && vtlb_GetGuestAddress(info.addr, &vaddr))
@@ -1607,7 +1607,7 @@ static bool vtlb_PageFaultHandler(const PageFaultInfo& info)
 			mmap_ClearCpuBlock(offset);
 			return true;
 		}
-		return vtlb_BackpatchLoadStore(info.pc, info.addr);
+		return vtlb_BackpatchLoadStore(info.pc, info.addr, &info.resume_pc);
 	}
 	else
 	{

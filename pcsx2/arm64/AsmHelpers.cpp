@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 isztld <https://isztld.com/>
 // SPDX-License-Identifier: GPL-3.0
 
+#include "arm64/aot_arm64.h"
 #include "../../common/Threading.h"
 #include <cstdlib>
 #include <cstring>
@@ -262,6 +263,13 @@ static const char* armJitAddResultName(ArmJitRegions::AddResult r)
 
 u8* armJitMap(size_t size, const char* what)
 {
+	// HH-37: in an AOT mode only the shaped recompilers' caches exist (aot::jitAllowed); every
+	// other recompiler runs its interpreter, as on a host with no executable memory.
+	if (!aot::jitAllowed(what))
+	{
+		Console.WriteLn("arm64 JIT: %s code cache: none in this AOT mode; its interpreter runs.", what);
+		return nullptr;
+	}
 	switch (s_jit_source)
 	{
 		case ArmJitSource::Self:
