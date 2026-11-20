@@ -91,7 +91,7 @@ thread_local u64* mvuReadMask;
 static __fi bool mvuAot(const microVU& mVU) { return mVU.index == 1 && aot::unitShaped(aot::UnitVU1); }
 static microBlock s_vu1AotBlock; // the block being compiled (mVUpBlock): its states, as literals
 static a64::Label* vu1AotLit(const microRegInfo& st);
-static void vu1AotEmitLink(microVU& mVU, const microRegInfo& st, int pcImm, bool jr);
+static void vu1AotEmitLink(microVU& mVU, const microRegInfo& st, int pc);
 static void* vu1AotFind(microVU& mVU, u32 pc, const microRegInfo* st);
 static void vu1AotReset(microVU& mVU);
 static void vu1AotClear();
@@ -1921,20 +1921,19 @@ static void vu1AotEmitLits()
 
 static void* vu1AotLinkRT(u32 pc, const microRegInfo* st);
 
-// A link to the block at pcImm (or, at -1, the pc in w0: a jump's, which also becomes start_pc)
-// entered with state st. Every register but x19, x27, x28, the flag instances (w23-w26) and PQ
-// (v24) is free here: the branch drivers have flushed the allocator (mVUsetupBranch), as the
-// stock form's jump to a block's start requires.
-static void vu1AotEmitLink(microVU& mVU, const microRegInfo& st, int pcImm, bool jr)
+// A link to the block at pc entered with state st; pc -1: a jump's, whose target is in w0 and
+// becomes start_pc, as mVUcompileJIT makes it. Every register but x19, x27, x28, the flag
+// instances (w23-w26) and PQ (v24) is free here: the branch drivers have flushed the allocator
+// (mVUsetupBranch), as the stock form's jump to a block's start requires.
+static void vu1AotEmitLink(microVU& mVU, const microRegInfo& st, int pc)
 {
 	using namespace a64;
 	Label* lit = vu1AotLit(st);
-	if (pcImm >= 0)
-		armAsm->Mov(w0, (u32)pcImm);
+	if (pc >= 0)
+		armAsm->Mov(w0, (u32)pc);
 	else
 	{
-		if (jr)
-			armAsm->Str(w0, MemOperand(RVUSTATE, offsetof(VURegs, start_pc)));
+		armAsm->Str(w0, MemOperand(RVUSTATE, offsetof(VURegs, start_pc)));
 		armAsm->And(w0, w0, mVU.microMemSize - 8);
 	}
 	armAsm->Adr(x1, lit);

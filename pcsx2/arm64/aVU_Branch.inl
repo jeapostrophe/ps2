@@ -375,7 +375,7 @@ void normBranchCompile(microVU& mVU, u32 branchPC)
 {
 	if (mvuAot(mVU)) // HH-37: every successor through a link stub
 	{
-		vu1AotEmitLink(mVU, mVUregs, branchPC, false);
+		vu1AotEmitLink(mVU, mVUregs, branchPC);
 		return;
 	}
 	microBlock* pBlock;
@@ -406,8 +406,7 @@ void normJumpCompile(mV, microFlagCycles& mFC, bool isEvilJump)
 	}
 	else
 		mvuLdr32(mVU, RWARG1, &mVU.branch);
-	if (mvuAot(mVU))
-		; // HH-37: the link stub below takes its state literal
+	if (mvuAot(mVU)) {} // HH-37: the link stub below takes the end state as a literal
 	else if (doJumpCaching)
 		armMoveAddressToReg(RXARG2, mVUpBlock);
 	else
@@ -424,9 +423,9 @@ void normJumpCompile(mV, microFlagCycles& mFC, bool isEvilJump)
 		armEmitJmp(mVU.exitFunct);
 	}
 
-	if (mvuAot(mVU)) // HH-37: a jump's link (w0 the target; it sets start_pc, as mVUcompileJIT does)
+	if (mvuAot(mVU)) // HH-37: a jump's link (w0 the target)
 	{
-		vu1AotEmitLink(mVU, mVUpBlock->pStateEnd, -1, true);
+		vu1AotEmitLink(mVU, mVUpBlock->pStateEnd, -1);
 		return;
 	}
 	if (!mVU.index)
@@ -650,9 +649,9 @@ void condBranch(mV, microFlagCycles& mFC, a64::Condition JMPcc)
 			const u32 takenPC = branchAddr(mVU);
 			a64::Label taken;
 			armAsm->B(&taken, JMPcc);
-			vu1AotEmitLink(mVU, mVUregs, notTakenPC, false);
+			vu1AotEmitLink(mVU, mVUregs, notTakenPC);
 			armAsm->Bind(&taken);
-			vu1AotEmitLink(mVU, mVUregs, takenPC, false);
+			vu1AotEmitLink(mVU, mVUregs, takenPC);
 			return;
 		}
 
