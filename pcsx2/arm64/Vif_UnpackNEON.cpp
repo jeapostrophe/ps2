@@ -438,7 +438,8 @@ void VifUnpackSSE_Init()
 		s_upkCode = armJitMap(kUpkCodeSize, "VIF unpack"); // the writes are armStartBlock sessions
 		if (!s_upkCode)
 		{
-			Console.Error("arm64 VIF unpack dynarec: no code memory; using the C reference path.");
+			if (!aot::imageOnly()) // HH-37: Load and Interp take the image's kernels at admission
+				Console.Error("arm64 VIF unpack dynarec: no code memory; using the C reference path.");
 			return;
 		}
 	}

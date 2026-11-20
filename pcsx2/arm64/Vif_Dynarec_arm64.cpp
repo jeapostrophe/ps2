@@ -210,7 +210,8 @@ void dVifReserve(int idx)
 	s_vifCode[idx] = armJitMap(kVifCodeSize, idx ? "VIF1" : "VIF0"); // the writes are armStartBlock sessions
 	if (!s_vifCode[idx])
 	{
-		Console.Error("arm64 VIF%d dynarec: no code memory; unpacks fall back to the C reference path.", idx);
+		if (!aot::imageOnly()) // HH-37: Load and Interp run the image's routines
+			Console.Error("arm64 VIF%d dynarec: no code memory; unpacks fall back to the C reference path.", idx);
 		return;
 	}
 	nVif[idx].recWritePtr = s_vifCode[idx];
