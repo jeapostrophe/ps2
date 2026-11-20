@@ -547,6 +547,15 @@ void cdvdReloadElfInfo(std::string elfoverride)
 }
 
 
+bool cdvdPeekDiscIdentity(std::string& serial, std::string& boot)
+{
+	char s[PCSX2_PATH_MAX];
+	GetPS2ElfName(boot);
+	ExecutablePathToSerial(s, sizeof(s), boot.c_str());
+	serial = s;
+	return !serial.empty() || !boot.empty();
+}
+
 static void cdvdReadKey(u8, u16, u32 arg2, u8* key)
 {
 	s32 numbers = 0, letters = 0;

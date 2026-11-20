@@ -6,12 +6,16 @@
 // instead of SysMemory.
 
 #include "Vif_UnpackNEON.h"
+#include "arm64/aot_arm64.h"
 #include <algorithm>
 
 #include "common/Console.h"
 #include "common/General.h"
 
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <iterator>
 #include <sys/mman.h>
 
 namespace a64 = vixl::aarch64;
@@ -379,10 +383,14 @@ void VifUnpackNEON_Simple::doMaskWrite(const vixl::aarch64::VRegister& regX) con
 	armAsm->Ldr(a64::q7, dstIndirect);
 
 	int offX = std::min(curCycle, 3);
-	armMoveAddressToReg(RXVIXLSCRATCH, nVifMask);
-	armAsm->Ldr(a64::q29, a64::MemOperand(RXVIXLSCRATCH, reinterpret_cast<const u8*>(nVifMask[0][offX]) - reinterpret_cast<const u8*>(nVifMask)));
-	armAsm->Ldr(a64::q30, a64::MemOperand(RXVIXLSCRATCH, reinterpret_cast<const u8*>(nVifMask[1][offX]) - reinterpret_cast<const u8*>(nVifMask)));
-	armAsm->Ldr(a64::q31, a64::MemOperand(RXVIXLSCRATCH, reinterpret_cast<const u8*>(nVifMask[2][offX]) - reinterpret_cast<const u8*>(nVifMask)));
+	// HH-37: an AOT-shaped kernel reaches nVifMask off its third argument (x2), never at its address
+	const bool shaped = aot::shaped() && !aot::redVifHostAddr();
+	if (!shaped)
+		armMoveAddressToReg(RXVIXLSCRATCH, nVifMask);
+	const a64::Register& base = shaped ? RXARG3 : RXVIXLSCRATCH;
+	armAsm->Ldr(a64::q29, a64::MemOperand(base, reinterpret_cast<const u8*>(nVifMask[0][offX]) - reinterpret_cast<const u8*>(nVifMask)));
+	armAsm->Ldr(a64::q30, a64::MemOperand(base, reinterpret_cast<const u8*>(nVifMask[1][offX]) - reinterpret_cast<const u8*>(nVifMask)));
+	armAsm->Ldr(a64::q31, a64::MemOperand(base, reinterpret_cast<const u8*>(nVifMask[2][offX]) - reinterpret_cast<const u8*>(nVifMask)));
 	armAsm->And(regX.V16B(), regX.V16B(), a64::q29.V16B());
 	armAsm->And(a64::q7.V16B(), a64::q7.V16B(), a64::q30.V16B());
 	armAsm->Orr(regX.V16B(), regX.V16B(), a64::q31.V16B());
@@ -390,27 +398,31 @@ void VifUnpackNEON_Simple::doMaskWrite(const vixl::aarch64::VRegister& regX) con
 	armAsm->Str(regX, dstIndirect);
 }
 
+// The kernel nVifUpk[index] at the assembler's pointer, its length in *len: null for an unpack
+// type with no data (the C table runs those)
+static u8* nVifGenOne(u32 index, u32* len)
+{
+	const int usn = (index >> 7) & 1, mask = (index >> 6) & 1, type = (index >> 2) & 15, curCycle = index & 3;
+	if (nVifT[type] == 0)
+		return nullptr;
+	VifUnpackNEON_Simple vpugen(!!usn, !!mask, curCycle);
+	u8* start = armStartBlock();
+	vpugen.xUnpack(type);
+	vpugen.xMovDest();
+	armAsm->Ret();
+	*len = static_cast<u32>(armEndBlock() - start);
+	return start;
+}
+
+static u32 s_upkLen[(2 * 2 * 16) * 4]; // HH-37 Shape: each kernel's length, for the shape log
+
 // ecx = dest, edx = src
 static void nVifGen(int usn, int mask, int curCycle)
 {
-
-	int usnpart = usn * 2 * 16;
-	int maskpart = mask * 16;
-
-	VifUnpackNEON_Simple vpugen(!!usn, !!mask, curCycle);
-
 	for (int i = 0; i < 16; ++i)
 	{
-		nVifCall& ucall(nVifUpk[((usnpart + maskpart + i) * 4) + curCycle]);
-		ucall = NULL;
-		if (nVifT[i] == 0)
-			continue;
-
-		ucall = (nVifCall)armStartBlock();
-		vpugen.xUnpack(i);
-		vpugen.xMovDest();
-		armAsm->Ret();
-		armEndBlock();
+		const u32 index = ((usn * 2 * 16 + mask * 16 + i) * 4) + curCycle;
+		nVifUpk[index] = (nVifCall)nVifGenOne(index, &s_upkLen[index]);
 	}
 }
 
@@ -426,7 +438,8 @@ void VifUnpackSSE_Init()
 		s_upkCode = armJitMap(kUpkCodeSize, "VIF unpack"); // the writes are armStartBlock sessions
 		if (!s_upkCode)
 		{
-			Console.Error("arm64 VIF unpack dynarec: no code memory; using the C reference path.");
+			if (!aot::imageOnly()) // HH-37: Load and Interp take the image's kernels at admission
+				Console.Error("arm64 VIF unpack dynarec: no code memory; using the C reference path.");
 			return;
 		}
 	}
@@ -440,6 +453,97 @@ void VifUnpackSSE_Init()
 			for (int c = 0; c < 4; c++)
 				nVifGen(a, b, c);
 }
+
+// ---- HH-37: the kernels in the AOT form (aot_arm64.cpp; the image's UnitVIFUnpack) ----
+
+#ifdef LRPS2_AOT_FORM
+static bool s_upkFromImage; // nVifUpk holds the image's kernels
+
+// Shape, at admission (once the game is known, which the log's first line names): log each kernel
+void vifAotLogKernels()
+{
+	if (!s_upkCode)
+		return;
+	for (u32 index = 0; index < std::size(nVifUpk); index++)
+		if (nVifUpk[index])
+		{
+			aot::Block b;
+			b.unit = aot::UnitVIFUnpack;
+			b.pc = index;
+			b.codeLen = s_upkLen[index];
+			aot::logBlock(b, reinterpret_cast<const u8*>(nVifUpk[index]));
+		}
+}
+
+// Load and Interp, once the image is open: every kernel from the image. One it lacks stops a Load;
+// in Interp it stays null, and the C table runs its unpacks.
+void vifAotInstallKernels()
+{
+	for (u32 index = 0; index < std::size(nVifUpk); index++)
+	{
+		if (nVifT[(index >> 2) & 15] == 0)
+			continue;
+		const std::vector<const aot::Block*>* v = aot::imageBlocks(aot::UnitVIFUnpack, index);
+		if (!v || v->empty())
+		{
+			aot::miss(aot::UnitVIFUnpack, index);
+			continue;
+		}
+		nVifUpk[index] = (nVifCall)v->front()->code;
+		aot::countInstall(aot::UnitVIFUnpack);
+	}
+	s_upkFromImage = true;
+}
+
+void vifAotDropKernels()
+{
+	if (s_upkFromImage)
+		memset(nVifUpk, 0, sizeof(nVifUpk));
+	s_upkFromImage = false;
+}
+
+// Emit: re-generate every kernel into buf, checking each against the one the shape log has (a
+// kernel the log lacks fails the image). LRPS2_AOT_CORRUPT=vifk:index emits that one as a bare
+// return (the red receipt).
+void vifAotEmitKernels(u8* buf, size_t cap)
+{
+	const aot::Block* byIndex[std::size(nVifUpk)] = {};
+	for (const aot::Block& r : aot::emitRecords(aot::UnitVIFUnpack))
+	{
+		if (r.pc >= std::size(nVifUpk) || nVifT[(r.pc >> 2) & 15] == 0)
+			aot::emitFailed(r, "it names no kernel");
+		else
+			byIndex[r.pc] = &r;
+	}
+	const u32 corrupt = aot::emitCorrupt(aot::UnitVIFUnpack);
+	for (u32 index = 0; index < std::size(nVifUpk); index++)
+	{
+		if (nVifT[(index >> 2) & 15] == 0)
+			continue;
+		if (!byIndex[index])
+		{
+			aot::Block missing;
+			missing.unit = aot::UnitVIFUnpack;
+			missing.pc = index;
+			aot::emitFailed(missing, "the shape log has no such kernel");
+			continue;
+		}
+		armSetAsmPtr(buf, cap, nullptr);
+		u32 len;
+		u8* start;
+		if (corrupt && index == corrupt)
+		{
+			start = armStartBlock();
+			armAsm->Ret();
+			len = static_cast<u32>(armEndBlock() - start);
+			fprintf(stderr, "lrps2 AOT emit: VIF kernel %u emitted as a bare return, on purpose\n", index);
+		}
+		else
+			start = nVifGenOne(index, &len);
+		aot::emitted(*byIndex[index], start, len, {});
+	}
+}
+#endif
 
 void VifUnpackSSE_Destroy()
 {
