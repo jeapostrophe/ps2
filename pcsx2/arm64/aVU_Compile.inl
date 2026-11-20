@@ -382,9 +382,12 @@ static void mvuPreloadRegisters(microVU& mVU, u32 endCount)
 		return (free_regs >= REQUIRED_FREE_XMMS || free_gprs >= REQUIRED_FREE_GPRS);
 	};
 
+	// (incPC2: the walk reads the IR alone, never an instruction word -- mVU.code is restored
+	// below -- so the words past a block are no input of its compile; HH-37's key is the words
+	// a compile reads)
 	for (u32 x = 0; x < endCount && canPreload(); x++)
 	{
-		incPC(1);
+		incPC2(1);
 
 		const microOp* info = &mVUinfo;
 		if (info->doXGKICK)
