@@ -16,6 +16,7 @@
 
 #include "Common.h"
 void LaneLockstepVsync();
+bool LaneLockstepOn();
 
 #include <cstring>
 #include <list>
@@ -230,6 +231,15 @@ void LaneLockstepVsync()
 		return;
 	s_ls_cv.wait(lock, [] { return s_ls_release || s_ls_fe >= s_ls_ee + 1; });
 }
+bool LaneLockstepOn()
+{
+	if (s_ls_on < 0)
+	{
+		const char* e = getenv("LRPS2_LOCKSTEP");
+		s_ls_on = e && *e == '1';
+	}
+	return s_ls_on && !s_ls_release;
+}
 void LaneLockstepFrame()
 {
 	{
@@ -321,8 +331,10 @@ bool MTGS::MainLoop(bool flush_all)
 					return false;
 			}
 #else
-			if (!s_sem_event.WaitForWorkTimed(100))
-				return false;
+			/* lane hh37b (lane-only): under LRPS2_LOCKSTEP a frame never dupes, however slow the EE */
+			while (!s_sem_event.WaitForWorkTimed(100))
+				if (!LaneLockstepOn())
+					return false;
 #endif
 		}
 
