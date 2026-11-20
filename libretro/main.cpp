@@ -2984,6 +2984,41 @@ struct rt_aot_outcome
 	const char* detail;
 };
 
+/* retro-trainer PLAN-handheld HH-37, lane hh37b (lane-only): two mid-session events for the AOT
+ * form's red receipts. LRPS2_DIAG_SET=<frame>:<section>/<key>=<true|false> sets that bool at that
+ * retro_run and applies it as an option change does (check_variables). LRPS2_DIAG_FM_HOLE=<frame>:
+ * <guest vaddr hex>:<len hex> takes the EE's fastmem view of that range away (PROT_NONE), so every
+ * fastmem access there faults, as an access to MMIO the shape run saw as RAM would. */
+#include "../pcsx2/vtlb.h"
+#include <sys/mman.h>
+u32 eeAotFlags(); // arm64/recR5900_arm64.cpp
+static void LaneDiagFrame(void)
+{
+	static unsigned frame;
+	static const char* set = getenv("LRPS2_DIAG_SET");
+	static const char* hole = getenv("LRPS2_DIAG_FM_HOLE");
+	frame++;
+	if (set && *set && strtoul(set, nullptr, 10) == frame)
+	{
+		std::string spec(strchr(set, ':') + 1);
+		const size_t slash = spec.rfind('/'), eq = spec.find('=');
+		const std::string section = spec.substr(0, slash), key = spec.substr(slash + 1, eq - slash - 1);
+		const bool v = spec.substr(eq + 1) == "true";
+		s_settings_interface.SetBoolValue(section.c_str(), key.c_str(), v);
+		cpu_thread_pause();
+		VMManager::ApplySettings();
+		fprintf(stderr, "lrps2 diag: frame %u: %s/%s = %d applied; EE flags now %#x\n", frame, section.c_str(), key.c_str(), (int)v, eeAotFlags());
+	}
+	if (hole && *hole && strtoul(hole, nullptr, 10) == frame)
+	{
+		const char* a = strchr(hole, ':') + 1;
+		char* e;
+		const unsigned long addr = strtoul(a, &e, 16), len = strtoul(e + 1, nullptr, 16);
+		const int rc = mprotect((void*)(vtlbdata.fastmem_base + addr), len, PROT_NONE);
+		fprintf(stderr, "lrps2 diag: frame %u: the fastmem view of %08lx+%lx made PROT_NONE (%d)\n", frame, addr, len, rc);
+	}
+}
+
 void retro_run(void)
 {
 #ifdef ARCH_ARM64
@@ -3006,6 +3041,7 @@ void retro_run(void)
 
 	Input::Update();
 	LaneLockstepFrame();
+	LaneDiagFrame();
 
 	if (!MTGS::IsOpen())
 		MTGS::TryOpenGS();
