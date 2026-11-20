@@ -373,6 +373,11 @@ static inline void mvuTestMemBranchZero(microVU& mVU, const void* addr, u32 imm,
 
 void normBranchCompile(microVU& mVU, u32 branchPC)
 {
+	if (mvuAot(mVU)) // HH-37: every successor through a link stub
+	{
+		vu1AotEmitLink(mVU, mVUregs, branchPC, false);
+		return;
+	}
 	microBlock* pBlock;
 	blockCreate(branchPC / 8);
 	pBlock = mVUblocks[branchPC / 8]->search(mVU, (microRegInfo*)&mVUregs);
@@ -388,7 +393,7 @@ void normJumpCompile(mV, microFlagCycles& mFC, bool isEvilJump)
 	mVUsetupBranch(mVU, mFC);
 	mVUbackupRegs(mVU);
 
-	if (!mVUpBlock->jumpCache) // Create the jump cache for this block
+	if (!mVUpBlock->jumpCache && !mvuAot(mVU)) // Create the jump cache for this block (HH-37: the link cache's job)
 	{
 		mVUpBlock->jumpCache = new microJumpCache[mProgSize / 2];
 	}
@@ -401,7 +406,9 @@ void normJumpCompile(mV, microFlagCycles& mFC, bool isEvilJump)
 	}
 	else
 		mvuLdr32(mVU, RWARG1, &mVU.branch);
-	if (doJumpCaching)
+	if (mvuAot(mVU))
+		; // HH-37: the link stub below takes its state literal
+	else if (doJumpCaching)
 		armMoveAddressToReg(RXARG2, mVUpBlock);
 	else
 		armMoveAddressToReg(RXARG2, &mVUpBlock->pStateEnd);
@@ -417,6 +424,11 @@ void normJumpCompile(mV, microFlagCycles& mFC, bool isEvilJump)
 		armEmitJmp(mVU.exitFunct);
 	}
 
+	if (mvuAot(mVU)) // HH-37: a jump's link (w0 the target; it sets start_pc, as mVUcompileJIT does)
+	{
+		vu1AotEmitLink(mVU, mVUpBlock->pStateEnd, -1, true);
+		return;
+	}
 	if (!mVU.index)
 		armEmitCall(reinterpret_cast<const void*>(&mVUcompileJIT<0>)); // (u32 startPC, uptr pState)
 	else
@@ -473,7 +485,10 @@ void normBranch(mV, microFlagCycles& mFC)
 		u32 tempPC = iPC;
 
 		memcpy(&mVUpBlock->pStateEnd, &mVUregs, sizeof(microRegInfo));
-		armMoveAddressToReg(RXARG1, &mVUpBlock->pStateEnd);
+		if (mvuAot(mVU)) // HH-37: a literal in the block
+			armAsm->Adr(RXARG1, vu1AotLit(mVUpBlock->pStateEnd));
+		else
+			armMoveAddressToReg(RXARG1, &mVUpBlock->pStateEnd);
 		armEmitCall(mVU.copyPLState);
 
 		mVUsetupBranch(mVU, mFC);
@@ -568,7 +583,10 @@ void condBranch(mV, microFlagCycles& mFC, a64::Condition JMPcc)
 		u32 tempPC = iPC;
 
 		memcpy(&mVUpBlock->pStateEnd, &mVUregs, sizeof(microRegInfo));
-		armMoveAddressToReg(RXARG1, &mVUpBlock->pStateEnd);
+		if (mvuAot(mVU)) // HH-37: a literal in the block
+			armAsm->Adr(RXARG1, vu1AotLit(mVUpBlock->pStateEnd));
+		else
+			armMoveAddressToReg(RXARG1, &mVUpBlock->pStateEnd);
 		armEmitCall(mVU.copyPLState);
 
 		mVUendProgram(mVU, &mFC, 3);
@@ -621,6 +639,22 @@ void condBranch(mV, microFlagCycles& mFC, a64::Condition JMPcc)
 	{
 		mvuLdrsh16(mVU, gprT1, &mVU.branch);
 		armAsm->Cmp(gprT1.W(), 0);
+
+		if (mvuAot(mVU)) // HH-37: both sides through link stubs, with the state both sides get
+		{
+			incPC(3);
+			incPC2(1);
+			const u32 notTakenPC = xPC;
+			incPC2(-1);
+			incPC(-3);
+			const u32 takenPC = branchAddr(mVU);
+			a64::Label taken;
+			armAsm->B(&taken, JMPcc);
+			vu1AotEmitLink(mVU, mVUregs, notTakenPC, false);
+			armAsm->Bind(&taken);
+			vu1AotEmitLink(mVU, mVUregs, takenPC, false);
+			return;
+		}
 
 		incPC(3);
 		microBlock* bBlock;

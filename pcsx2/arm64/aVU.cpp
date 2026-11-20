@@ -20,6 +20,7 @@
 #include "arm64/aVU.h"
 #include "arm64/aVU_IR.h"
 #include "arm64/aVU_Misc.h" // arch-neutral macro layer (task 7.3)
+#include "arm64/aot_arm64.h"
 
 #include "VUmicro.h"
 #include "Memory.h"
@@ -32,7 +33,9 @@
 #include "common/Perf.h"
 
 #include <algorithm>
+#include <deque>
 #include <sys/mman.h>
+#include <unordered_map>
 #include <vector>
 #include <string>
 #include <cstdarg>
@@ -82,6 +85,17 @@ static void  mVUcleanUpVU1();
 // Block compiler entry points (later Phase 7 tasks):
 extern void* mVUblockFetch(microVU& mVU, u32 startPC, uptr pState);
 static void* mVUentryGet(microVU& mVU, microBlockManager* block, u32 startPC, uptr pState);
+
+// HH-37: microVU1's AOT form (its section, "microVU1's AOT form", says what it is).
+thread_local u64* mvuReadMask;
+static __fi bool mvuAot(const microVU& mVU) { return mVU.index == 1 && aot::unitShaped(aot::UnitVU1); }
+static microBlock s_vu1AotBlock; // the block being compiled (mVUpBlock): its states, as literals
+static a64::Label* vu1AotLit(const microRegInfo& st);
+static void vu1AotEmitLink(microVU& mVU, const microRegInfo& st, int pcImm, bool jr);
+static void* vu1AotFind(microVU& mVU, u32 pc, const microRegInfo* st);
+static void vu1AotReset(microVU& mVU);
+static void vu1AotClear();
+static void vu1AotForget();
 
 // Forward decls for the private cache helpers (mirrors microVU.cpp ordering).
 static void mVUdeleteProg(microVU& mVU, microProgram*& prog);
@@ -503,12 +517,19 @@ __fi void mVUinitFirstPass(microVU& mVU, uptr pState, u8* thisPtr)
 	{
 		memcpy((u8*)&mVUregs, (u8*)pState, sizeof(microRegInfo));
 	}
-	if (((uptr)&mVU.prog.lpState != pState))
+	// (HH-37: never in the AOT form, where a compile touches no state the code runs on)
+	if (((uptr)&mVU.prog.lpState != pState) && !mvuAot(mVU))
 	{
 		memcpy((u8*)&mVU.prog.lpState, (u8*)pState, sizeof(microRegInfo));
 	}
 	mVUblock.codeStart = thisPtr;
-	mVUpBlock = mVUblocks[mVUstartPC / 2]->add(mVU, &mVUblock); // Add this block to block manager
+	if (mvuAot(mVU)) // HH-37: no block manager; the block is its key's, found by vu1AotFind
+	{
+		std::memcpy(&s_vu1AotBlock, &mVUblock, sizeof(microBlock));
+		mVUpBlock = &s_vu1AotBlock;
+	}
+	else
+		mVUpBlock = mVUblocks[mVUstartPC / 2]->add(mVU, &mVUblock); // Add this block to block manager
 	mVUregs.needExactMatch = (mVUpBlock->pState.blockType) ? 7 : 0; // ToDo: Fix 1-Op block flag linking (MGS2:Demo/Sly Cooper)
 	mVUregs.blockType = 0;
 	mVUregs.viBackUp  = 0;
@@ -526,6 +547,9 @@ static constexpr size_t kMvuRecSize = 0x4000000;
 
 bool mVUavailable(int vuIndex)
 {
+	// HH-37: an image's VU1 runs from its stubs and blocks, with no code cache
+	if (vuIndex && aot::imageOnly())
+		return aot::unitShaped(aot::UnitVU1) && aot::admitted() && aot::imageBlocks(aot::UnitVU1, aot::VU1_STUB_PC);
 	return (vuIndex ? microVU1 : microVU0).cache != nullptr;
 }
 
@@ -577,7 +601,11 @@ void mVUreset(microVU& mVU, bool resetReserve)
 	// Point the VIXL emitter at mVU.cache and emit the dispatchers + helper thunks
 	// at the start of the cache (x86: x86Ptr = (u8*)(mVU.cache) + the five generate calls).
 	// Also sets mVU.prog.codeStart / codePtr just past the emitted dispatchers.
-	mVUgenerateDispatchers(mVU);
+	// HH-37: in the AOT form, the stubs in their shaped form (or the image's), and no blocks.
+	if (mvuAot(mVU))
+		vu1AotReset(mVU);
+	else
+		mVUgenerateDispatchers(mVU);
 
 	mVU.regs().nextBlockCycles = 0;
 	memset(&mVU.prog.lpState, 0, sizeof(mVU.prog.lpState));
@@ -626,6 +654,8 @@ void mVUclose(microVU& mVU)
 	}
 	free(mVU.mscalMemo);
 	mVU.mscalMemo = nullptr;
+	if (mVU.index)
+		vu1AotForget(); // HH-37: its blocks' code goes with the cache (or the image)
 
 	// The cache goes with the VM that leased it (mVUinit).
 	if (mVU.cache)
@@ -647,6 +677,8 @@ void mVUclose(microVU& mVU)
 // Clears Block Data in specified range
 void mVUclear(microVU& mVU, u32 addr, u32 size)
 {
+	if (mvuAot(mVU))
+		vu1AotClear(); // HH-37: every block's words are checked again before it next runs
 	if (!mVU.prog.cleared)
 	{
 		mVU.prog.cleared = 1; // Next execution searches/creates a new microprogram
@@ -956,7 +988,11 @@ static void rec_vu1_execute(u32 cycles)
 	}
 
 	VU1.VI[REG_TPC].UL <<= 3;
-	((mVUrecCall)microVU1.startFunct)(VU1.VI[REG_TPC].UL, cycles);
+	// HH-37: the AOT form's dispatcher takes the import table too (it puts it in x28)
+	if (mvuAot(microVU1))
+		((void (*)(u32, u32, void**))microVU1.startFunct)(VU1.VI[REG_TPC].UL, cycles, aot::imports());
+	else
+		((mVUrecCall)microVU1.startFunct)(VU1.VI[REG_TPC].UL, cycles);
 	VU1.VI[REG_TPC].UL >>= 3;
 	if (microVU1.regs().flags & 0x4 && !THREAD_VU1)
 	{
@@ -979,7 +1015,10 @@ static void rec_vu1_resume_xgkick(void)
 {
 	if (!(VU0.VI[REG_VPU_STAT].UL & 0x100))
 		return;
-	((mVUrecCallXG)microVU1.startFunctXG)();
+	if (mvuAot(microVU1))
+		((void (*)(void**))microVU1.startFunctXG)(aot::imports());
+	else
+		((mVUrecCallXG)microVU1.startFunctXG)();
 }
 
 void vucpu_rec_vu0_reserve(void)
@@ -1212,6 +1251,8 @@ static void mVUdispatcherAB(microVU& mVU)
 
 	// Save callee-saved GPRs (x19-x28, fp/lr) and the low halves of v8-v15.
 	armBeginStackFrame(true);
+	if (armAotRoute) // HH-37: x28 = the import table, the third argument
+		armAsm->Mov(a64::x28, a64::x2);
 
 	// Args (startPC, cycles) are already in w0/w1; mVUexecute returns entry in x0.
 	armEmitCall(reinterpret_cast<const void*>(isVU1 ? mVUexecuteVU1 : mVUexecuteVU0));
@@ -1278,6 +1319,8 @@ static void mVUdispatcherCD(microVU& mVU)
 	mVU.startFunctXG = armGetCurrentCodePointer();
 
 	armBeginStackFrame(true);
+	if (armAotRoute) // HH-37: x28 = the import table, the argument
+		armAsm->Mov(a64::x28, a64::x0);
 
 	// C.74: pin &mVU before anything below (or in the resumed block) uses it.
 	armMoveAddressToReg(RVUMVU, &mVU);
@@ -1456,6 +1499,14 @@ static void* mVUexecute(u32 startPC, u32 cycles)
 
 	const u32 spc = startPC & vuLimit;
 
+	// HH-37: the AOT form finds a block by its pc, state and words alone (vu1AotFind); the
+	// program search's one effect on what runs is that a found program is no longer cleared
+	if (mvuAot(mVU))
+	{
+		mVU.prog.cleared = 0;
+		return vu1AotFind(mVU, spc, &mVU.prog.lpState);
+	}
+
 	// Fast path: if the microprogram + block for this (start_pc, startPC, pipeline
 	// state) is already compiled, return its host entry directly and skip the emit
 	// session below. armStartBlock/armEndBlock allocate+finalize a VIXL
@@ -1506,7 +1557,8 @@ static void mVUcleanUp()
 
 	// The block compiler advanced mVU.prog.codePtr as it emitted; if it ran past
 	// the cache limit, reset the program cache (x86 checks x86Ptr here).
-	if ((mVU.prog.codePtr < mVU.prog.codeStart) || (mVU.prog.codePtr >= mVU.prog.codeEnd))
+	// (HH-37: an image's VU1 has no cache)
+	if (mVU.cache && ((mVU.prog.codePtr < mVU.prog.codeStart) || (mVU.prog.codePtr >= mVU.prog.codeEnd)))
 	{
 		Console.WriteLn(vuIndex ? Color_Orange : Color_Magenta, "microVU%d: Program cache limit reached.", mVU.index);
 		mVUreset(mVU, false);
@@ -1745,3 +1797,545 @@ static_assert(alignof(microBlock) == 16, "microBlock must stay 16-byte aligned")
 	mVUDTendProgram(mVU, &mFC, 1);
 	mVUsetupBranch(mVU, mFC);
 }
+
+//------------------------------------------------------------------
+// HH-37: microVU1's AOT form (aot_arm64.cpp says what the AOT form is)
+//------------------------------------------------------------------
+// In the AOT form (mvuAot: Shape, Emit and Load) a microVU1 block is a function of its start pc,
+// its incoming pipeline state (all 96 bytes of microRegInfo), the micro-memory words its compile
+// read (curI records them, mvuReadMask), this build and its settings (the image header's
+// layout_hash and abi_hash), and of nothing else:
+//   - One compile is one block. No successor is compiled inline or jumped to directly: every
+//     block it can go to it leaves for through a link stub (vu1AotEmitLink): w0 = the successor's
+//     pc, x1 = the address of a literal in this block holding the state it enters with; a
+//     direct-mapped link cache (keyed by that literal's address and the pc, emptied by mVUclear)
+//     gives the successor's code, and on a miss vu1AotLinkRT finds it (vu1AotFind). A JR/JALR's
+//     link stub also sets start_pc, as mVUcompileJIT does.
+//   - The states the stock form passes by heap pointer (the block's own, for an early exit's
+//     copyPLState, and its end state) are literals at the block's end (vu1AotLit), reached by adr.
+//   - Every host address goes through the import table in x28 (armAotRoute, AsmHelpers.h):
+//     microVU1, the VU registers, settings, tables and helpers as regions; VU1's data and micro
+//     memory as run-time regions; the dispatchers and stubs as value imports.
+//   - Blocks are found by exact match of (pc, state), then by their words against micro memory
+//     (vu1AotFind), never by the program search, whose answer depends on what was compiled
+//     before; so Shape compiles, and Load installs, the same block for the same execution.
+//   - The compile writes nothing a block runs on (mVUinitFirstPass leaves lpState alone) and
+//     starts from zeroed IR state (setBranchA reads the IR of the op before a block's first).
+// The dispatchers and helper stubs are one more record (VU1_STUB_PC), in their shaped form: the
+// dispatcher takes the import table as its third argument (rec_vu1_execute).
+// Shape logs each block it compiles; Emit re-compiles each record from its words into plain
+// memory (vu1AotEmit); Load runs the image's, and a block it lacks stops the process.
+
+namespace
+{
+	enum Vu1Stub { StubStart, StubExit, StubStartXG, StubExitXG, StubExactMul, StubWaitMTVU, StubCopyPL, StubCompare, StubCount };
+	const char* const kVu1StubImport[StubCount] = {"vu1.start", "vu1.exit", "vu1.startXG", "vu1.exitXG", "vu1.exactMul",
+		"vu1.waitMTVU", "vu1.copyPLState", "vu1.compareState"};
+	u8** vu1StubField(microVU& mVU, int i)
+	{
+		u8** const f[StubCount] = {&mVU.startFunct, &mVU.exitFunct, &mVU.startFunctXG, &mVU.exitFunctXG, &mVU.exactMulStub,
+			&mVU.waitMTVU, &mVU.copyPLState, &mVU.compareStateF};
+		return f[i];
+	}
+
+	struct Vu1Entry
+	{
+		std::vector<u32> runs; // the words it was compiled from (the image format's runs)
+		const u8* code;
+	};
+	struct Vu1Key
+	{
+		u32 pc;
+		u32 st[aot::VU1_STATE_WORDS];
+		bool operator==(const Vu1Key& o) const { return pc == o.pc && !std::memcmp(st, o.st, sizeof st); }
+	};
+	struct Vu1KeyHash
+	{
+		size_t operator()(const Vu1Key& k) const
+		{
+			u64 h = 1469598103934665603ULL ^ k.pc;
+			for (u32 w : k.st)
+				h = (h ^ w) * 1099511628211ULL;
+			return (size_t)h;
+		}
+	};
+	// The blocks of a key, and which of them matches micro memory now: valid while gen is the
+	// current generation, which mVUclear advances.
+	struct Vu1Node
+	{
+		std::vector<Vu1Entry> entries;
+		u64 gen = 0;
+		u32 valid = 0;
+	};
+	std::unordered_map<Vu1Key, Vu1Node, Vu1KeyHash> s_vu1Map;
+	u64 s_vu1Gen = 1;
+
+	// The link cache the link stubs read: slot ((lit >> 4) ^ (pc >> 3)) & (kLinkSlots - 1)
+	// holds key lit | pc << 48 and the code it links to.
+	struct Vu1LinkSlot
+	{
+		u64 key;
+		const void* code;
+	};
+	static_assert(sizeof(Vu1LinkSlot) == 16, "the link stub indexes 16-byte slots");
+	constexpr u32 kLinkSlots = 8192;
+	Vu1LinkSlot* s_vu1Links;
+	bool s_vu1LinksDirty;
+
+	microProgram* s_vu1Prog; // a compile's program: its ranges only (no block manager is used)
+	struct Vu1Lit
+	{
+		a64::Label label;
+		microRegInfo st;
+	};
+	std::deque<Vu1Lit> s_vu1Lits; // the block being compiled's state literals
+} // namespace
+
+static a64::Label* vu1AotLit(const microRegInfo& st)
+{
+	for (Vu1Lit& l : s_vu1Lits)
+		if (!std::memcmp(&l.st, &st, sizeof st))
+			return &l.label;
+	s_vu1Lits.emplace_back();
+	std::memcpy(&s_vu1Lits.back().st, &st, sizeof st);
+	return &s_vu1Lits.back().label;
+}
+
+// The block's literals, after its code: 16-aligned, each the 96 bytes of a state
+static void vu1AotEmitLits()
+{
+	for (Vu1Lit& l : s_vu1Lits)
+	{
+		while (armAsm->GetCursorOffset() & 15)
+		{
+			a64::ExactAssemblyScope scope(armAsm, 4);
+			armAsm->dc32(0);
+		}
+		armAsm->Bind(&l.label);
+		a64::ExactAssemblyScope scope(armAsm, sizeof(microRegInfo));
+		for (u32 w : l.st.full32)
+			armAsm->dc32(w);
+	}
+	s_vu1Lits.clear();
+}
+
+static void* vu1AotLinkRT(u32 pc, const microRegInfo* st);
+
+// A link to the block at pcImm (or, at -1, the pc in w0: a jump's, which also becomes start_pc)
+// entered with state st. Every register but x19, x27, x28, the flag instances (w23-w26) and PQ
+// (v24) is free here: the branch drivers have flushed the allocator (mVUsetupBranch), as the
+// stock form's jump to a block's start requires.
+static void vu1AotEmitLink(microVU& mVU, const microRegInfo& st, int pcImm, bool jr)
+{
+	using namespace a64;
+	Label* lit = vu1AotLit(st);
+	if (pcImm >= 0)
+		armAsm->Mov(w0, (u32)pcImm);
+	else
+	{
+		if (jr)
+			armAsm->Str(w0, MemOperand(RVUSTATE, offsetof(VURegs, start_pc)));
+		armAsm->And(w0, w0, mVU.microMemSize - 8);
+	}
+	armAsm->Adr(x1, lit);
+	armAsm->Ldr(x2, MemOperand(x28, aot::slotOfValue("vu1.links") * 8));
+	armAsm->Lsr(x3, x1, 4);
+	armAsm->Eor(x3, x3, Operand(x0, LSR, 3));
+	armAsm->And(x3, x3, kLinkSlots - 1);
+	armAsm->Add(x2, x2, Operand(x3, LSL, 4));
+	armAsm->Orr(x3, x1, Operand(x0, LSL, 48));
+	armAsm->Ldp(x4, x5, MemOperand(x2));
+	armAsm->Cmp(x4, x3);
+	Label slow;
+	armAsm->B(&slow, ne);
+	armAsm->Br(x5);
+	armAsm->Bind(&slow);
+	armAsm->Str(mVU_xmmPQ.Q(), mvuAbsMem(mVU, &mVU.vecBackup[mVU_xmmPQ.GetCode()][0], 16));
+	armEmitCall(reinterpret_cast<const void*>(&vu1AotLinkRT));
+	armAsm->Ldr(mVU_xmmPQ.Q(), mvuAbsMem(mVU, &mVU.vecBackup[mVU_xmmPQ.GetCode()][0], 16));
+	armAsm->Br(x0);
+}
+
+// The runs of the words a compile read (the mask), with their values in micro memory
+static std::vector<u32> vu1AotRuns(const u64* mask, const u32* micro)
+{
+	std::vector<u32> runs;
+	for (u32 i = 0; i < 4096;)
+	{
+		if (!((mask[i >> 6] >> (i & 63)) & 1))
+		{
+			i++;
+			continue;
+		}
+		u32 n = 0;
+		while (i + n < 4096 && ((mask[(i + n) >> 6] >> ((i + n) & 63)) & 1))
+			n++;
+		runs.push_back((i << 16) | n);
+		runs.insert(runs.end(), micro + i, micro + i + n);
+		i += n;
+	}
+	return runs;
+}
+
+static bool vu1AotRunsHold(const u32* runs, size_t n, const u32* micro)
+{
+	for (size_t i = 0; i < n;)
+	{
+		const u32 start = runs[i] >> 16, count = runs[i] & 0xffff;
+		if (std::memcmp(micro + start, runs + i + 1, count * 4))
+			return false;
+		i += 1 + count;
+	}
+	return true;
+}
+
+// One block, into the open session at its cursor (Shape: the cache; Emit: plain memory)
+static u8* vu1AotCompileBody(microVU& mVU, u32 pc, const microRegInfo& st, std::vector<u32>* runs)
+{
+	if (!s_vu1Prog)
+	{
+		s_vu1Prog = (microProgram*)_aligned_malloc(sizeof(microProgram), 64);
+		std::memset(s_vu1Prog, 0, sizeof(microProgram));
+		s_vu1Prog->ranges = new std::deque<microRange>();
+	}
+	s_vu1Prog->ranges->clear();
+	mVU.prog.cur = s_vu1Prog;
+	std::memset(&mVU.prog.IRinfo, 0, sizeof(mVU.prog.IRinfo));
+	s_vu1Lits.clear();
+	u64 mask[4096 / 64] = {};
+	microRegInfo state;
+	std::memcpy(&state, &st, sizeof state);
+	mvuReadMask = mask;
+	armAotRoute = true;
+	u8* const start = armGetCurrentCodePointer();
+	mVUcompile(mVU, pc, (uptr)&state);
+	vu1AotEmitLits();
+	armAotRoute = false;
+	mvuReadMask = nullptr;
+	*runs = vu1AotRuns(mask, (const u32*)mVU.regs().Micro);
+	return start;
+}
+
+static void vu1AotLog(u32 pc, const u32* words, size_t nwords, u32 native, const u8* code, u32 len)
+{
+	aot::Block b;
+	b.unit = aot::UnitVU1;
+	b.pc = pc;
+	b.native = native;
+	b.words.assign(words, words + nwords);
+	b.codeLen = len;
+	aot::logBlock(b, code);
+}
+
+// Shape: compile the block for (pc, st) into the cache, log it, and give its code
+static const u8* vu1AotCompile(microVU& mVU, u32 pc, const microRegInfo& st, std::vector<u32>* runs)
+{
+	armSetAsmPtr(mVU.prog.codePtr, mVU.prog.codeReserveEnd - mVU.prog.codePtr, nullptr);
+	armStartBlock();
+	u8* const code = vu1AotCompileBody(mVU, pc, st, runs);
+	mVU.prog.codePtr = armEndBlock();
+	std::vector<u32> words(st.full32, st.full32 + aot::VU1_STATE_WORDS);
+	words.insert(words.end(), runs->begin(), runs->end());
+	vu1AotLog(pc, words.data(), words.size(), aot::VU1_STATE_WORDS, code, (u32)(mVU.prog.codePtr - code));
+	return code;
+}
+
+// The code of the block for (pc, st) whose words micro memory holds now: the node's, the
+// image's (Load), or compiled (Shape). Load stops the process on a block the image lacks.
+static void* vu1AotFind(microVU& mVU, u32 pc, const microRegInfo* st)
+{
+	Vu1Key k;
+	k.pc = pc;
+	std::memcpy(k.st, st, sizeof k.st);
+	auto [it, fresh] = s_vu1Map.try_emplace(k);
+	Vu1Node& n = it->second;
+	if (n.gen == s_vu1Gen)
+		return const_cast<u8*>(n.entries[n.valid].code);
+	if (fresh && aot::imageOnly())
+		if (const std::vector<const aot::Block*>* v = aot::imageBlocks(aot::UnitVU1, pc))
+			for (const aot::Block* b : *v)
+				if (b->native == aot::VU1_STATE_WORDS && !std::memcmp(b->words.data(), k.st, sizeof k.st))
+				{
+					n.entries.push_back({std::vector<u32>(b->words.begin() + aot::VU1_STATE_WORDS, b->words.end()), b->code});
+					aot::countInstall(aot::UnitVU1);
+				}
+	const u32* micro = (const u32*)mVU.regs().Micro;
+	for (u32 i = 0; i < n.entries.size(); i++)
+		if (vu1AotRunsHold(n.entries[i].runs.data(), n.entries[i].runs.size(), micro))
+		{
+			n.gen = s_vu1Gen;
+			n.valid = i;
+			return const_cast<u8*>(n.entries[i].code);
+		}
+	if (aot::imageOnly())
+	{
+		aot::miss(aot::UnitVU1, pc); // Load: stops here
+		std::abort();
+	}
+	std::vector<u32> runs;
+	microRegInfo state; // (st may be a literal in the cache the compile writes to)
+	std::memcpy(&state, k.st, sizeof state);
+	const u8* code = vu1AotCompile(mVU, pc, state, &runs);
+	n.entries.push_back({std::move(runs), code});
+	n.gen = s_vu1Gen;
+	n.valid = (u32)n.entries.size() - 1;
+	return const_cast<u8*>(code);
+}
+
+// A link stub's miss (w0 the pc, x1 its state literal): find the block and fill the slot
+static void* vu1AotLinkRT(u32 pc, const microRegInfo* st)
+{
+	void* code = vu1AotFind(microVU1, pc, st);
+	const uintptr_t lit = reinterpret_cast<uintptr_t>(st);
+	Vu1LinkSlot& slot = s_vu1Links[((lit >> 4) ^ (pc >> 3)) & (kLinkSlots - 1)];
+	slot.key = lit | ((u64)pc << 48);
+	slot.code = code;
+	s_vu1LinksDirty = true;
+	return code;
+}
+
+static void vu1AotClear()
+{
+	s_vu1Gen++;
+	if (s_vu1LinksDirty && s_vu1Links)
+		std::memset(s_vu1Links, 0, kLinkSlots * sizeof(Vu1LinkSlot));
+	s_vu1LinksDirty = false;
+}
+
+static void vu1AotForget()
+{
+	s_vu1Map.clear();
+	vu1AotClear();
+}
+
+// The stubs in their shaped form, at the open session's cursor: their entries' offsets in offs
+static void vu1AotGenStubs(microVU& mVU, u32 offs[StubCount])
+{
+	armAotRoute = true;
+	u8* const start = armGetCurrentCodePointer();
+	mVUdispatcherAB(mVU);
+	mVUdispatcherCD(mVU);
+	mVUemitExactMulStub(mVU);
+	mVUGenerateWaitMTVU(mVU);
+	mVUGenerateCopyPipelineState(mVU);
+	mVUGenerateCompareState(mVU);
+	armAotRoute = false;
+	for (int i = 0; i < StubCount; i++)
+		offs[i] = (u32)(*vu1StubField(mVU, i) - start);
+}
+
+static void vu1AotSetImports(microVU& mVU)
+{
+	if (!s_vu1Links)
+		s_vu1Links = (Vu1LinkSlot*)calloc(kLinkSlots, sizeof(Vu1LinkSlot));
+	aot::setValueImport("vu1.links", s_vu1Links);
+	aot::setValueImport("vu1.Mem", mVU.regs().Mem);
+	aot::setValueImport("vu1.Micro", mVU.regs().Micro);
+	for (int i = 0; i < StubCount; i++)
+		aot::setValueImport(kVu1StubImport[i], *vu1StubField(mVU, i));
+	armAotRedCall = aot::redVu1HostAddr() ? reinterpret_cast<const void*>(&mVU1clearlpStateJIT) : nullptr;
+}
+
+// mVUreset's part in the AOT form: no blocks; the stubs compiled (Shape, logged) or the image's
+static void vu1AotReset(microVU& mVU)
+{
+	vu1AotForget();
+	std::memset(mVU.mscalMemo, 0, (mVU.progSize / 2) * sizeof(microMscalMemoA));
+	if (aot::imageOnly())
+	{
+		const std::vector<const aot::Block*>* v = aot::imageBlocks(aot::UnitVU1, aot::VU1_STUB_PC);
+		const aot::Block* b = v ? (*v)[0] : nullptr;
+		if (!b || b->words.size() != StubCount)
+		{
+			std::fprintf(stderr, "lrps2 AOT load: the image's VU1 stubs have %zu entries, this core %d: stopping\n", b ? b->words.size() : 0, (int)StubCount);
+			std::fflush(stderr);
+			std::_Exit(5);
+		}
+		for (int i = 0; i < StubCount; i++)
+			*vu1StubField(mVU, i) = const_cast<u8*>(b->code) + b->words[i];
+		mVU.prog.codeStart = mVU.prog.codePtr = nullptr;
+	}
+	else
+	{
+		armSetAsmPtr(mVU.cache, static_cast<size_t>(mVU.prog.codeReserveEnd - mVU.cache), nullptr);
+		u8* const start = armStartBlock();
+		u32 offs[StubCount];
+		vu1AotGenStubs(mVU, offs);
+		u8* const end = armEndBlock();
+		vu1AotLog(aot::VU1_STUB_PC, offs, StubCount, StubCount, start, (u32)(end - start));
+		mVU.prog.codeStart = mVU.prog.codePtr =
+			reinterpret_cast<u8*>((reinterpret_cast<uintptr_t>(end) + 15u) & ~uintptr_t(15));
+	}
+	vu1AotSetImports(mVU);
+}
+
+// Emit: re-compile every logged VU1 record from its words, into plain memory, at one offset past
+// the stubs (where nothing but the block's own words, state and this build decides its bytes).
+// LRPS2_AOT_CORRUPT_VU1 names a pc whose records are emitted from a changed word (the first upper
+// ADD made a SUB, or MUL an ADD): the red receipt for "the image's code is what runs".
+void vu1AotEmit()
+{
+	microVU& mVU = microVU1;
+	const std::vector<aot::Block>& recs = aot::emitRecords(aot::UnitVU1);
+	if (recs.empty())
+		return;
+	constexpr size_t kBuf = 8u << 20;
+	u8* const buf = static_cast<u8*>(mmap(nullptr, kBuf, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+	static u32 micro[4096];
+	alignas(16) static u8 mem[0x4000];
+	u8* const savedMicro = mVU.regs().Micro;
+	u8* const savedMem = mVU.regs().Mem;
+	mVU.regs().Micro = reinterpret_cast<u8*>(micro);
+	mVU.regs().Mem = mem;
+	armAotDirect = true;
+
+	armSetAsmPtr(buf, kBuf, nullptr);
+	u8* const stubs = armStartBlock();
+	u32 offs[StubCount];
+	vu1AotGenStubs(mVU, offs);
+	const u32 stubLen = (u32)(armEndBlock() - stubs);
+	vu1AotSetImports(mVU); // the stubs' entries, here, and the run-time regions, the stand-ins above
+	const size_t blockOff = (stubLen + 4095) & ~size_t(4095);
+
+	u32 corruptPC;
+	const bool corrupt = aot::emitCorruptVu1(&corruptPC);
+	unsigned long corrupted = 0;
+	for (const aot::Block& r : recs)
+	{
+		if (r.pc == aot::VU1_STUB_PC)
+		{
+			if (r.words.size() != StubCount || std::memcmp(r.words.data(), offs, sizeof offs))
+				aot::emitFailed(r, "the stubs' entries are not where the shape run's were");
+			else
+				aot::emitted(r, stubs, stubLen, {});
+			continue;
+		}
+		if (r.native != aot::VU1_STATE_WORDS || r.words.size() < aot::VU1_STATE_WORDS)
+		{
+			aot::emitFailed(r, "a VU1 record without its state");
+			continue;
+		}
+		std::memset(micro, 0, sizeof micro);
+		bool ok = true;
+		for (size_t i = aot::VU1_STATE_WORDS; i < r.words.size() && ok;)
+		{
+			const u32 start = r.words[i] >> 16, count = r.words[i] & 0xffff;
+			ok = count && start + count <= 4096 && i + 1 + count <= r.words.size();
+			if (ok)
+				std::memcpy(micro + start, &r.words[i + 1], count * 4);
+			i += 1 + count;
+		}
+		if (!ok)
+		{
+			aot::emitFailed(r, "a VU1 record whose runs overrun micro memory or the record");
+			continue;
+		}
+		const bool corruptThis = corrupt && r.pc == corruptPC;
+		if (corruptThis)
+		{
+			for (u32 q = r.pc / 4 + 1; q < 4096; q += 2) // upper ops are the odd words
+			{
+				const u32 op = micro[q] & 0x3f;
+				if ((micro[q] & 0x7e000000u) == 0 && (op == 0x28 || op == 0x2a))
+				{
+					micro[q] = (micro[q] & ~0x3fu) | (op == 0x28 ? 0x2c : 0x28);
+					corrupted++;
+					break;
+				}
+			}
+		}
+		microRegInfo st;
+		std::memcpy(&st, r.words.data(), sizeof st);
+		armSetAsmPtr(buf + blockOff, kBuf - blockOff, nullptr);
+		armStartBlock();
+		std::vector<u32> runs;
+		u8* const code = vu1AotCompileBody(mVU, r.pc, st, &runs);
+		const u32 len = (u32)(armEndBlock() - code);
+		if (!corruptThis && (runs.size() != r.words.size() - aot::VU1_STATE_WORDS ||
+								 std::memcmp(runs.data(), r.words.data() + aot::VU1_STATE_WORDS, runs.size() * 4)))
+			aot::emitFailed(r, "it reads other micro words than the shape run's compile did");
+		else
+			aot::emitted(r, code, len, {});
+	}
+	if (corrupt)
+		std::fprintf(stderr, "lrps2 AOT emit: %lu VU1 records at %04x re-emitted from a changed word, on purpose\n", corrupted, corruptPC);
+	armAotDirect = false;
+	mVU.regs().Micro = savedMicro;
+	mVU.regs().Mem = savedMem;
+	munmap(buf, kBuf);
+}
+
+#ifdef LRPS2_AOT_FORM
+// Everything a shaped microVU1 block or stub reaches that is not off x19 or x27, in slot order.
+void aot::vu1Imports(ImportAdder add)
+{
+#define AOT_FN(f) add(#f, reinterpret_cast<const void*>(&f), 1)
+	AOT_FN(mVUexecuteVU1); AOT_FN(mVUcleanUpVU1); AOT_FN(mVU1clearlpStateJIT); AOT_FN(mVUTBit); AOT_FN(mVUEBit);
+	AOT_FN(mVUwaitMTVU); AOT_FN(aVUexactDivC); AOT_FN(_vuXGKICKTransfermVU); AOT_FN(mVU_XGKICK_); AOT_FN(mVUbadOp1);
+	AOT_FN(vu1AotLinkRT);
+#undef AOT_FN
+	add("microVU1", &microVU1, sizeof(microVU1));
+	add("EmuConfig.Cpu", &EmuConfig.Cpu, sizeof(EmuConfig.Cpu));
+	add("eeHw", eeHw, sizeof(eeHw));
+	add("mVUmovemaskBit", mVUmovemaskBit, sizeof(mVUmovemaskBit));
+	add("mVU_sse4_compvals", mVU_sse4_compvals, sizeof(mVU_sse4_compvals));
+	add("sse4_minvals", sse4_minvals, sizeof(sse4_minvals));
+	add("sse4_maxvals", sse4_maxvals, sizeof(sse4_maxvals));
+	add("mVU_MIN_MAX_1", mVU_MIN_MAX_1, sizeof(mVU_MIN_MAX_1));
+	add("mVU_MIN_MAX_2", mVU_MIN_MAX_2, sizeof(mVU_MIN_MAX_2));
+	add("vu1.Mem", nullptr, 0x4000);
+	add("vu1.Micro", nullptr, 0x4000);
+	add("vu1.links", nullptr, 0);
+	for (const char* name : kVu1StubImport)
+		add(name, nullptr, 0);
+}
+
+// What microVU1's code addresses off x19 (VURegs), x27 (microVU) and its import regions, by name,
+// offset and size: a layout that differs refuses the image.
+u64 aot::vu1LayoutHash()
+{
+	u64 h = 1469598103934665603ULL;
+	const auto mix = [&h](const char* name, size_t off, size_t size) {
+		for (const char* c = name; *c; c++) { h ^= (u8)*c; h *= 1099511628211ULL; }
+		const u64 w[2] = {off, size};
+		for (size_t i = 0; i < sizeof w; i++) { h ^= ((const u8*)w)[i]; h *= 1099511628211ULL; }
+	};
+	const VURegs& r = vuRegs[1];
+	const microVU& m = microVU1;
+#define AOT_R(f) mix("VURegs." #f, (uintptr_t)&r.f - (uintptr_t)&r, sizeof(r.f))
+#define AOT_V(f) mix("microVU." #f, (uintptr_t)&m.f - (uintptr_t)&m, sizeof(m.f))
+	AOT_R(VF); AOT_R(VI); AOT_R(ACC); AOT_R(q); AOT_R(p); AOT_R(pending_q); AOT_R(pending_p); AOT_R(micro_macflags);
+	AOT_R(micro_clipflags); AOT_R(micro_statusflags); AOT_R(flags); AOT_R(cycle); AOT_R(nextBlockCycles); AOT_R(start_pc);
+	AOT_R(Mem); AOT_R(Micro); AOT_R(xgkickenable); AOT_R(xgkickcyclecount); AOT_R(xgkickaddr);
+	AOT_V(statFlag); AOT_V(macFlag); AOT_V(clipFlag); AOT_V(vecCTemp); AOT_V(exactMulBuf); AOT_V(exactDivBuf);
+	AOT_V(exactMulSave); AOT_V(vecBackup); AOT_V(glob); AOT_V(sse4Min); AOT_V(sse4Max); AOT_V(code); AOT_V(divFlag);
+	AOT_V(VIbackup); AOT_V(VIxgkick); AOT_V(branch); AOT_V(badBranch); AOT_V(evilBranch); AOT_V(evilevilBranch);
+	AOT_V(p); AOT_V(q); AOT_V(totalCycles); AOT_V(cycles); AOT_V(prog.lpState); AOT_V(resumePtrXG);
+#undef AOT_R
+#undef AOT_V
+	mix("sizeof", sizeof(VURegs), sizeof(microVU));
+	mix("microRegInfo", sizeof(microRegInfo), alignof(microRegInfo));
+	mix("VIFregisters.top/itop", offsetof(VIFregisters, top), offsetof(VIFregisters, itop));
+	mix("vif1Regs", (uintptr_t)&vif1Regs - (uintptr_t)eeHw, sizeof(VIFregisters));
+	mix("EmuConfig.Cpu FPCRs", (uintptr_t)&EmuConfig.Cpu.VU1FPCR - (uintptr_t)&EmuConfig.Cpu,
+		(uintptr_t)&EmuConfig.Cpu.FPUFPCR - (uintptr_t)&EmuConfig.Cpu);
+	return h;
+}
+
+// The ABI of microVU1's code and stubs, and every setting its compile reads
+const char* aot::vu1AbiText()
+{
+	static char text[512];
+	snprintf(text, sizeof text,
+		"vu1: dispatcher w0 pc w1 cycles x2 imports, xg x0 imports; x19 vuRegs[1]; x27 microVU1; x28 imports; "
+		"link w0 pc x1 state literal (96, 16-aligned), %u slots of 16 keyed lit|pc<<48 at ((lit>>4)^(pc>>3)); "
+		"PQ v24 saved at vecBackup; jr sets start_pc; exact state match; stubs %d; "
+		"flaghack %d ovf %d sign %d extra %d exactmul %d exactdiv %d accaddsub %d addsubhack %d xgkickhack %d "
+		"ibit %d vusync %d fullvu0sync %d mtvu %d fpcr %d",
+		kLinkSlots, (int)StubCount, (int)CHECK_VU_FLAGHACK, (int)CHECK_VU_OVERFLOW(1), (int)CHECK_VU_SIGN_OVERFLOW(1),
+		(int)CHECK_VU_EXTRA_OVERFLOW(1), (int)CHECK_VU_EXACTMUL, (int)CHECK_VU_EXACTDIV, (int)CHECK_VU_ACC_ADDSUB,
+		(int)CHECK_VUADDSUBHACK, (int)CHECK_XGKICKHACK, (int)EmuConfig.Gamefixes.IbitHack, (int)EmuConfig.Gamefixes.VUSyncHack,
+		(int)EmuConfig.Gamefixes.FullVU0SyncHack, (int)THREAD_VU1, (int)mvuNeedsFPCRUpdate(microVU1));
+	return text;
+}
+#endif

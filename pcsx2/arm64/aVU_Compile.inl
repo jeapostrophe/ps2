@@ -309,7 +309,10 @@ void mVUtestCycles(microVU& mVU, microFlagCycles& mFC)
 	a64::Label skip;
 	armAsm->B(&skip, a64::pl); // jump if result >= 0 (x86 xForwardJNS32)
 
-	armMoveAddressToReg(RXARG1, &mVUpBlock->pState);
+	if (mvuAot(mVU)) // HH-37: the block's own state, a literal in it
+		armAsm->Adr(RXARG1, vu1AotLit(mVUpBlock->pState));
+	else
+		armMoveAddressToReg(RXARG1, &mVUpBlock->pState);
 	armEmitCall(mVU.copyPLState);
 
 	if (EmuConfig.Gamefixes.VUSyncHack || EmuConfig.Gamefixes.FullVU0SyncHack)
@@ -647,7 +650,9 @@ void* mVUcompile(microVU& mVU, u32 startPC, uptr pState)
 				if (EmuConfig.Gamefixes.VUSyncHack || EmuConfig.Gamefixes.FullVU0SyncHack)
 					mvuStrImm64(mVU, &mVU.regs().nextBlockCycles, 0, gprT1);
 				mVUendProgram(mVU, &mFC, 0);
-				normBranchCompile(mVU, xPC);
+				// (HH-37: the AOT form compiles the program's resumption when it resumes)
+				if (!mvuAot(mVU))
+					normBranchCompile(mVU, xPC);
 				incPC(-2);
 				goto perf_and_return;
 			}

@@ -14,7 +14,8 @@
 //   of its guest address, the guest words it was compiled from, its key flags and this build, and
 //   it runs anywhere. Every compiled block is logged (logBlock). Only the shaped recompilers get a
 //   code cache (jitAllowed): the others, and microVU0 whatever the mode, run their interpreters,
-//   so a Shape run and an image's run differ in nothing but where the shaped code lives.
+//   so a Shape run and an image's run differ in nothing but where the shaped code lives. The
+//   shaped recompilers are the EE's and microVU1's (aVU.cpp, "microVU1's AOT form").
 // - Emit: re-compiles each distinct logged block from its logged words into plain memory, checks
 //   its code against the JIT's (length and fnv64: the two processes load the core at different
 //   slides, so a host address left in a block would differ), writes `image`.code and
@@ -23,6 +24,7 @@
 //   when the image holds a block for that address whose words guest memory holds now; a block
 //   the image lacks stops the process.
 // - Interp: Load, but a block the image lacks runs on its recompiler's C twin (the device's mode).
+//   microVU1 has no C twin yet: in Interp, VU1 runs on its interpreter (unitShaped).
 //
 // admit(), from VMManager::UpdateCPUImplementations, opens the image in Load and Interp and
 // refuses one made for another core build or another game (checkHeader): the interpreters run
@@ -53,6 +55,7 @@
 #endif
 
 void eeAotEmit(); // recR5900_arm64.cpp
+void vu1AotEmit(); // aVU.cpp
 u32 eeAotFastmemMode();
 u32 eeAotFlags();
 
@@ -67,11 +70,21 @@ namespace aot
 	 * says how an image is made, keyed and shipped). Its meta, little-endian, is this header (the
 	 * same 104 bytes, magic and version as mupen64plus_next's, flycast's and Dolphin's, so
 	 * retro-trainer's tools read all four), then per block
-	 *   u32 unit, pc, flags, native, nwords, mask[3], code_off, code_len, nsites,
+	 *   u32 unit, pc, flags, native, nwords, mask[3], code_off, code_len, nsites, reserved,
 	 *       words[nwords], sites[3 * nsites] (site_off and stub_off within the block's code, and
 	 *       the index in words of the guest instruction whose access it is)
-	 * and its code is each block's at its code_off (BlockAlign apart). A load refuses an image
-	 * unless each checked field is this core's (checkHeader names the first that differs).
+	 * and its code is each block's at its code_off (BlockAlign apart). What `words` holds is the
+	 * unit's:
+	 *   - UnitEE: the guest words from pc on (at most 96); `native` of them are the block's.
+	 *   - UnitVU1, a block: its incoming pipeline state (microRegInfo, native = VU1_STATE_WORDS =
+	 *     24 words), then the micro-memory words its compile read, as runs: a word
+	 *     (first index << 16 | count) and that many words (indices are of 32-bit micro words,
+	 *     below 4096). No mask, no sites.
+	 *   - UnitVU1 at VU1_STUB_PC (one record): the dispatchers and helper stubs every VU1 block
+	 *     calls or leaves through; `words` (native = nwords) are their entries' offsets in its code,
+	 *     in aVU.cpp's Vu1Stub order.
+	 * A load refuses an image unless each checked field is this core's (checkHeader names the
+	 * first that differs); layout_hash and abi_hash cover microVU1's bases, settings and stubs.
 	 */
 	struct ImageHeader
 	{
@@ -109,6 +122,8 @@ namespace aot
 		Mode mode = Off;
 		std::string image, log;
 		u32 corrupt = 0;
+		bool hasCorruptVu1 = false;
+		u32 corruptVu1 = 0;
 		bool hasCoreUuid = false;
 		u8 coreUuid[16]{};
 	} cfg;
@@ -178,6 +193,9 @@ namespace aot
 		cfg.log = (env && *env && log) ? log : "";
 		const char* corrupt = getenv("LRPS2_AOT_CORRUPT");
 		cfg.corrupt = (env && *env && corrupt && *corrupt) ? (u32)strtoul(corrupt, nullptr, 16) : 0;
+		const char* corruptVu1 = getenv("LRPS2_AOT_CORRUPT_VU1");
+		cfg.hasCorruptVu1 = env && *env && corruptVu1 && *corruptVu1;
+		cfg.corruptVu1 = cfg.hasCorruptVu1 ? (u32)strtoul(corruptVu1, nullptr, 16) : 0;
 		const char* uuid = getenv("LRPS2_AOT_CORE_UUID");
 		cfg.hasCoreUuid = env && *env && uuid && *uuid;
 		AOT_CHECK(!cfg.hasCoreUuid || parseHex16(uuid, cfg.coreUuid), "LRPS2_AOT_CORE_UUID=%s is not a uuid", uuid);
@@ -198,18 +216,23 @@ namespace aot
 		// Shape: the shaped recompilers and the vixl self-test that comes up with them; every other
 		// recompiler (and microVU0, which the AOT form never runs) on its interpreter, as on a device
 		if (cfg.mode == Shape)
-			return !strcmp(what, "EE") || !strcmp(what, "self-test");
+			return !strcmp(what, "EE") || !strcmp(what, "microVU1") || !strcmp(what, "self-test");
 		return false;
 	}
 
-	bool unitShaped(Unit u) { return cfg.mode != Off && u == UnitEE; }
+	// microVU1 in Shape, Emit and Load; in Interp, which has no C twin for it to miss to, VU1 runs
+	// on its interpreter
+	bool unitShaped(Unit u) { return cfg.mode != Off && (u == UnitEE || cfg.mode != Interp); }
 
 	/**** the import table ****/
 
-	struct Import { std::string name; uintptr_t start; size_t size; };
+	// A region import (start, size), a value import (size 0: its table entry is set at run time),
+	// or a run-time region (`dynamic`: a size, and a start set at run time with its entry).
+	struct Import { std::string name; uintptr_t start; size_t size; bool dynamic; };
 	static std::vector<Import> importList;     // in slot order
 	static std::vector<void*> importTable;
-	static std::vector<u32> regionsByStart;     // slots of the regions (size > 0), by start
+	static std::vector<u32> regionsByStart;     // slots of the static regions, by start
+	static std::vector<u32> dynamicRegions;     // slots of the run-time regions
 	static std::unordered_map<std::string, u32> slotByName;
 
 	static void addImport(const char* name, const void* ptr, size_t size)
@@ -217,7 +240,7 @@ namespace aot
 		AOT_CHECK(!slotByName.count(name), "the import %s is listed twice", name);
 		AOT_CHECK(size || !ptr, "the import %s has a pointer and no size (a value import has neither)", name);
 		slotByName[name] = (u32)importList.size();
-		importList.push_back({name, reinterpret_cast<uintptr_t>(ptr), size});
+		importList.push_back({name, reinterpret_cast<uintptr_t>(ptr), size, size && !ptr});
 		importTable.push_back(const_cast<void*>(ptr));
 	}
 
@@ -226,8 +249,11 @@ namespace aot
 		if (!importList.empty())
 			return;
 		eeImports(addImport);
+		vu1Imports(addImport);
 		for (u32 s = 0; s < importList.size(); s++)
-			if (importList[s].size)
+			if (importList[s].dynamic)
+				dynamicRegions.push_back(s);
+			else if (importList[s].size)
 				regionsByStart.push_back(s);
 		std::sort(regionsByStart.begin(), regionsByStart.end(), [](u32 a, u32 b) { return importList[a].start < importList[b].start; });
 		for (size_t i = 1; i < regionsByStart.size(); i++)
@@ -242,29 +268,57 @@ namespace aot
 
 	void** imports() { return importTable.data(); }
 
+	// What p is, for the message of a block that reaches something no import holds
+	static std::string nameOf(const void* p)
+	{
+		Dl_info dl;
+		char s[200];
+		if (dladdr(p, &dl) && dl.dli_sname)
+			snprintf(s, sizeof s, " (%s+%#lx)", dl.dli_sname, (unsigned long)((uintptr_t)p - (uintptr_t)dl.dli_saddr));
+		else
+			s[0] = 0;
+		return s;
+	}
+
 	u32 slotOf(const void* p, u32* off)
 	{
 		const uintptr_t a = reinterpret_cast<uintptr_t>(p);
 		auto it = std::upper_bound(regionsByStart.begin(), regionsByStart.end(), a, [](uintptr_t v, u32 s) { return v < importList[s].start; });
-		AOT_CHECK(it != regionsByStart.begin(), "an AOT-shaped block reaches %p, which no import holds", p);
-		const Import& im = importList[*(it - 1)];
-		AOT_CHECK(a < im.start + im.size, "an AOT-shaped block reaches %p, which no import holds (the nearest below is %s)", p, im.name.c_str());
-		*off = (u32)(a - im.start);
-		return *(it - 1);
+		if (it != regionsByStart.begin() && a < importList[*(it - 1)].start + importList[*(it - 1)].size)
+		{
+			*off = (u32)(a - importList[*(it - 1)].start);
+			return *(it - 1);
+		}
+		for (u32 s : dynamicRegions)
+			if (importList[s].start && a - importList[s].start < importList[s].size)
+			{
+				*off = (u32)(a - importList[s].start);
+				return s;
+			}
+		for (u32 s = 0; s < importList.size(); s++)
+			if (!importList[s].size && importTable[s] == p && p)
+			{
+				*off = 0;
+				return s;
+			}
+		AOT_CHECK(false, "an AOT-shaped block reaches %p%s, which no import holds", p, nameOf(p).c_str());
+		return 0;
 	}
 
 	u32 slotOfValue(const char* name)
 	{
 		auto it = slotByName.find(name);
-		AOT_CHECK(it != slotByName.end() && importList[it->second].size == 0, "%s is no value import", name);
+		AOT_CHECK(it != slotByName.end() && (importList[it->second].size == 0 || importList[it->second].dynamic), "%s is no value import", name);
 		return it->second;
 	}
 
 	void setValueImport(const char* name, void* value)
 	{
 		auto it = slotByName.find(name);
-		AOT_CHECK(it != slotByName.end() && importList[it->second].size == 0, "%s is no value import", name);
+		AOT_CHECK(it != slotByName.end() && (importList[it->second].size == 0 || importList[it->second].dynamic), "%s is no value import", name);
 		importTable[it->second] = value;
+		if (importList[it->second].dynamic)
+			importList[it->second].start = reinterpret_cast<uintptr_t>(value);
 	}
 
 	static u64 fnv(u64 h, const void* p, size_t n)
@@ -348,9 +402,11 @@ namespace aot
 		if (!contentDigest(h.rom_md5))
 			missing |= HEADER_NO_DIGEST;
 		h.imports_hash = importsHash();
-		h.layout_hash = eeLayoutHash();
+		const u64 vl = vu1LayoutHash();
+		h.layout_hash = fnv(eeLayoutHash(), &vl, sizeof vl);
 		const char* abi = eeAbiText();
-		h.abi_hash = fnv(fnv(FNV_BASIS, abi, strlen(abi) + 1), &BlockAlign, sizeof BlockAlign);
+		const char* vabi = vu1AbiText();
+		h.abi_hash = fnv(fnv(fnv(FNV_BASIS, abi, strlen(abi) + 1), vabi, strlen(vabi) + 1), &BlockAlign, sizeof BlockAlign);
 		h.fastmem = eeAotFastmemMode();
 		h.ee_flags = eeAotFlags();
 		h.code_size = codeSize;
@@ -609,7 +665,12 @@ namespace aot
 				why = k;
 				goto refuse;
 			}
-			if (nwords == 0 || nwords > 96 || b.native > nwords || nsites > 256 || left < BlockWords + nwords + 3 * (size_t)nsites)
+			// each unit's payload (the format's comment): the EE's at most 96 guest words; microVU1's
+			// a state and at most every micro word with a run header each, or its stubs' entries
+			const bool vu1 = b.unit == UnitVU1, stub = vu1 && b.pc == VU1_STUB_PC;
+			const u32 maxWords = !vu1 ? 96 : stub ? 64 : VU1_STATE_WORDS + 2 * 4096;
+			const bool shapeOk = !vu1 || (stub ? b.native == nwords : b.native == VU1_STATE_WORDS) && nsites == 0;
+			if (nwords == 0 || nwords > maxWords || b.native > nwords || !shapeOk || nsites > 256 || left < BlockWords + nwords + 3 * (size_t)nsites)
 			{
 				why = "meta: block " + std::to_string(i) + " has " + std::to_string(nwords) + " words or overruns the meta";
 				goto refuse;
@@ -674,6 +735,16 @@ namespace aot
 #endif
 	}
 
+	bool redVu1HostAddr()
+	{
+#ifdef AOT_TOOLING
+		static const bool red = [] { const char* e = getenv("LRPS2_AOT_RED"); return e && !strcmp(e, "vu1hostaddr"); }();
+		return red;
+#else
+		return false;
+#endif
+	}
+
 	void miss(Unit u, u32 pc)
 	{
 		stats.misses[u]++;
@@ -694,11 +765,17 @@ namespace aot
 
 	const std::vector<Block>& emitRecords(Unit u) { return emitRecs[u]; }
 	u32 emitCorrupt() { return cfg.corrupt; }
+	bool emitCorruptVu1(u32* pc)
+	{
+		*pc = cfg.corruptVu1;
+		return cfg.hasCorruptVu1;
+	}
 
 	void emitted(const Block& b, const u8* code, u32 len, const std::vector<u32>& sites)
 	{
 		const u64 h = fnv(FNV_BASIS, code, len);
-		const bool corrupt = cfg.corrupt != 0 && b.pc == cfg.corrupt;
+		const bool corrupt = b.unit == UnitEE ? cfg.corrupt != 0 && b.pc == cfg.corrupt
+		                                      : cfg.hasCorruptVu1 && b.pc == cfg.corruptVu1;
 		if (!corrupt && (len != b.codeLen || h != b.hash || sites != b.sites))
 		{
 			if (stats.emitDiffers++ < 10)
@@ -738,7 +815,7 @@ namespace aot
 		AOT_CHECK(!cfg.log.empty() && !cfg.image.empty(), "emit needs LRPS2_AOT_LOG to read and LRPS2_AOT_IMAGE to write");
 		FILE* f = fopen(cfg.log.c_str(), "r");
 		AOT_CHECK(f != nullptr, "cannot read %s", cfg.log.c_str());
-		static char line[1 << 16];
+		static char line[1 << 20]; // a microVU1 record reads up to 4096 words
 		bool buildOk = false;
 		unsigned long nrecs = 0;
 		while (fgets(line, sizeof line, f))
@@ -806,9 +883,10 @@ namespace aot
 			v = std::move(uniq);
 		}
 		eeAotEmit();
+		vu1AotEmit();
 		const int status = stats.emitDiffers ? 3 : stats.emitSkipped ? 4 : 0;
-		fprintf(stderr, "lrps2 AOT emit: %lu records, %zu EE blocks, %u emitted (%zu bytes of code), %lu skipped, %lu differ from the JIT's\n",
-			nrecs, emitRecs[UnitEE].size(), emitBlocks, emitCode.size(), stats.emitSkipped, stats.emitDiffers);
+		fprintf(stderr, "lrps2 AOT emit: %lu records, %zu EE blocks, %zu VU1 blocks (and stubs), %u emitted (%zu bytes of code), %lu skipped, %lu differ from the JIT's\n",
+			nrecs, emitRecs[UnitEE].size(), emitRecs[UnitVU1].size(), emitBlocks, emitCode.size(), stats.emitSkipped, stats.emitDiffers);
 		const std::string codePath = cfg.image + ".code", metaPath = cfg.image + ".meta";
 		unlink(codePath.c_str());
 		unlink(metaPath.c_str());
@@ -841,9 +919,11 @@ namespace aot
 	{
 		if (cfg.mode == Off)
 			return;
-		fprintf(stderr, "lrps2 AOT %s: EE %lu compiled, %lu installed, %lu missed, %lu fastmem faults resumed at a stub\n",
+		fprintf(stderr, "lrps2 AOT %s: EE %lu compiled, %lu installed, %lu missed, %lu fastmem faults resumed at a stub; "
+			"VU1 %lu compiled, %lu installed, %lu missed\n",
 			cfg.mode == Shape ? "shape" : cfg.mode == Emit ? "emit" : cfg.mode == Load ? "load" : "interp",
-			stats.compiled[UnitEE], stats.installs[UnitEE], stats.misses[UnitEE], stats.faults[UnitEE]);
+			stats.compiled[UnitEE], stats.installs[UnitEE], stats.misses[UnitEE], stats.faults[UnitEE],
+			stats.compiled[UnitVU1], stats.installs[UnitVU1], stats.misses[UnitVU1]);
 		vmReport("end of run");
 		fflush(stderr);
 	}

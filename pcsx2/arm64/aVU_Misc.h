@@ -163,7 +163,16 @@ typedef Fntype_mVUrecInst* Fnptr_mVUrecInst;
 #define isBadOrEvil  (mVUlow.badBranch || mVUlow.evilBranch)
 #define isConditional (mVUlow.branch > 2 && mVUlow.branch < 9)
 #define xPC          ((iPC / 2) * 8)
-#define curI         ((u32*)mVU.regs().Micro)[iPC] //mVUcurProg.data[iPC]
+// HH-37: every micro word a compile reads is read here; while mvuReadMask is set (microVU1's AOT
+// form, aVU.cpp) the word's index is recorded, and those words are the compiled block's key.
+extern thread_local u64* mvuReadMask;
+static __fi u32& mvuCodeWord(microVU& mVU, u32 pc)
+{
+	if (mvuReadMask) [[unlikely]]
+		mvuReadMask[pc >> 6] |= u64(1) << (pc & 63);
+	return ((u32*)mVU.regs().Micro)[pc];
+}
+#define curI         mvuCodeWord(mVU, iPC) //mVUcurProg.data[iPC]
 #define setCode()    { mVU.code = curI; }
 #define bSaveAddr    (((xPC + 16) & (mVU.microMemSize-8)) / 8)
 // P/Q-pair lane permute immediate (every block starts at P/Q instance #0). Same
