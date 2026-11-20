@@ -100,6 +100,7 @@ namespace aot
 	constexpr u32 VERSION = 3;
 	constexpr u32 BlockAlign = 16;
 	constexpr u32 BlockWords = 12; // a meta block record's fixed words
+	constexpr u32 BLOCK_FLAGS_KNOWN = 0; // no block flag is defined yet: every block's is 0
 
 	/**** configuration ****/
 
@@ -575,6 +576,11 @@ namespace aot
 			goto refuse;
 		}
 		p = meta + sizeof h / 4;
+		if (h.nblocks > (size_t)(metaEnd - p) / BlockWords)
+		{
+			why = "meta: " + std::to_string(h.nblocks) + " blocks cannot fit";
+			goto refuse;
+		}
 		imageBlockList.reserve(h.nblocks);
 		for (u32 i = 0; i < h.nblocks; i++)
 		{
@@ -594,6 +600,13 @@ namespace aot
 			if (b.unit >= UnitCount)
 			{
 				why = "block_unit: block " + std::to_string(i) + " is for unit " + std::to_string(b.unit) + ", this core knows " + std::to_string((u32)UnitCount);
+				goto refuse;
+			}
+			if (b.flags & ~BLOCK_FLAGS_KNOWN)
+			{
+				char k[160];
+				snprintf(k, sizeof k, "block_flags: block %u (%08x) has flags %#x, this core knows %#x", i, b.pc, b.flags, BLOCK_FLAGS_KNOWN);
+				why = k;
 				goto refuse;
 			}
 			if (nwords == 0 || nwords > 96 || b.native > nwords || nsites > 256 || left < BlockWords + nwords + 3 * (size_t)nsites)
