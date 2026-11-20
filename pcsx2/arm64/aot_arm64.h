@@ -115,6 +115,8 @@ namespace aot
 	void countInstall(Unit u);
 	// A fastmem fault a shaped block's access took (resumed at its stub).
 	void countFault(Unit u);
+	// An unpack that wraps VU memory, which runs on the kernels (or, with a mode, on the C table)
+	void countVifWrap(bool kernels);
 	// LRPS2_AOT_RED=hostaddr (the Mac's tooling): one EE helper's address is materialized into
 	// the code as the stock form does, so Emit's comparison must find every block that has it
 	// (the red receipt for "a shaped block holds no host address").
@@ -157,6 +159,7 @@ namespace aot
 	inline void miss(Unit, u32) {}
 	inline void countInstall(Unit) {}
 	inline void countFault(Unit) {}
+	inline void countVifWrap(bool) {}
 	inline bool redHostAddr() { return false; }
 	inline bool redVifHostAddr() { return false; }
 	inline const std::vector<Block>& emitRecords(Unit) { static const std::vector<Block> none; return none; }

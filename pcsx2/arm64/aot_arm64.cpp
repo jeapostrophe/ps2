@@ -134,6 +134,7 @@ namespace aot
 	static struct
 	{
 		unsigned long compiled[UnitCount], installs[UnitCount], misses[UnitCount], faults[UnitCount], emitDiffers, emitSkipped;
+		unsigned long vifWraps, vifWrapsOnKernels;
 	} stats;
 
 	static bool parseHex16(const char* s, u8 out[16])
@@ -707,6 +708,11 @@ namespace aot
 
 	void countInstall(Unit u) { stats.installs[u]++; }
 	void countFault(Unit u) { stats.faults[u]++; }
+	void countVifWrap(bool kernels)
+	{
+		stats.vifWraps++;
+		stats.vifWrapsOnKernels += kernels;
+	}
 
 	bool redHostAddr()
 	{
@@ -900,11 +906,13 @@ namespace aot
 		if (cfg.mode == Off)
 			return;
 		fprintf(stderr, "lrps2 AOT %s: EE %lu compiled, %lu installed, %lu missed, %lu fastmem faults resumed at a stub; "
-			"VIF routines %lu compiled, %lu installed, %lu missed; VIF kernels %lu compiled, %lu installed, %lu missed\n",
+			"VIF routines %lu compiled, %lu installed, %lu missed; VIF kernels %lu compiled, %lu installed, %lu missed; "
+			"%lu unpacks wrapped VU memory, %lu of them on the kernels\n",
 			cfg.mode == Shape ? "shape" : cfg.mode == Emit ? "emit" : cfg.mode == Load ? "load" : "interp",
 			stats.compiled[UnitEE], stats.installs[UnitEE], stats.misses[UnitEE], stats.faults[UnitEE],
 			stats.compiled[UnitVIF], stats.installs[UnitVIF], stats.misses[UnitVIF],
-			stats.compiled[UnitVIFUnpack], stats.installs[UnitVIFUnpack], stats.misses[UnitVIFUnpack]);
+			stats.compiled[UnitVIFUnpack], stats.installs[UnitVIFUnpack], stats.misses[UnitVIFUnpack],
+			stats.vifWraps, stats.vifWrapsOnKernels);
 		vmReport("end of run");
 		fflush(stderr);
 	}

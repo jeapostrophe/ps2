@@ -642,6 +642,7 @@ _vifT __fi void dVifUnpack(const u8* data, int isFill)
 		}
 		else
 		{
+			aot::countVifWrap(vifRegs.mode == 0);
 			_nVifUnpack(idx, data, vifRegs.mode, isFill);
 		}
 	}
