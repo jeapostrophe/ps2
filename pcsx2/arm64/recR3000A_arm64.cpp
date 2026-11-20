@@ -125,6 +125,27 @@ namespace
 	{
 		m.Ldr(r, MemOperand(importsReg, aot::slotOfValue(name) * 8));
 	}
+	// ---- lane hh37b (lane-only): LRPS2_IOP_ALIAS=1 counts the LUT hits in recExecuteBlock's
+	// dispatch whose block was compiled for another raw pc than the one asked (a mirror alias:
+	// the LUT is indexed by Norm(pc)); =nochain also stops the chain, so every hit is counted.
+	u32 s_lut_pc[kRamWords];
+	int AliasMode()
+	{
+		static const int m = [] { const char* e = getenv("LRPS2_IOP_ALIAS"); return !e ? 0 : !strcmp(e, "nochain") ? 2 : 1; }();
+		return m;
+	}
+	unsigned long s_alias_lookups, s_alias_hits;
+	std::unordered_map<u64, unsigned long> s_alias_pairs;
+	void AliasReport()
+	{
+		fprintf(stderr, "lrps2 lane IOP alias (%s): %lu LUT hits in the dispatch, %lu for a block compiled at another raw pc, %zu pairs\n",
+			AliasMode() == 2 ? "no chain" : "chain", s_alias_lookups, s_alias_hits, s_alias_pairs.size());
+		int k = 0;
+		for (const auto& [key, n] : s_alias_pairs)
+			if (k++ < 12)
+				fprintf(stderr, "lrps2 lane IOP alias: asked %08x, block at %08x: %lu hits\n", (u32)(key >> 32), (u32)key, n);
+	}
+
 	// &ICFG, whose bit 3 sets the IOP's clock ratio. LRPS2_AOT_RED=iophostaddr materializes it as
 	// the stock form does: the red receipt for "a shaped IOP block holds no host address".
 	inline void EmitIcfgAddr(MacroAssembler& m, const Register& r)
@@ -599,6 +620,8 @@ namespace
 		m.Mov(w3, kRamBytes);
 		m.Cmp(w2, w3);
 		m.B(&ret_path, hs);                  // not RAM -> return
+		if (AliasMode() == 2)
+			m.B(&ret_path);
 		if (Aot())
 			EmitValue(m, x0, kLutImport);
 		else
@@ -804,6 +827,7 @@ namespace
 	{
 		s_blocks.emplace(pc, BlockRec{fn, cov});
 		if (InRam(ns)) s_lut[ns >> 2] = fn;
+		if (InRam(ns)) s_lut_pc[ns >> 2] = pc;
 		if (cov > ns)
 		{
 			for (u32 pg = ns >> kPageShift; pg <= (cov - 1) >> kPageShift; pg++)
@@ -992,6 +1016,15 @@ namespace
 		if (InRam(np))
 		{
 			BlockFn f = s_lut[np >> 2];
+			if (f && AliasMode())
+			{
+				s_alias_lookups++;
+				if (s_lut_pc[np >> 2] != pc)
+				{
+					s_alias_hits++;
+					s_alias_pairs[((u64)pc << 32) | s_lut_pc[np >> 2]]++;
+				}
+			}
 			return f ? f : NewBlock(pc);
 		}
 		auto it = s_blocks.find(pc);
@@ -1025,6 +1058,12 @@ static void recReserve(void)
 		if (s_lut == MAP_FAILED) s_lut = nullptr;
 	}
 	s_ok = s_ok && (s_code || aot::imageOnly()) && s_lut;
+	static bool aliasAtExit;
+	if (AliasMode() && !aliasAtExit)
+	{
+		atexit(AliasReport);
+		aliasAtExit = true;
+	}
 	if (aot::shaped() && s_lut)
 		aot::setValueImport(kLutImport, s_lut);
 	Console.WriteLn("arm64 IOP rec (C.2b-4): %s.", s_ok ? "native ALU+mem+branch JIT active" : "FAILED -> interpreter fallback");
