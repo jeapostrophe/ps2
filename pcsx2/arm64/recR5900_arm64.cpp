@@ -3828,7 +3828,10 @@ namespace {
 	void EmitTailCycles(MacroAssembler& m, int cyc, bool with_update)
 	{
 		const uint64_t upd = reinterpret_cast<uint64_t>(&eeUpdateCycles_arm64);
-		EmitAddr(m, x10, reinterpret_cast<uint64_t>(&cpuBlockCycles)); // once, for both halves
+		if (aot::redHostAddr())
+			m.Mov(x10, reinterpret_cast<uint64_t>(&cpuBlockCycles)); // the red receipt (aot_arm64.h)
+		else
+			EmitAddr(m, x10, reinterpret_cast<uint64_t>(&cpuBlockCycles)); // once, for both halves
 		m.Ldr(w1, RegsField(&cpuRegs.CP0.n.Config));
 		m.Mov(w2, cyc); m.Mov(w3, cyc * 2);
 		m.Tst(w1, 1u << 18);
@@ -4801,6 +4804,7 @@ extern "C" bool eeFastmemFault_arm64(uintptr_t code_address, uintptr_t* resume_p
 			block = it->block;
 		}
 		*resume_pc = stub;
+		aot::countFault(aot::UnitEE);
 		const auto bit = std::lower_bound(s_fm_faulting.begin(), s_fm_faulting.end(), pc);
 		if (bit == s_fm_faulting.end() || *bit != pc)
 			s_fm_faulting.insert(bit, pc);

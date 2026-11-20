@@ -105,6 +105,12 @@ namespace aot
 	// Load: a block the image lacks. Load stops the process; Interp counts it (the caller runs it).
 	void miss(Unit u, u32 pc);
 	void countInstall(Unit u);
+	// A fastmem fault a shaped block's access took (resumed at its stub).
+	void countFault(Unit u);
+	// LRPS2_AOT_RED=hostaddr (the Mac's tooling): one EE helper's address is materialized into
+	// the code as the stock form does, so Emit's comparison must find every block that has it
+	// (the red receipt for "a shaped block holds no host address").
+	bool redHostAddr();
 
 	// Emit: the unit's logged blocks, for its emitter to re-compile, and the corrupt pc (a red
 	// receipt: that block is emitted from a changed word, its true words kept in the meta).
@@ -136,6 +142,8 @@ namespace aot
 	inline const std::vector<Site>& imageSites() { static const std::vector<Site> none; return none; }
 	inline void miss(Unit, u32) {}
 	inline void countInstall(Unit) {}
+	inline void countFault(Unit) {}
+	inline bool redHostAddr() { return false; }
 	inline const std::vector<Block>& emitRecords(Unit) { static const std::vector<Block> none; return none; }
 	inline u32 emitCorrupt() { return 0; }
 	inline void emitted(const Block&, const u8*, u32, const std::vector<u32>&) {}

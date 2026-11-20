@@ -114,7 +114,7 @@ namespace aot
 
 	static struct
 	{
-		unsigned long compiled[UnitCount], installs[UnitCount], misses[UnitCount], emitDiffers, emitSkipped;
+		unsigned long compiled[UnitCount], installs[UnitCount], misses[UnitCount], faults[UnitCount], emitDiffers, emitSkipped;
 	} stats;
 
 	static bool parseHex16(const char* s, u8 out[16])
@@ -421,12 +421,15 @@ namespace aot
 
 	/**** the VM report (the Mac's tooling): what this process maps executable ****/
 
+	// What this process maps executable: every executable region, those writable now (W+X), and
+	// those whose maximum protection lets them be made writable (each named, with its image).
 	static void vmReport(const char* when)
 	{
 #ifdef AOT_TOOLING
 		mach_vm_address_t addr = 0;
 		mach_vm_size_t size;
-		u32 wx = 0, x = 0, depth = 0;
+		u32 wx = 0, x = 0, maxw = 0, depth = 0;
+		std::string named;
 		for (;;)
 		{
 			vm_region_submap_info_data_64_t info;
@@ -441,12 +444,23 @@ namespace aot
 			if (info.protection & VM_PROT_EXECUTE)
 			{
 				x++;
-				if ((info.protection & VM_PROT_WRITE) || (info.max_protection & VM_PROT_WRITE))
-					wx++;
+				const bool w = (info.protection & VM_PROT_WRITE) != 0;
+				const bool mw = (info.max_protection & VM_PROT_WRITE) != 0;
+				wx += w;
+				maxw += mw;
+				if (w || mw)
+				{
+					Dl_info dl;
+					char line[256];
+					snprintf(line, sizeof line, "; %s %llx+%llx (%s)", w ? "W+X" : "max W", (unsigned long long)addr,
+						(unsigned long long)size, dladdr((const void*)addr, &dl) && dl.dli_fname ? dl.dli_fname : "no image");
+					named += line;
+				}
 			}
 			addr += size;
 		}
-		fprintf(stderr, "lrps2 AOT VM (%s): %u executable regions, %u writable (or able to be made writable) and executable\n", when, x, wx);
+		fprintf(stderr, "lrps2 AOT VM (%s): %u executable regions, %u writable and executable, %u whose maximum protection allows writing%s\n",
+			when, x, wx, maxw, named.c_str());
 #else
 		(void)when;
 #endif
@@ -635,6 +649,17 @@ namespace aot
 	const std::vector<Site>& imageSites() { return imageSiteList; }
 
 	void countInstall(Unit u) { stats.installs[u]++; }
+	void countFault(Unit u) { stats.faults[u]++; }
+
+	bool redHostAddr()
+	{
+#ifdef AOT_TOOLING
+		static const bool red = [] { const char* e = getenv("LRPS2_AOT_RED"); return e && !strcmp(e, "hostaddr"); }();
+		return red;
+#else
+		return false;
+#endif
+	}
 
 	void miss(Unit u, u32 pc)
 	{
@@ -803,9 +828,9 @@ namespace aot
 	{
 		if (cfg.mode == Off)
 			return;
-		fprintf(stderr, "lrps2 AOT %s: EE %lu compiled, %lu installed, %lu missed\n",
+		fprintf(stderr, "lrps2 AOT %s: EE %lu compiled, %lu installed, %lu missed, %lu fastmem faults resumed at a stub\n",
 			cfg.mode == Shape ? "shape" : cfg.mode == Emit ? "emit" : cfg.mode == Load ? "load" : "interp",
-			stats.compiled[UnitEE], stats.installs[UnitEE], stats.misses[UnitEE]);
+			stats.compiled[UnitEE], stats.installs[UnitEE], stats.misses[UnitEE], stats.faults[UnitEE]);
 		vmReport("end of run");
 		fflush(stderr);
 	}
