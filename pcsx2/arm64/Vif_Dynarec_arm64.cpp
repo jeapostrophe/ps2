@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <sys/mman.h>
 
 namespace a64 = vixl::aarch64;
@@ -635,7 +636,10 @@ _vifT __fi void dVifUnpack(const u8* data, int isFill)
 		u8* startmem = VU.Mem + (vif.tag.addr & (vuMemLimit - 0x10));
 		u8* endmem = VU.Mem + vuMemLimit;
 
-		if (likely((startmem + b->f.length) <= endmem))
+		// retro-trainer lane hh37b (lane-only): LRPS2_VIF_KERNELS=1 runs every unpack with no mode
+		// on the kernels (the wrap path), which css-press never reaches otherwise
+		static const bool lane_kernels = [] { const char* e = getenv("LRPS2_VIF_KERNELS"); return e && !strcmp(e, "1"); }();
+		if (likely((startmem + b->f.length) <= endmem) && !(lane_kernels && vifRegs.mode == 0))
 		{
 			// No wrapping, you can run the fast dynarec
 			((VifRoutine)(base + (b->f.startOffset - 1)))((uptr)startmem, (uptr)data, &vif);
