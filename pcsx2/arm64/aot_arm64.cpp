@@ -719,9 +719,7 @@ namespace aot
 				why = "meta: block " + std::to_string(i) + " has " + std::to_string(nwords) + " words or overruns the meta";
 				goto refuse;
 			}
-			if (b.unit == UnitEE ? nwords == 0 :
-			    (b.native || nsites || b.mask[0] || b.mask[1] || b.mask[2] ||
-			     (b.unit == UnitVIF ? nwords != 2 || (b.pc >> 16) > 1 : nwords != 0 || b.pc >= VIF_KERNELS)))
+			if ((vif || kern) && (b.mask[0] || b.mask[1] || b.mask[2] || (vif ? (b.pc >> 16) > 1 : b.pc >= VIF_KERNELS)))
 			{
 				char k[160];
 				snprintf(k, sizeof k, "meta: block %u (unit %u, %08x) is no key of its unit (%u words)", i, b.unit, b.pc, nwords);
